@@ -113,9 +113,22 @@ void main()
     }
     else
     {
-        float fogAmount = clamp(cam.cloudParams7.y, 0.0, 4.0);
-        sigmaUniform = vec3(VFOG_DENSITY * fogAmount);
+        sigmaUniform = vec3(0.0);
     }
+
+    // 2026-11-01：介质口径与 volumetric_fog.glsl:evaluateAnalyticFog 逐项对齐。
+    // 旧版给 fogDensityAt 传的是 (baseDensity = 0, 高度带 = 硬编码 96..0)，而解析雾
+    // 用的是 (用户密度 -> baseDensity, 用户高度带 cloudParams7.z/.w, 雨强时间因子)。
+    // 两套介质 ⇒ 局部光散射会出现在"没有雾的空气里"，表现为光从雾边界/墙外渗出来；
+    // 同时它的透射率也和解析雾对不上。这里只统一密度剖面，不引入地面锚定/wisp
+    // （那两件在解析雾里要读地形高度，代价高，且与穿墙无关）。
+    const float fogRain = clamp(cam.weatherParams.x, 0.0, 1.0);
+    const float fogBaseDensity =
+        clamp(cam.cloudParams7.y, 0.0, 4.0) * (fogRain * 0.15 + 0.08) /
+        max(cam.cameraParams.y, 100.0);
+    const float fogTimeFactor = mix(1.0, max(cam.cloudParams9.y, 0.0), fogRain);
+    const float fogHeightMax = max(cam.cloudParams7.z, cam.cloudParams7.w);
+    const float fogHeightMin = min(cam.cloudParams7.z, cam.cloudParams7.w);
 
     float marchDistance = min(sceneDistance, maxViewZ / cosAngle);
 
@@ -169,11 +182,10 @@ void main()
         vec3 sigma = sigmaUniform;
         if(!underwater)
         {
-            vec3 worldPosition = cameraPosition + worldDirection * (viewZ / cosAngle);
-            float density = fogDensityAt(worldPosition, 0.0,
-                clamp(cam.cloudParams7.y, 0.0, 4.0),
-                clamp(cam.weatherParams.x, 0.0, 1.0), 96.0, 0.0);
-            sigma = vec3(density);
+            const vec3 worldPosition =
+                cameraPosition + worldDirection * (viewZ / cosAngle);
+            sigma = vec3(fogDensityAt(worldPosition, fogBaseDensity,
+                fogTimeFactor, fogRain, fogHeightMax, fogHeightMin));
         }
 
         sigma = max(sigma * extinctionScale, vec3(0.0));
@@ -183,7 +195,12 @@ void main()
         transmittance *= stepTransmittance;
     }
 
-    float alpha = clamp(dot(transmittance, vec3(1.0 / 3.0)), 0.0, 1.0);
-
+    // 2026-11-01：alpha 恒 1，只做加法混入（不再二次衰减场景）。
+    // 原来这里写的是本地光介质的平均透射率，god_ray_composite 会做 scene * a + rgb；
+    // 但雾的透射率**已经**由 volumetric_clouds 在同一次 composite 里乘过一次
+    // （cloudOutput.a = 解析雾 T）⇒ ReSTIR 一开，场景被两层雾各衰减一次：
+    // 整体变暗、雾看起来更厚，贴近雾区的物体会比远处更黑。这与 Remix 的
+    // 做法（preintegratedRadiance + scene*T 一次性合成）也不一致。
+    const float alpha = 1.0;
     imageStore(volCompositeOut, pixel, vec4(accumulated, alpha));
 }

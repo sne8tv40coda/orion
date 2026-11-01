@@ -29,14 +29,17 @@ layout(push_constant) uniform VolRestirPush
 float volRestirLightWeight(
     vec3 lightPos,
     float emissionLevel,
+    uint typeCode,
     vec3 froxelCenter,
     float energyScale)
 {
     float distanceToLight = length(lightPos - froxelCenter);
-    float rangeFade = vptLocalLightRangeFade(distanceToLight, emissionLevel);
+    float rangeFade = vptLocalLightRangeFade(distanceToLight, typeCode, emissionLevel);
     float attenuation = vptLocalLightDistanceAttenuation(distanceToLight);
+    // 2026-10-31：亮度按光源档案（×15 保持旧的 0..15 量级）。
+    float brightness = localLightProfileBrightness(typeCode, emissionLevel) * 15.0;
 
-    return max(emissionLevel * rangeFade * attenuation * energyScale, 0.0);
+    return max(brightness * rangeFade * attenuation * energyScale, 0.0);
 }
 
 void main()
@@ -79,6 +82,7 @@ void main()
         candidateWeight[i] = volRestirLightWeight(
             candidatePosEmission[i].xyz,
             candidatePosEmission[i].w,
+            candidateType[i],
             froxelCenter,
             energyScale);
         weightTotal += candidateWeight[i];
@@ -138,10 +142,13 @@ void main()
     float selectedAttenuation =
         vptLocalLightDistanceAttenuation(length(selectedPosEmission.xyz - froxelCenter)) *
         vptLocalLightRangeFade(length(selectedPosEmission.xyz - froxelCenter),
+            selectedType,
             selectedPosEmission.w);
 
+    // 2026-10-31：亮度按光源档案（×15 与上面的权重同量级口径）。
     vec3 radiance = decodeLocalLightColor(selectedType) *
-        selectedPosEmission.w * selectedAttenuation * energyScale;
+        localLightProfileBrightness(selectedType, selectedPosEmission.w) * 15.0 *
+        selectedAttenuation * energyScale;
 
     imageStore(volRadianceOut, restirCoord, vec4(radiance, 1.0));
 }

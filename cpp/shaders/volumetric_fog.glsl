@@ -29,6 +29,7 @@ struct FogResult
 // temporalPhase() 同一招：黄金比序列在任意连续窗口内近似均匀铺满 [0,1)，
 // 于是"沿视线的步进相位"在 3~5 帧内被既有 resolve 收敛掉，而不是靠白噪声。
 // 只取低 10 位（同 v1 的理由：fp32 精度，几小时后仍精确）。
+//
 float fogTemporalPhase(float strength)
 {
     if(strength <= 0.0)
@@ -38,16 +39,18 @@ float fogTemporalPhase(float strength)
     return strength * float(cam.frameCount & 0x3ffu) * 0.6180339887498949;
 }
 
+// 2026-10-31：4x4 Bayer 换成 Interleaved Gradient Noise（自创，标准做法）。
+// 病征是"整片雾面上细密均匀、相机静止时钉死在屏幕上的纱窗"：Bayer 是
+// **空间固定**的低分辨率图案（4 个云像素 = 8 个输出像素的周期），而雾是
+// 低频均匀场，一旦去噪/时间累积没把它抹平就必然被看成网格。IGN 每个像素
+// 的相位都不同、无重复周期，时间相位叠加后只会收敛成均匀值，不会再被识别
+// 成图案；同时比 const int[16] 数组的动态索引便宜（部分驱动会把常量数组
+// 降到 local memory 再去索引）。
 float fogDitherPhase(ivec2 pixel, float temporalPhase)
 {
-    const int bayer4[16] = int[16](
-        0, 8, 2, 10,
-        12, 4, 14, 6,
-        3, 11, 1, 9,
-        15, 7, 13, 5);
-
-    const float base = float(bayer4[(pixel.y & 3) * 4 + (pixel.x & 3)]) / 16.0;
-    return fract(base + temporalPhase);
+    const float ign = fract(52.9829189 * fract(
+        dot(vec2(pixel) + 0.5, vec2(0.06711056, 0.00583715))));
+    return fract(ign + temporalPhase);
 }
 
 const float FOG_ANCHOR_REFERENCE_Y = 63.0;
@@ -87,35 +90,9 @@ float fogGroundAnchorOffset(FogGround g, float strength)
     return shift * clamp(strength * g.weight, 0.0, 1.0);
 }
 
-const float FOG_WISP_EXTINCTION = 0.0090;
-const float FOG_WISP_VERTICAL_STRETCH = 12.0;
-const float FOG_WISP_WARP = 0.32;
-const float FOG_WISP_THRESHOLD_LO = 0.40;
-const float FOG_WISP_THRESHOLD_HI = 0.62;
-const vec3 FOG_WISP_WIND_DIRECTION = vec3(0.81915204429, 0.0, 0.57357643635);
-
-float fogWispShape(
-    vec3 position,
-    float wavelength,
-    float advectSpeed,
-    float timeSeconds)
-{
-    const vec3 advected = position +
-        FOG_WISP_WIND_DIRECTION * (advectSpeed * timeSeconds);
-    const float invWavelength = 1.0 / max(wavelength, 8.0);
-    const vec3 q = vec3(
-        advected.x * invWavelength,
-        advected.y * invWavelength * FOG_WISP_VERTICAL_STRETCH,
-        advected.z * invWavelength);
-
-    const float warp = textureLod(
-        cloudShapeNoise, q * 0.37 + vec3(0.11, 0.23, 0.47), 0.0).r - 0.5;
-    const float shape = textureLod(
-        cloudShapeNoise, q + warp * FOG_WISP_WARP, 0.0).r;
-
-    return smoothstep(FOG_WISP_THRESHOLD_LO, FOG_WISP_THRESHOLD_HI, shape);
-}
-
+// 2026-10-31：雨天地面雾浪（cloudParams4.y/.z/.w + cloudParams9.w 那条链）
+// 整段删除。用户实测"跟没有一样"，留着只是每步多 2 次 textureLod 与一次
+// 3D 噪声形状计算。相关 UBO 车道保留（std140 布局不动），但已无消费者。
 const float FOG_LIGHT_PHASE_SCALE = 0.62;
 const float FOG_LIGHT_PHASE_FLOOR = 0.02;
 const float FOG_LIGHT_PHASE_G = 0.40;
@@ -193,11 +170,7 @@ FogResult evaluateAnalyticFog(
     float rainBoost,
     float groundAnchor,
     float temporalJitter,
-    float dynamicLightStrength,
-    float wispEnabled,
-    float wispStrength,
-    float wispWavelength,
-    float wispSpeed)
+    float dynamicLightStrength)
 {
     FogResult result;
     result.scattering = vec3(0.0);
@@ -244,7 +217,9 @@ FogResult evaluateAnalyticFog(
     const vec3 rayVector = end - start;
 
     const float rSteps = 1.0 / VFOG_QUALITY;
-    const float rayLength = length(rayVector) * rSteps * 0.23979;
+    // 提到循环外：原来循环里对同一条 rayVector 反复求 length（雾浪与均值距离各一次）。
+    const float rayVectorLength = length(rayVector);
+    const float rayLength = rayVectorLength * rSteps * 0.23979;
 
     const float noise = fogDitherPhase(
         ivec2(gl_GlobalInvocationID.xy), fogTemporalPhase(temporalJitter));
@@ -268,11 +243,7 @@ FogResult evaluateAnalyticFog(
     }
     vec3 lightDensityAccum = vec3(0.0);
 
-    const float wispRain = smoothstep(0.0, 0.35, wetness);
-    const bool wispActive =
-        wispEnabled > 0.5 && wispStrength > 0.0 && wispRain > 0.0;
-    const float wispTime = uintBitsToFloat(cam.padding);
-    const bool needGroundSample = groundAnchor > 0.0 || wispActive;
+    const bool needGroundSample = groundAnchor > 0.0;
 
     float transmittance = 1.0;
     float fogDensityAccum = 0.0;
@@ -305,20 +276,6 @@ FogResult evaluateAnalyticFog(
             wetness,
             heightMax,
             heightMin);
-
-        if(wispActive)
-        {
-            const float groundY = mix(
-                FOG_ANCHOR_REFERENCE_Y, ground.height, ground.weight);
-            const float layerHeight = clamp(wispWavelength * 0.05, 2.0, 24.0);
-            const float profile =
-                exp(-max(fogPos.y - groundY, 0.0) / layerHeight);
-            if(profile > 0.01)
-            {
-                density += FOG_WISP_EXTINCTION * wispStrength * wispRain * profile *
-                    fogWispShape(fogPos, wispWavelength, wispSpeed, wispTime);
-            }
-        }
 
         const float absorption = exp2(-density * stepDensity);
 
@@ -358,7 +315,7 @@ FogResult evaluateAnalyticFog(
         rayDensityAccum += stepRayDensity * shadow;
 
         {
-            const float sampleDistance = fogNear + stepLength * length(rayVector);
+            const float sampleDistance = fogNear + stepLength * rayVectorLength;
             fogMeanDistanceAccum += integral * sampleDistance;
             fogMeanWeightAccum += integral;
         }
@@ -372,15 +329,19 @@ FogResult evaluateAnalyticFog(
 
             const vec3 toLight = fogLightPosEmission[li].xyz - fogPos;
             const float emissionLevel = clamp(fogLightPosEmission[li].w, 1.0, 15.0);
+            // 2026-10-31：每盏灯有自己的档案（色温/亮度/距离），不再共用
+            // "emission / 15 + emission × 2 格"的统一口径。
+            const uint lightProfile = fogLightType[li];
             const float distanceToLight = length(toLight);
-            if(distanceToLight > vptLocalLightRange(emissionLevel))
+            if(distanceToLight > vptLocalLightRange(lightProfile, emissionLevel))
             {
                 continue;
             }
 
-            const float lightScale = fogLightEnergyScale * (emissionLevel / 15.0) *
+            const float lightScale = fogLightEnergyScale *
+                localLightProfileBrightness(lightProfile, emissionLevel) *
                 vptLocalLightDistanceAttenuation(distanceToLight) *
-                vptLocalLightRangeFade(distanceToLight, emissionLevel);
+                vptLocalLightRangeFade(distanceToLight, lightProfile, emissionLevel);
 
             lightDensityAccum += decodeLocalLightColor(fogLightType[li]) * lightScale *
                 (fogLightPhase(toLight, worldDirection) * integral);

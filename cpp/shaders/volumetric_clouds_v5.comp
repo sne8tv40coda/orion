@@ -198,6 +198,7 @@ void main()
 
     vec4 march = vec4(0.0, 0.0, 0.0, 1.0);
     float cloudDistance = V4_EMPTY;
+    float hpMeanDistance = V4_EMPTY;
     if(cloudDeckEnabled)
     {
         vec2 anchorXZ = cam.cloudParams3.xy;
@@ -233,12 +234,28 @@ void main()
         hp.scCellThickStr     = cam.hpShapeD.w >= 0.0 ? cam.hpShapeD.w : hp.scCellThickStr;
         hp.forwardEcc         = cam.hpLightA.x >= 0.0 ? cam.hpLightA.x : hp.forwardEcc;
         hp.backwardEcc        = cam.hpLightA.y >= 0.0 ? cam.hpLightA.y : hp.backwardEcc;
-        hp.phiFwdIntensity = cam.cloudMsParams.x > 0.0 ? cam.cloudMsParams.x
-            : (cam.hpLightA.z >= 0.0 ? cam.hpLightA.z : hp.phiFwdIntensity);
-        hp.phiFwdDepthPow = cam.cloudMsParams.y > 0.0 ? cam.cloudMsParams.y
-            : (cam.hpLightA.w >= 0.0 ? cam.hpLightA.w : hp.phiFwdDepthPow);
-        hp.phiFwdDepthBias = cam.cloudMsParams.z != 0.0 ? cam.cloudMsParams.z : cam.hpLightB.x;
+        // phi_fwd 三参的权威来源是 HP 面板滑条（hpLightA/hpLightB）；
+        // cloudMsParams（早期工厂值，GUI 无入口）只在 HP 未设（<0）时回落。
+        // 原优先级反着写：工厂值 3.4/2.0/0.5 把 HP[18][19][20] 三条滑条压死，
+        // 且 3.4 超出参考建议范围（0.1~2.0）。
+        hp.phiFwdIntensity = cam.hpLightA.z >= 0.0 ? cam.hpLightA.z
+            : (cam.cloudMsParams.x > 0.0 ? cam.cloudMsParams.x : hp.phiFwdIntensity);
+        hp.phiFwdDepthPow = cam.hpLightA.w >= 0.0 ? cam.hpLightA.w
+            : (cam.cloudMsParams.y > 0.0 ? cam.cloudMsParams.y : hp.phiFwdDepthPow);
+        hp.phiFwdDepthBias = cam.hpLightB.x != 0.0 ? cam.hpLightB.x : cam.cloudMsParams.z;
         hp.phiFwdCompress     = cam.hpLightB.y >= 0.0 ? cam.hpLightB.y : hp.phiFwdCompress;
+        // 边界受光置信度 / MS 建立速率：cloudPhiParams 从 10-02 起一直下发，
+        // 但 v5 从未读取 —— 参考的边界 wrap 光照特性实际处于"永远关闭"。
+        // 负值=回落 hpDefaultConfig（与 Java 侧 A/B 通道约定一致）。
+        hp.phiFwdBoundary = cam.cloudPhiParams.x >= 0.0
+            ? clamp(cam.cloudPhiParams.x, 0.0, 1.0) : hp.phiFwdBoundary;
+        hp.phiFwdMSBuild = cam.cloudPhiParams.y > 0.0 ? cam.cloudPhiParams.y : hp.phiFwdMSBuild;
+        // 锥形步长比率 A/B 通道（≤0 = 回落参考宏 2.0）
+        hp.coneRatio = cam.cloudPhiParams.w > 0.0
+            ? clamp(cam.cloudPhiParams.w, 1.05, 8.0) : 2.0;
+        // 光步侵蚀细节开关（cloudShapeParams.w，性能优先默认关）：开 = 光步也做
+        // erosion 采样（参考行为，自阴影带细节，云 pass +~40%）；关 = 跳过。
+        hp.lightErosion = cam.cloudShapeParams.w > 0.5 ? 1.0 : 0.0;
         hp.scatterODScale     = cam.hpLightB.z >= 0.0 ? cam.hpLightB.z : hp.scatterODScale;
         hp.scatterCurvePow    = cam.hpLightB.w >= 0.0 ? cam.hpLightB.w : hp.scatterCurvePow;
         hp.msEccentricity     = cam.hpMiscA.x >= 0.0 ? cam.hpMiscA.x : hp.msEccentricity;
@@ -259,16 +276,22 @@ void main()
         hp.luminanceScale = cam.ueCloudA.w >= 0.0 ? cam.ueCloudA.w : 3.0;
         hp.sunDir = cfg.sunDir;
         hp.sunColor = cfg.sunColor;
-        hp.ambientTop = skyColor * 1.5;
+        // 云顶环境光倍率：cloudAmbientParams.x 从 10-02 起下发但从未被读取，
+        // 这里接通（≤0 回落 1.5）。云底仍用 0.15 固定近似（参考用的是 SH 向下的
+        // 地面反弹辐亮度，本仓无该探针——见决策文档受光差距清单）。
+        hp.ambientTop = skyColor * (cam.cloudAmbientParams.x > 0.0
+            ? clamp(cam.cloudAmbientParams.x, 0.1, 4.0) : 1.5);
         hp.ambientBottom = skyColor * 0.15;
         hp.viewDistance = clamp(cfg.viewDistance, 4000.0, 60000.0);
-        hp.fadeStart = 0.75;
+        // 远处淡出起点：HP 面板"远处淡出起点"（hpMiscA.z）优先，未设回落主面板
+        // 同名滑条（cfg.fadeStart）。原来的无条件 0.75 硬编码把两条滑条都压死。
+        hp.fadeStart = cam.hpMiscA.z >= 0.0 ? cam.hpMiscA.z : cfg.fadeStart;
         hp.time = cfg.time;
         float ingnHP = fract(52.9829189 * fract(dot(vec2(pixel),
             vec2(0.06711056, 0.00583715))));
         hp.jitter = fract(ingnHP);
         march = hpTraceVolumetricRay(origin, worldDirection, min(sceneDistance, cfg.viewDistance),
-            hp, cloudAtlas, baseTex, cloudWorley, cloudDistance);
+            hp, cloudAtlas, baseTex, cloudWorley, cloudDistance, hpMeanDistance);
     }
 
     float opacity = clamp(1.0 - march.a, 0.0, 1.0);
@@ -306,8 +329,7 @@ void main()
         cam.cloudParams7.x, cam.cloudParams7.y, cam.cloudParams7.z, cam.cloudParams7.w,
         cam.cloudParams8.x, cam.cloudParams8.y, cam.cloudParams8.z, cam.cloudParams8.w,
         cam.cloudParams9.x, cam.cloudParams9.y, cam.cloudParams9.z,
-        cam.fogExtrasParams.y, cam.fogExtrasParams.w, cam.fogExtrasParams.x,
-        cam.cloudParams4.y, cam.cloudParams4.z, cam.cloudParams4.w, cam.cloudParams9.w);
+        cam.fogExtrasParams.y, cam.fogExtrasParams.w, cam.fogExtrasParams.x);
 
     if(fog.transmittance < 1.0)
     {
@@ -317,7 +339,10 @@ void main()
     }
 
     float combinedFirst = min(cloudDistance, fog.firstDistance);
-    float reprojectDistance = cam.cloudMarchParams.w > 0.5 ? cloudDistance : combinedFirst;
+    // 参考语义：重投影用透射加权平均距离（hpTraceVolumetricRay 的 meanDistance），
+    // 首次命中距离逐帧跳变，破云场景下时域积累会抖。均值未命中（晴空/纯高空云）退回 combinedFirst。
+    float reprojectDistance = (cam.cloudMarchParams.w > 0.5 && hpMeanDistance < V4_EMPTY)
+        ? hpMeanDistance : combinedFirst;
     if(reprojectDistance <= 0.0 || reprojectDistance >= V4_EMPTY) reprojectDistance = combinedFirst;
     if(1.0 - fog.transmittance > 0.5) reprojectDistance = fog.meanDistance;
 

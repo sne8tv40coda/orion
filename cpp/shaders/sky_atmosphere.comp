@@ -15,6 +15,12 @@ const float SKY_ATM_EXPOSURE = 0.00033;
 #ifndef SKY_ATM_DEBUG
 #define SKY_ATM_DEBUG 0
 #endif
+// 2026-11-01：A 方案（Hillaire 结构）编译开关。0 = 整个模型从 SPV 里剔除。
+// include 位置有讲究：必须在下面 brunetonTransmittance 采样器声明**之后**，
+// 它要用那张 LUT 做透过率（见 sky_hillaire_common.glsl 的偏差 2）。
+#ifndef SKY_ATM_HILLAIRE
+#define SKY_ATM_HILLAIRE 1
+#endif
 #endif
 
 layout(set = 0, binding = 0) uniform CameraProperties
@@ -31,6 +37,11 @@ layout(set = 0, binding = 7) uniform sampler2D endSkyAtlas;
 layout(set = 0, binding = 3) uniform sampler2D brunetonTransmittance;
 layout(set = 0, binding = 4) uniform sampler3D brunetonScattering;
 layout(set = 0, binding = 5) uniform sampler3D brunetonSingleMie;
+#endif
+#if SKY_ATM_BRUNETON && SKY_ATM_HILLAIRE
+// A 模型（Hillaire 结构）：复用上面三张 Bruneton LUT 中的 transmittance，
+// 其余量自己 march。详见该文件头部的偏差说明。
+#include "sky_hillaire_common.glsl"
 #endif
 
 const float EARTH_RADIUS = 6360.0;
@@ -198,6 +209,35 @@ void main()
     DimensionlessSpectrum viewTransmittance =
         GetTransmittanceToTopAtmosphereBoundary(
             ATMOSPHERE, brunetonTransmittance, rCamKm, muB);
+
+    // =====================================================
+    // 2026-11-01 A 模型（Hillaire 结构）运行时切换
+    //
+    // cam.skyModelParams.x > 0.5 ⇒ 走 sky_hillaire_common.glsl 的逐像素 march
+    // （单次散射含真实行星阴影 + 解析多次散射近似）；否则保持 Bruneton 的
+    // 4 阶 delta LUT。两支输出**同量纲、同契约**，所以下面的标定/天气/滑杆/
+    // 落盘链两者共用，rt_test.rmiss 一行都不用改。
+    // 两个形状不同的模型不可能逐像素相同 ⇒ A 档留了 cam.skyModelParams.y
+    // 作为辐亮度标定倍率（1 = 出厂）。
+    // =====================================================
+#if SKY_ATM_HILLAIRE
+    if(cam.skyModelParams.x > 0.5)
+    {
+        skyHillaireEvaluate(
+            cameraAltitude,
+            direction,
+            sunDirB,
+            spectral,
+            spectralAureoleB);
+        spectralAureoleB *= aureoleScaleB;
+        spectral *= max(cam.skyModelParams.y, 0.0);
+        // A 模型的"视图透过率"（DEBUG 1 用的那个量）用同一支函数现算：
+        // 它在 A 分支里没有 LUT 之外的来源，直接取到大气顶的 Bruneton LUT 值
+        // —— 与 B 分支同源，保证诊断档在两模型下可比较。
+        viewTransmittance = GetTransmittanceToTopAtmosphereBoundary(
+            ATMOSPHERE, brunetonTransmittance, rCamKm, muB);
+    }
+#endif
 #if SKY_ATM_DEBUG == 1
     imageStore(skyScatteringOutput, pixel, vec4(viewTransmittance, 1.0));
     imageStore(skyTransmittanceOutput, pixel, vec4(1.0));
@@ -229,11 +269,17 @@ void main()
 #endif
     vec3 radiance = spectral * SKY_SPECTRAL_RADIANCE_TO_LUMINANCE *
         SKY_ATM_EXPOSURE;
+    // 2026-11-01：两个原本写死的常量改成可调（车道见 CameraUBO.skyModelParams）。
+    // 旧档 z/w 恒写 0 ⇒ 这里把 <= 0 当 1.0，保证老配置/老 DLL 逐位不变。
+    //   z = 夜间天空底光倍率（下面 0.05 那一项）
+    //   w = 雨天/雷暴天空压暗倍率（下面 0.55 / 0.35 / 雷暴染色的整体强度）
+    const float nightSkyScale = cam.skyModelParams.z > 0.0 ? cam.skyModelParams.z : 1.0;
+    const float rainSkyScale = cam.skyModelParams.w > 0.0 ? cam.skyModelParams.w : 1.0;
     float nightAmount = smoothstep(-0.03, -0.35, sunElevationB);
-    radiance += vec3(0.30, 0.42, 0.85) * 0.05 * nightAmount;
+    radiance += vec3(0.30, 0.42, 0.85) * 0.05 * nightAmount * nightSkyScale;
     radiance += SKY_LUT_SKY_EXTRA_SCALE * (
         evaluateAurora(direction, sunElevationB));
-    float rainSky = clamp(cam.weatherParams.x, 0.0, 1.0);
+    float rainSky = clamp(cam.weatherParams.x * rainSkyScale, 0.0, 1.0);
     float thunderSky = clamp(cam.weatherParams.y, 0.0, 1.0);
     float rainLuma = dot(radiance, vec3(0.2126, 0.7152, 0.0722));
     radiance = mix(radiance, vec3(rainLuma), rainSky * 0.55) *

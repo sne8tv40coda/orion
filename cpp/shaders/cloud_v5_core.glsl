@@ -6,6 +6,16 @@ const float HP_BASE_TILE    = 8000.0;
 const float HP_EROSION_TILE = 1400.0;
 #define HP_DENSITY_THRESHOLD     0.1
 #define HP_DENSITY_BASE_THRESHOLD 0.41
+// 覆盖率→阈值耦合（Schneider 口径 threshold ≈ 1-coverage）：密度阈值不再是常数，
+// 而是跟随逐柱 coverage 下移。没有这一步，滑块只调"云的浓度"不调"天空被遮比例"，
+// 0.48 的滑块也会得到 ~85% 的全覆盖灰毯（2026-11-01 v5top 实测）。
+// 两端按本仓 base 体积侵蚀后的分布标定（eroded 均值 ~0.58）：
+// coverage 0 → 阈值 0.85（稀疏），coverage 1 → 0.30（近全覆盖）。
+// 天气图 R 均值 ~0.66，滑块高端会饱和（0.9 只盖 52%），映射前乘 GAIN 补偿：
+// 实测 0.2 → ~10%，0.48 → ~60%，0.9 → ~85%。
+#define HP_COVERAGE_THR_GAIN     1.45
+#define HP_COVERAGE_THR_HI       0.85
+#define HP_COVERAGE_THR_LO       0.30
 #define HP_PRESENCE_SOFT         0.10
 #define HP_PHIFWD_OMEGA0         0.999
 #define HP_PHIFWD_KAPPA_SCALE    sqrt(3.0 * (1.0 - HP_PHIFWD_OMEGA0))
@@ -76,6 +86,7 @@ struct HPCloudConfig
     float scatterCurvePow;
     float lightErosion;
     float lightReuse;
+    float coneRatio;
 };
 
 // ---------------------------------------------------------------- 工具
@@ -156,6 +167,7 @@ HPCloudConfig hpDefaultConfig()
 
     c.lightErosion = 0.0;
     c.lightReuse = 2.0;
+    c.coneRatio = HP_CONE_RATIO;
     return c;
 }
 
@@ -277,18 +289,28 @@ void hpEvaluateCloudProperties(vec3 positionAlt, float slabH, float noiseMipOffs
     float scCoverage = hpSaturate(coverageRaw * cfg.coverage * (cfg.covMapScale * 1.1));
     coverage = mix(coverage, scCoverage * scCell, scStr);
 
-    float loCoverTopScale = 1.0 + 1.2 * hpSaturate(coverageHeight);
+    // 覆盖率→云顶高度拉伸（只加不减，Möbius 底部锚定）：参考的宏观分布特征——
+    // coverage 高的区域云体向上拉伸到 LoCoverTopMax 倍层高，晴区保持矮云。
+    // 旧代码写死 1.2（=默认档的硬编码），cfg.loCoverTopMax/Str（GUI 已下发）是死旋钮。
+    float loCoverTopScale = mix(1.0, max(cfg.loCoverTopMax, 1.0),
+        hpSaturate(coverageHeight) * clamp(cfg.loCoverTopStr, 0.0, 1.0));
     float heightForLUT = h / (1.0 + (loCoverTopScale - 1.0) * h);
 
     float scCompressedHeight = hpSaturate(h / max(cfg.scHeightScale, 0.05));
     float lutSampleHeight = mix(heightForLUT, scCompressedHeight, scStr);
     outLocalHeight = lutSampleHeight;
 
-    float hpRadial = 0.5;
+    // 参考实现：radialDist = 到天气图中心的距离（0=中心）。LUT 剖面沿半径渐变——
+    // 中心偏 Cb（浓密高塔），边缘偏 Cu（小积云）。旧代码写死 0.5，剖面全场一致。
+    float hpRadial = hpSaturate(length(weatherUV - 0.5) * 2.0);
     float heightGradient = hpProfileLUT(lutSampleHeight, hpRadial, cloudType);
     if(scStr > 0.0)
         heightGradient = mix(heightGradient, hpProfileCu(lutSampleHeight), scStr);
-    heightGradient *= 1.0 - smoothstep(0.82, 1.0, h);
+    // 云顶逐柱变化：weather.a（烘焙器低频场）抬/压每根柱子的顶截断。
+    // 旧写法 smoothstep(0.82,1.0,h) 是全天空同一条顶线，是"薄饼"的主因之一。
+    // topCut ∈ [0.80, 1.30]：低柱云顶压到 0.80，高柱到 1.30（等效不截）。
+    float topCut = mix(0.80, 1.30, hpSaturate(weather.a));
+    heightGradient *= 1.0 - smoothstep(topCut - 0.25, topCut, h);
 
     vec3 windOffset = vec3(windUV.x, 0.0, windUV.y);
     float minNoiseScale = HP_BASE_TILE / (6.0 * slabH);
@@ -322,7 +344,10 @@ void hpEvaluateCloudProperties(vec3 positionAlt, float slabH, float noiseMipOffs
         float scCellFactor = mix(1.0, scCellShaped, 0.6);
         float heightClip = mix(1.0, scCellFactor, scStr);
 
-        float threshold = HP_DENSITY_BASE_THRESHOLD;
+        // 阈值跟随逐柱 coverage：coverage 高（天气图湿区 × 滑块）→ 阈值低 → 成云；
+        // 干区阈值高到 base 噪声几乎过不了 → 蓝天。这是"滑块 ≈ 天空被遮比例"的实现。
+        float threshold = clamp(mix(HP_COVERAGE_THR_HI, HP_COVERAGE_THR_LO,
+            hpSaturate(coverage * HP_COVERAGE_THR_GAIN)), 0.18, 0.95);
 
         float detailStrength;
         if(cloudType < 0.5)
@@ -406,6 +431,20 @@ vec3 hpEvaluateSunLuminance(vec3 positionAlt, float currentLocalHeight,
     phiFwd = 0.0;
 
     float originRadius = length(positionAlt + vec3(0.0, cfg.planetRadius, 0.0));
+    // 参考 GetCloudVolumeIntersection_Light：太阳射线打中行星球体 ⇒ 直射被地球遮挡，
+    // 太阳项（含 phi_fwd 源）整体为 0。缺失时暮色段云底会被"穿地阳光"照亮。
+    // 判据：dir.y<0 且 |b|≥√(or²−R²)（b = or·dir.y）⇔ 仰角低于该高度的掠射角。
+    {
+        float earthB = originRadius * cfg.sunDir.y;
+        float earthC0 = originRadius * originRadius
+            - cfg.planetRadius * cfg.planetRadius;
+        if(earthB < 0.0 && earthB * earthB >= earthC0)
+        {
+            lightExtinctionOD = 0.0;
+            phiFwd = 0.0;
+            return vec3(0.0);
+        }
+    }
     float topRadius = cfg.planetRadius + cfg.topHeight;
     float b = originRadius * cfg.sunDir.y;
     float c0 = originRadius * originRadius - topRadius * topRadius;
@@ -416,7 +455,9 @@ vec3 hpEvaluateSunLuminance(vec3 positionAlt, float currentLocalHeight,
     {
         float coverDist = clamp(totalLightDistance, 0.0, HP_CONE_MAX_DISTANCE);
         int numSteps = clamp(cfg.lightSteps, 4, 12);
-        float r = HP_CONE_RATIO;
+        // 锥形步长比率：参考是编译期宏 CONE_RATIO=2.0；本仓作 A/B 通道
+        //（cloudPhiParams.w，≤0 回落宏），经 cfg.coneRatio 传入保持核心无 UBO 依赖。
+        float r = max(cfg.coneRatio, 1.05);
         float w0 = coverDist * (r - 1.0) / max(pow(r, float(numSteps)) - 1.0, 1.0e-4);
         w0 = max(w0, HP_CONE_MIN_STEP);
 
@@ -564,9 +605,13 @@ vec4 gHpDebugInfo = vec4(0.0);
 
 vec4 hpTraceVolumetricRay(vec3 rayOriginPlanet, vec3 rayDir, float maxDist,
     HPCloudConfig cfg, sampler2D weatherTex, sampler3D baseTex, sampler3D erosionTex,
-    out float hitDistance)
+    out float hitDistance, out float meanDistance)
 {
     hitDistance = maxDist;
+    // 参考 VolumetricRayResult.meanDistance：透射率×密度加权的平均命中距离。
+    // 首次命中距离在破云/边缘场景下逐帧跳变，重投影（时域积累）用它就抖；
+    // 加权均值才是稳定的"这条视线主要打在多远"的估计。
+    meanDistance = maxDist;
 
     cfg.cameraAlt = rayOriginPlanet - vec3(0.0, cfg.planetRadius, 0.0);
 
@@ -609,6 +654,8 @@ vec4 hpTraceVolumetricRay(vec3 rayOriginPlanet, vec3 rayDir, float maxDist,
     float firstStep = min(stepLargeRaw, stepLargeNearCap);
     float dist = cfg.jitter * firstStep;
     float hit = maxDist;
+    float meanDistAccum = 0.0;
+    float meanDistWeight = 0.0;
 
     float cosAngle = dot(rayDir, cfg.sunDir);
     float phaseFunction[3];
@@ -655,6 +702,9 @@ vec4 hpTraceVolumetricRay(vec3 rayOriginPlanet, vec3 rayDir, float maxDist,
             if(fullDensity > 0.001)
             {
                 hit = min(hit, absDist);
+                float twd = transmittance * fullDensity;
+                meanDistAccum += absDist * twd;
+                meanDistWeight += twd;
 
                 float relDist = dist / max(totalDist, 1.0);
                 if(lightTick <= 0)
@@ -686,6 +736,7 @@ vec4 hpTraceVolumetricRay(vec3 rayOriginPlanet, vec3 rayDir, float maxDist,
 
 
     hitDistance = hit;
+    meanDistance = (meanDistWeight > 0.0) ? meanDistAccum / meanDistWeight : hit;
     gHpDebugInfo.z = float(iterCount);
     gHpDebugInfo.w = hit;
     return vec4(inScattering, transmittance);
@@ -800,6 +851,9 @@ float hpGradient2D(vec2 p, float tile)
 }
 
 // ---- mode 0：weather 2D ----
+// A 通道 = 云顶高度变化（0..1，低频）。原先写死 0.5 纯浪费；没有逐柱云顶差
+// 整层就是"薄饼"——v5slice 实测云底/云顶沿 10 km 剖面基本等高。两档 value 噪声
+// 给出 ~24 km / ~12 km 的天气尺度起伏。
 vec4 hpRenderWeather(vec2 uv)
 {
     const float tile = 8.0;
@@ -808,15 +862,22 @@ vec4 hpRenderWeather(vec2 uv)
         hpValue2D(p * 2.0 + 71.3, 16.0) - 0.5,
         hpValue2D(p * 2.0 + 137.9, 16.0) - 0.5) * 1.6;
     vec2 q = p + warp;
-    float cov = 0.275 * (hpGradient2D(q * 2.0 + 3.1, 16.0) + 0.5)
-              + 0.350 * (hpGradient2D(q * 4.0 + 17.9, 32.0) + 0.5)
-              + 0.375 * (hpGradient2D(q * 8.0 + 41.3, 64.0) + 0.5);
+    // 覆盖率倍频：必须包含**大尺度天气系统**（24/12 km 级聚簇）。
+    // 参考用的是带天气系统的天气图（大片云区 / 大片晴区）；旧烘焙最大特征只有
+    // 6 km ⇒ 云均匀撒满全天，"分布怪"的主因。均值保持 0.5 ⇒ (cov-0.5)*2.4+0.66
+    // 的重映射均值不变（0.66），覆盖率标定不受影响。
+    float cov = 0.30 * (hpGradient2D(q * 0.5 + 3.1, 4.0) + 0.5)
+              + 0.28 * (hpGradient2D(q * 1.0 + 17.9, 8.0) + 0.5)
+              + 0.24 * (hpGradient2D(q * 2.0 + 41.3, 16.0) + 0.5)
+              + 0.18 * (hpGradient2D(q * 4.0 + 71.3, 32.0) + 0.5);
     cov = clamp((cov - 0.5) * 2.4 + 0.66, 0.0, 1.0);
     float type = clamp(0.5 + 0.9 * (hpValue2D(p * 0.25 + 91.1, 2.0) - 0.5), 0.0, 1.0);
     float blob = 0.62 * hpWorley2D(p * 0.75, 6.0)
                + 0.38 * hpWorley2D(p * 1.5 + 7.31, 12.0);
     float scMask = smoothstep(0.55, 0.85, blob);
-    return vec4(cov, type, scMask, 0.5);
+    float topVar = 0.65 * (hpValue2D(p * 0.5 + 51.7, 4.0))
+                 + 0.35 * (hpValue2D(p * 1.0 + 133.7, 8.0));
+    return vec4(cov, type, scMask, clamp(topVar, 0.0, 1.0));
 }
 
 // ---- mode 1：base 3D（R = PerlinWorley）----

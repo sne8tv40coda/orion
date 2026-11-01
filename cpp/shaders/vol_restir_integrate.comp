@@ -209,7 +209,8 @@ void main()
 
                 float energyScale = LOCAL_LIGHT_ENERGY_SCALE * localLightIntensity();
                 float attenuation = vptLocalLightDistanceAttenuation(distanceToLight);
-                float rangeFade = vptLocalLightRangeFade(distanceToLight, emissionLevel);
+                float rangeFade = vptLocalLightRangeFade(
+                    distanceToLight, light.meta.x, emissionLevel);
 
                 if(rangeFade > 0.0 &&
                    volRestirNeeVisible(froxelCenter, light.worldPosEmission.xyz,
@@ -217,8 +218,10 @@ void main()
                 {
                     float phase = volRestirLightPhase(toLight, viewDirection);
 
+                    // 2026-10-31：亮度按光源档案（×15 保持旧的 0..15 量级）。
                     radiance = decodeLocalLightColor(light.meta.x) *
-                        emissionLevel * attenuation * rangeFade * energyScale * phase;
+                        localLightProfileBrightness(light.meta.x, emissionLevel) * 15.0 *
+                        attenuation * rangeFade * energyScale * phase;
 
                     lightDir = normalize(toLight);
                     hasLight = true;

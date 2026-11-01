@@ -1368,7 +1368,10 @@ void main() {
     // Ordinary sky/environment rays still receive the physical sky colour.
     if((payload.state & 0x7u) != 5u)
     {
-        payload.albedoPacked = packAlbedoUnorm(clamp(finalColor, 0.0, 2.5));
+        // 2026-10-31：天空是 HDR（旧档 vec3 clamp 到 2.5），必须走带缩放的车道，
+        // 否则 packUnorm4x8 会把 >1 的部分削成 1.0 ⇒ 天空整体变暗变平。
+        // 解码在 hit_payload.glsl 的 unpackAlbedoUnorm（alpha 车道还原缩放）。
+        payload.albedoPacked = packSkyRadianceUnorm(finalColor);
     }
     // Deferred mode: these resets happen in the ray-generation dispatcher, which
     // owns the local HitPayload; the identity payload has no such fields.

@@ -1,9 +1,9 @@
 {
 	"schemaVersion": 1,
 	"id": "orion",
-	"version": "beta 0.42",
+	"version": "beta 0.43",
 	"name": "Orion",
-	"description": "Orion RT — real-time path traced renderer for Minecraft (beta 0.42).",
+	"description": "Orion RT — real-time path traced renderer for Minecraft (beta 0.43).",
 	"authors": [
 		"yani-neko7"
 	],

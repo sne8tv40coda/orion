@@ -124,6 +124,51 @@
 #define VPT_GLASS_ALPHA_BLEND_PAIR_FACES 0
 #endif
 
+// =====================================================
+// 2026-10-31（第五轮，用户授权重构）：**确定性多层传输**
+//
+// 抽签口径（上面的 update() + 两个 rahit 的 acceptLayer）的两个结构性问题：
+//   1) 单槽抽签靠"逐帧换蓝噪声 + 下游时域平均"收敛，但本引擎玻璃像素的
+//      时域判据在 pane/背景之间跳变 ⇒ 抽签结果沉淀成固定形状噪点
+//      （2026-10-31 用户复测：不随 RR 挡位变化 —— 合成发生在 RR 之后，
+//      RR 摸不到它）。
+//   2) SINGLE_LAYER=1 后 any-hit 永不记录 ⇒ 第二层及更深的玻璃**完全丢失**
+//      （异色玻璃叠放只剩最近一层的颜色与不透明度）。
+//
+// 本口径把合成式逐层**确定性**展开（single-ray 链可以精确求和，无需抽签）：
+//   C_out = C_bg · Π_i(1−a_i) + Σ_i tint_i · a_i · Π_{j<i}(1−a_j) · L_i
+// L_i 统一用最近层的受光（同一面墙的玻璃受光一致；误差远小于旧口径的
+// "深层完全丢失"）。pane 受光本身在 rgen 侧换成
+// 太阳 NEE + 环境 + 本地光时域 RIS（见 rt_test.rgen 77 号图处说明）。
+//
+// 状态仍住 73/74/75 三张图（payload 不扩），通道语义改为：
+//   73 gbuffer : rgb = Σ_i tint_i·w_i / a_div（预解调口径；a_div = 最近层 alpha，
+//                由 reset 写进 .a —— 加法累积 ⇒ 与写入顺序无关）
+//                a   = a_div
+//   74 meta    : x = Π(1−a_i)（bgT；finish.comp 的 backgroundAlpha，口径不变）
+//                y = 最近层 hitT（**合成有效标志**，只有 rgen 在 trace 返回后置位
+//                    ⇒ 清玻璃早退等未走到写入的路径天然不产生合成）
+//                zw = 最近层 octahedral 法线（只有 rgen 写）
+//   75 aux     : w = 已累积的深层进入面数（面预算）
+//                x（随机阈值）/ y（geometryHash）/ z（旧"体内标志"）退役。
+//                ⚠ 出入面配对**不需要**任何标志：链射线带
+//                gl_RayFlagsCullBackFacingTrianglesEXT（rt_test.rgen:1022），
+//                玻璃体的出射面（背面）永不产生 any-hit ⇒ 每个体天然只命中
+//                一次入射面。2026-10-25 的"双重吸收"是旧几何口径的遗留问题，
+//                当前 flag 组合下不存在。
+//   随机阈值通道（x）退役：保留地址布局，不再读写。
+// 写入顺序与内容无关（rgb 全是加法）⇒ reset / any-hit / rgen 三方顺序自由。
+// =====================================================
+#ifndef VPT_GLASS_DETERMINISTIC_CHAIN
+#define VPT_GLASS_DETERMINISTIC_CHAIN 1
+#endif
+#if VPT_GLASS_DETERMINISTIC_CHAIN && VPT_GLASS_ALPHA_BLEND_PANE_ILLUMINATION
+// 确定性口径与 PANE_ILLUMINATION 实验分支不兼容（那套把 paneIllumination
+// 直接加进 transmittedRadiance、绕过 deferred 合成）。做实验请先关确定性链。
+#undef VPT_GLASS_ALPHA_BLEND_PANE_ILLUMINATION
+#define VPT_GLASS_ALPHA_BLEND_PANE_ILLUMINATION 0
+#endif
+
 vec3 glassAlphaBlendTransmission(vec3 tint, float alpha)
 {
     const float clampedAlpha = clamp(alpha, 0.0, 1.0);
@@ -453,6 +498,109 @@ float glassAlphaBlendSurfaceUpdate(
     imageStore(glassAlphaBlendLightImage, pixel, aux);
 
     return meta.x;
+}
+
+// =====================================================
+// 2026-10-31（第五轮）：确定性口径的三个入口（VPT_GLASS_DETERMINISTIC_CHAIN=1）。
+// 对应关系：ChainReset ≈ createEmpty()、ChainAccumulate ≈ update() 的确定性版、
+// ChainWriteNearest = 本引擎特有的"最近层回填"（Remix 把最近层留在
+// geometry_resolver 的槽位里；我们最近层 = 相机主命中面，天然在 rgen 手里）。
+// =====================================================
+
+// 链起点：只写"骨架"，不写任何层内容。
+//   74.x = 1 − a0 ：最近层的背景透射率已计入 ⇒ any-hit 的深层权重天然带上
+//                   Π_{j<2}(1−a_j) 因子（a0 与两个 rahit 的 chainAlpha 同式）；
+//   74.y = 0      ：保持"无效" —— 最近层内容由 rgen 在 trace 返回后写入，
+//                   清玻璃早退等路径不会写 ⇒ 天然不产生合成（10-28 教训）；
+//   75.z = 0      ：无需体内标志 —— 链射线剔除背面，出射面永不产生 any-hit。
+void glassAlphaBlendChainResetDeterministic(ivec2 pixel, float nearestAlpha)
+{
+    const float a0 = clamp(nearestAlpha, 0.0, 1.0);
+    imageStore(glassAlphaBlendGbufferImage, pixel, vec4(0.0, 0.0, 0.0, a0));
+    imageStore(
+        glassAlphaBlendMetaImage,
+        pixel,
+        vec4(clamp(1.0 - a0, 0.0, 1.0), 0.0, 0.0, 0.0));
+    // x/y = 退役通道；z = 无需体内标志（链射线剔除背面 ⇒ 出射面永不命中）；
+    // w = 深层面预算
+    imageStore(glassAlphaBlendLightImage, pixel, vec4(0.0, 0.0, 0.0, 0.0));
+}
+
+// 深层玻璃面的确定性累积（any-hit 调用；每个进入面一次）。
+// 返回累乘后的 bgT；返回 -1.0 = 面预算耗尽（调用方按遮挡收尾，< 1/255 判据天然覆盖）。
+// 链射线剔除背面（SECONDARY_TRAVERSE_FLAGS_4STATE）⇒ 每个玻璃体只有入射面
+// 到达这里，无需出入面配对。
+float glassAlphaBlendChainAccumulate(ivec2 pixel, vec4 demodColor)
+{
+    vec4 gbuffer = imageLoad(glassAlphaBlendGbufferImage, pixel);
+    vec4 meta = imageLoad(glassAlphaBlendMetaImage, pixel);
+    vec4 aux = imageLoad(glassAlphaBlendLightImage, pixel);
+
+    // 面预算：只数深层进入面（最近层不经过 any-hit）。
+    if(aux.w >= float(ORION_GLASS_CHAIN_MAX_FACES))
+    {
+        return -1.0;
+    }
+
+    const float layerAlpha = clamp(demodColor.a, 0.0, 1.0);
+    // 本层权重 w_i = a_i · Π_{j<i}(1−a_j)；meta.x 此刻正是 Π_{j<i}(1−a_j)。
+    const float layerWeight = layerAlpha * clamp(meta.x, 0.0, 1.0);
+    const float aDiv = max(gbuffer.a, 1.0e-3);
+
+    // 预解调色累加：Σ tint_i·w_i / a_div（纯加法 ⇒ 与 reset/write 的顺序无关）。
+    gbuffer.rgb += demodColor.rgb * (layerWeight / aDiv);
+    meta.x = clamp(meta.x * (1.0 - layerAlpha), 0.0, 1.0);
+    aux.w = min(aux.w + 1.0, 255.0);
+
+    imageStore(glassAlphaBlendGbufferImage, pixel, gbuffer);
+    imageStore(glassAlphaBlendMetaImage, pixel, meta);
+    imageStore(glassAlphaBlendLightImage, pixel, aux);
+
+    return meta.x;
+}
+
+// 最近层回填（rgen 在 trace 返回后调用；清玻璃早退路径不会走到这里）。
+// rgb 是**加法**：any-hit 先写入的深层累积不被覆盖。74.y 在这里才置位。
+void glassAlphaBlendChainWriteNearest(
+    ivec2 pixel,
+    vec3 tint0,
+    vec3 nearestNormal,
+    float nearestHitT)
+{
+    vec4 gbuffer = imageLoad(glassAlphaBlendGbufferImage, pixel);
+    vec4 meta = imageLoad(glassAlphaBlendMetaImage, pixel);
+
+    // w_0 = a0 · 1，除数 a_div = a0 ⇒ 最近层贡献恰为 tint0（预解调口径）。
+    gbuffer.rgb += clamp(tint0, vec3(0.0), vec3(1.0));
+    meta.y = max(nearestHitT, 1.0e-3);
+    meta.zw = glassAlphaBlendEncodeNormal(nearestNormal);
+
+    imageStore(glassAlphaBlendGbufferImage, pixel, gbuffer);
+    imageStore(glassAlphaBlendMetaImage, pixel, meta);
+}
+
+// 逐剖面"体不透明度"表（与 rt_test.rahit 的 getTransparentProfileTransmissionAnyHit
+// 同一张表；rgen 不包含 transparent_profile_common.glsl，且重定义会撞名 ⇒
+// 链契约内放一份，两入口看到同一个值）。
+float glassChainProfileAlpha(uint transparentProfile)
+{
+    if(transparentProfile == 1u)
+    {
+        return 0.06;
+    }
+    if(transparentProfile == 2u)
+    {
+        return 0.55;
+    }
+    if(transparentProfile == 3u)
+    {
+        return 0.45;
+    }
+    if(transparentProfile == 4u)
+    {
+        return 0.32;
+    }
+    return 1.0;
 }
 
 #endif // GLASS_CHAIN_COMMON_GLSL

@@ -126,3 +126,12 @@
     vec4 hpMiscA;
 
     vec4 sparseParams;
+
+    // ── skyModelParams ──（2026-11-01 追加在末尾：std140 允许块提前结束，
+    // 但中间插入会让后面所有字段整体平移，所以只能追加）
+    //   x = 天空散射模型：0 = Bruneton 预计算 LUT（默认），1 = Hillaire 结构
+    //       （逐像素 march + 解析多次散射，见 sky_hillaire_common.glsl）
+    //   y = Hillaire 分支的辐亮度标定倍率（1 = 出厂；两模型量纲不完全一致，
+    //       留这个旋钮做 A/B 对齐，不必重编）
+    //   z/w = 保留（写 0）
+    vec4 skyModelParams;

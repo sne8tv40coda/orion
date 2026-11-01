@@ -1,6 +1,10 @@
 #ifndef LOCAL_LIGHT_GRID_COMMON_GLSL
 #define LOCAL_LIGHT_GRID_COMMON_GLSL
 
+// 光源档案表（色温/发射色、满级亮度、基础传播距离）。雾、体素 GI 与主 raygen
+// 共用同一份，避免再出现"rgen 与雾两份调色板取值不同"的历史问题。
+#include "local_light_profile.glsl"
+
 // ---- binding 12：本地光表（与 rgen 的 binding 17 同一 buffer）----
 // 记录格式与 C++ 的 GPULocalLightRecord 逐字节对应（32 字节）：
 //   worldPosEmission = (blockX, blockY, blockZ, emission 0..15)
@@ -24,7 +28,6 @@ layout(std430, binding = 13, set = 0) readonly buffer FogLocalLightGridBuffer
 const float LOCAL_LIGHT_GRID_CELL_SIZE = 64.0;
 const float LOCAL_LIGHT_MAX_RANGE = 30.0;
 const float VPT_LOCAL_MAX_DISTANCE = 30.0;
-const float VPT_LOCAL_RANGE_PER_EMISSION = 2.0;
 const float VPT_LOCAL_FADE_START_FRACTION = 0.40;
 const float LOCAL_LIGHT_ENERGY_SCALE = 0.35;
 
@@ -109,19 +112,29 @@ bool localLightGridLookupCell(
     return false;
 }
 
-// rgen:2488 起的三段范围/衰减（逐行照抄）。
-float vptLocalLightRange(float emissionLevel)
+// 用户旋钮「本地光距离系数」（0.25 ~ 2.0，1.0 = 标准）。旧 DLL 恒写 0
+// （reserved 位）⇒ 回落 1.0，双向兼容。
+float localLightRangeScale()
 {
-    float userLocalMax = cam.rainWallParams1.w;
-    float localMaxDistance = userLocalMax > 0.5
-        ? min(VPT_LOCAL_MAX_DISTANCE, userLocalMax)
-        : VPT_LOCAL_MAX_DISTANCE;
-    return min(localMaxDistance, max(emissionLevel * VPT_LOCAL_RANGE_PER_EMISSION, 2.0));
+    float user = cam.rainWallParams1.w;
+    return (user >= 0.05 && user <= 8.0) ? user : 1.0;
 }
 
-float vptLocalLightRangeFade(float distanceToLight, float emissionLevel)
+// 传播距离 = 该光源档案的基础距离 × 用户系数，最后封顶 30 格。
+// 2026-10-31：不再用"emission × 2 格"的统一口径 —— 火把、岩浆、信标各自在
+// local_light_profile.glsl 里有物理上合理的距离（岩浆 26 格、火把 11 格…）。
+float vptLocalLightRange(uint typeCode, float emissionLevel)
 {
-    float range = vptLocalLightRange(emissionLevel);
+    float base = localLightProfileBaseRange(typeCode, emissionLevel);
+    return clamp(base * localLightRangeScale(), 1.5, VPT_LOCAL_MAX_DISTANCE);
+}
+
+float vptLocalLightRangeFade(
+    float distanceToLight,
+    uint typeCode,
+    float emissionLevel)
+{
+    float range = vptLocalLightRange(typeCode, emissionLevel);
     return 1.0 - smoothstep(
         range * VPT_LOCAL_FADE_START_FRACTION,
         range,
@@ -134,18 +147,10 @@ float vptLocalLightDistanceAttenuation(float distanceToLight)
         0.025 * distanceToLight * distanceToLight);
 }
 
-// rgen:8573 decodeLocalLightColor()（逐行照抄；发光色表是 Minecraft 光照等级
-// 分类的结果，与 Java 的 classifyLocalLightType 成对）。
+// 发射色：查光源档案表（色温或给定发射色），rgen 与雾共用同一份。
 vec3 decodeLocalLightColor(uint typeCode)
 {
-    if(typeCode == 0u) return vec3(1.00, 0.90, 0.75);
-    if(typeCode == 1u) return vec3(1.00, 0.62, 0.28);
-    if(typeCode == 2u) return vec3(0.25, 0.72, 1.00);
-    if(typeCode == 3u) return vec3(1.00, 0.18, 0.08);
-    if(typeCode == 4u) return vec3(1.00, 0.34, 0.08);
-    if(typeCode == 5u) return vec3(1.00, 0.82, 0.52);
-    if(typeCode == 6u) return vec3(0.70, 0.28, 1.00);
-    return vec3(1.00, 0.90, 0.75);
+    return localLightProfileColor(typeCode);
 }
 // rgen:1318 localLightIntensity()：用户滑杆「本地光源照射强度」，主机写的是
 // intensity + 1.0，这里减 1 还原；车道没下发过（0）时退回 1.0。

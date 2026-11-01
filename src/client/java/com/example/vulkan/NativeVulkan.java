@@ -272,6 +272,14 @@ public final class NativeVulkan {
 
     public static native boolean getSSSMode();
 
+    /**
+     * 本地光距离系数（设置界面滑块的 0.25 ~ 2.00，1.0 = 标准）。
+     *
+     * <p>语义在 2026-10-31 从"最远距离（格）"改成**整体系数**：每个光源方块在
+     * {@code cpp/shaders/local_light_profile.glsl} 里有各自的基础传播距离
+     * （火把 11 格、荧石 18 格、岩浆 26 格…），这里只统一缩放，乘积在着色器里
+     * 仍被 30 格封顶。纯状态拷贝，不产生 Vulkan 调用。</p>
+     */
     public static native boolean setLocalLightMaxDistance(
             float value
     );
@@ -311,6 +319,21 @@ public final class NativeVulkan {
 
     public static native boolean setPowderStrength(
             float value
+    );
+
+    /**
+     * 2026-11-01 天空散射模型切换。
+     *
+     * @param model 0 = Bruneton 预计算 LUT（出厂），1 = Hillaire 结构
+     *              （逐像素 march + 解析多次散射，A 方案）
+     * @param scale Hillaire 分支的辐亮度标定倍率 0.05..8（1 = 出厂；两个模型的
+     *              量纲不完全一致，用它把 A 档对到 B 档）
+     */
+    public static native boolean setSkyModelSettings(
+            int model,
+            float scale,
+            float nightSkyAmbientScale,
+            float rainSkyDimScale
     );
 
     /** 相位上限过渡 [0,1]：0 = 旧视觉钳制 1.05，1 = 双瓣 HG 自然峰值 2.52（默认）。 */
@@ -621,13 +644,6 @@ public final class NativeVulkan {
      * 那三项自 2026-10-19 体积雾重做后已无着色器消费者）。JNI 符号与数组长度不变。
      */
     public static native boolean setFogExtrasParams(float[] params);
-
-    /**
-     * 2026-10-23 雨天地面雾浪（CameraUBO 的 cloudParams4.y/.z/.w + cloudParams9.w）。
-     * 数组 4 项：{enabled(0/1), 强度, 波长(格), 漂移速度(格/秒)}。
-     * 见 RTXSettingsConfig.FogWispSettings.toParamArray()。
-     */
-    public static native boolean setFogWispParams(float[] params);
 
     /**
  * 2026-10-10 **#3 天光自遮挡 / #4 时域速度抑制**
@@ -1787,6 +1803,14 @@ public final class NativeVulkan {
         )) {
             System.err.println("[RTX CONFIG] Failed to restore powder strength");
         }
+        if(!setSkyModelSettings(
+                RTXSettingsConfig.getSkyModel(),
+                RTXSettingsConfig.getSkyModelScale(),
+                RTXSettingsConfig.getNightSkyAmbientScale(),
+                RTXSettingsConfig.getRainSkyDimScale()
+        )) {
+            System.err.println("[RTX CONFIG] Failed to restore sky model settings");
+        }
         if(!setCloudSunForwardScattering(
                 RTXSettingsConfig.getCloudSunForwardScattering()
         )) {
@@ -2024,9 +2048,6 @@ public final class NativeVulkan {
         RTXSettingsConfig.FogExtrasSettings fogExtras = RTXSettingsConfig.getFogExtrasSettings();
         if(!setFogExtrasParams(fogExtras.toParamArray()))
             System.err.println("[RTX CONFIG] Failed to restore fog extras settings");
-        RTXSettingsConfig.FogWispSettings fogWisp = RTXSettingsConfig.getFogWispSettings();
-        if(!setFogWispParams(fogWisp.toParamArray()))
-            System.err.println("[RTX CONFIG] Failed to restore fog wisp settings");
         RTXSettingsConfig.CloudAerialSettings cloudAerial =
                 RTXSettingsConfig.getCloudAerialSettings();
         if(!setCloudAerialParams(cloudAerial.toParamArray()))

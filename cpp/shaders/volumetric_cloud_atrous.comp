@@ -43,7 +43,13 @@ void main()
     }
     float meanLuminance = luminanceSum / 9.0;
     float variance = max(luminanceSquareSum / 9.0 - meanLuminance * meanLuminance, 0.0);
-    float luminanceScale = max(sqrt(variance) * pc.phiLum, 1.0e-4);
+    // 2026-10-31：亮度容差必须有一个**按信号量级的绝对下限**。
+    // 雾是低频均匀场，3x3 方差趋零 ⇒ sqrt(variance)*phiLum 掉到 1e-4 量级，
+    // 于是 exp(-|Δlum|/1e-4) 对任何抖动残差都判 0，4 轮 à-trous 在雾区退化成
+    // “只采中心像素”，半分辨率上的抖动图案原样留到上采样 ⇒ 屏幕上的细密纱窗。
+    // 下限取中心亮度的 30%（云的强边缘通常差 2 倍以上，仍被拒，保边不丢）。
+    float luminanceScale = max(sqrt(variance) * pc.phiLum,
+        max(centerLuminance, 1.0e-3) * 0.30);
     float depthScale = max(32.0, centerDistance * pc.phiDepthRel);
     float alphaScale = max(pc.phiAlpha, 1.0e-4);
 

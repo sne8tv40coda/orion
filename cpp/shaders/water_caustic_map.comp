@@ -1,0 +1,146 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+
+// ============================================================================
+// 水面焦散图（2026-11-01 重构：顶点拉伸光栅 -> 逐 texel compute）
+//
+// 旧实现的账（PERF L10 GPU 实测）：
+//   · water_caustic_map.vert 是 256² quad × 6 顶点 × 3×3 实例 = 3,538,944 顶点；
+//   · 层 0 还按 3 档 IOR 各 draw 一次（C++ 的 for channel 0..2），加反射层
+//     共 4 次 draw ⇒ **每帧 14,155,776 顶点**；
+//   · 输出 1024² × 2 层 × 11 级 mip，每帧重建（默认不节流）；
+//   · 结果：稳态 4~6ms，日出第一个 sunY>0 的帧 **441ms**（GPU 从夜间低频冷
+//     状态直接吃一个千万顶点的 pass）。
+//
+// 新实现：不发射任何顶点，对 512² 每个 texel 求一次面密度（雅可比行列式倒数）。
+// 数学与 GPU Gems 2 Ch.2 / 旧 frag 的 dFdx 面积比完全同源，只是把"渲染时让
+// 光栅器去算导数"换成"自己用 5 点有限差分算"：
+//
+//     接收点 q(p) = p.xz + d.xz * (refHeight / |d.y|),  d = refract/reflect
+//     J = [dq/dx, dq/dz]（中心差分，步长 = 一个 texel）
+//     density = 1 / |det J|      —— 面积压缩 = 光聚集
+//
+// 平坦水面 det J == 1 ⇒ density == 1，与旧图的"平水 = 1"口径逐字一致，
+// 所以消费端（binding 69/70）不需要任何改动。
+//
+// 色散：只算 1 次雅可比，RGB 用同一密度乘固定色散系数（成本 1×）。
+// ============================================================================
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D waterFftSlope;
+layout(rgba16f, set = 0, binding = 1) uniform writeonly image2DArray causticOutput;
+
+layout(push_constant) uniform WaterCausticMapPush
+{
+    vec4 sunDirection;   // xyz = 指向太阳（单位向量，y > 0）；w 保留
+    vec4 params;         // x = tile 周期（格）；y = 折射参考深度；z = 反射参考高度；w = 色散强度
+} pc;
+
+// 与 VulkanCore.cpp 的 WATER_CAUSTIC_MAP_RESOLUTION 逐字对应（宿主有 static_assert）。
+const uint CAUSTIC_RESOLUTION = 512u;
+const float CAUSTIC_RESOLUTION_F = 512.0f;
+
+const float DETAIL_TILE = 32.0;
+
+// 单档 IOR（用户 2026-11-01 定案：色散用固定系数近似，不再按 3 个 IOR 各算一遍）。
+const float CAUSTIC_IOR = 1.3335;
+const vec3 CAUSTIC_DISPERSION_RGB = vec3(-0.35, 0.0, 0.35);
+
+// 与旧 vert 的两段斜率叠加同一口径（base = .rg，detail = .ba，detail 以
+// DETAIL_TILE 为周期重采一次）。
+vec2 slopeAt(vec2 uv)
+{
+    const vec2 baseSlope = textureLod(waterFftSlope, uv, 0.0).rg;
+    const vec2 detailSlope = textureLod(
+        waterFftSlope,
+        uv * (pc.params.x / DETAIL_TILE),
+        0.0
+    ).ba;
+    return baseSlope + detailSlope;
+}
+
+// 水面点 -> 参考接收面上的落点。refHeight 由调用方按层给（折射 1 格、反射 16 格）。
+// reflectLayer = true 时走镜面反射（layer 1），否则走折射（layer 0）。
+vec2 projectToReceiver(vec2 sourceXZ, vec2 slope, float refHeight, bool reflectLayer)
+{
+    const vec3 normal = normalize(vec3(-slope.x, 1.0, -slope.y));
+    const vec3 incoming = -normalize(pc.sunDirection.xyz);
+
+    if(reflectLayer)
+    {
+        const vec3 outgoing = normalize(reflect(incoming, normal));
+        const float up = max(outgoing.y, 1.0e-3);
+        return sourceXZ + outgoing.xz * (refHeight / up);
+    }
+
+    const vec3 refracted = refract(incoming, normal, 1.0 / CAUSTIC_IOR);
+    const float down = min(refracted.y, -1.0e-3);
+    return sourceXZ + refracted.xz * (refHeight / -down);
+}
+
+void main()
+{
+    const ivec2 texel = ivec2(gl_GlobalInvocationID.xy);
+    const int layer = int(gl_GlobalInvocationID.z);
+
+    if(texel.x >= int(CAUSTIC_RESOLUTION) ||
+       texel.y >= int(CAUSTIC_RESOLUTION) ||
+       layer >= 2)
+    {
+        return;
+    }
+
+    const float tilePeriod = max(pc.params.x, 1.0e-3);
+    // 层 0（折射）用 params.y，层 1（反射）用 params.z —— 一次 dispatch 出两层，
+    // 省掉第二次 bind/push。
+    const bool reflectLayer = (layer == 1);
+    const float refHeight = max(reflectLayer ? pc.params.z : pc.params.y, 0.0);
+    const float cell = tilePeriod / CAUSTIC_RESOLUTION_F;
+
+    const vec2 uv = (vec2(texel) + 0.5) / CAUSTIC_RESOLUTION_F;
+    const vec2 sourceXZ = uv * tilePeriod;
+
+    const vec2 texelStep = vec2(1.0 / CAUSTIC_RESOLUTION_F, 0.0);
+
+    // 中心 + 四个邻居：共 5 次斜率采样（每点 2 次 textureLod，detail 那一次
+    // 可以忽略不计 —— 它只是同一张图的第二组通道）。
+    const vec2 qXP = projectToReceiver(
+        sourceXZ + vec2(cell, 0.0),
+        slopeAt(uv + texelStep.xy),
+        refHeight, reflectLayer);
+    const vec2 qXM = projectToReceiver(
+        sourceXZ - vec2(cell, 0.0),
+        slopeAt(uv - texelStep.xy),
+        refHeight, reflectLayer);
+    const vec2 qZP = projectToReceiver(
+        sourceXZ + vec2(0.0, cell),
+        slopeAt(uv + texelStep.yx),
+        refHeight, reflectLayer);
+    const vec2 qZM = projectToReceiver(
+        sourceXZ - vec2(0.0, cell),
+        slopeAt(uv - texelStep.yx),
+        refHeight, reflectLayer);
+
+    const vec2 dqdx = (qXP - qXM) / (2.0 * cell);
+    const vec2 dqdz = (qZP - qZM) / (2.0 * cell);
+    const float area = abs(dqdx.x * dqdz.y - dqdx.y * dqdz.x);
+
+    // 下界 0.10 与旧 frag 的 `min(area * params.w, 40)` 同源：限制极端聚焦的
+    // 亮度爆炸；上界 6.0 与 water_caustics.comp 一致。
+    const float density = clamp(1.0 / max(area, 0.10), 0.20, 6.0);
+
+    // 色散（自创近似，单档 IOR）：把"偏离平水 1.0 的程度"按固定系数分给 RGB。
+    // 反射层（layer 1）是镜面，不分色 ⇒ 那一层逐字是 vec3(density)。
+    vec3 rgb = vec3(density);
+    if(!reflectLayer)
+    {
+        const float spread = clamp(density - 1.0, -0.60, 1.20) * pc.params.w;
+        rgb += CAUSTIC_DISPERSION_RGB * spread;
+    }
+
+    imageStore(
+        causticOutput,
+        ivec3(texel, layer),
+        vec4(max(rgb, vec3(0.05)), 1.0));
+}

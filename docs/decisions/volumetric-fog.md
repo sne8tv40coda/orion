@@ -55,5 +55,14 @@
     自创部分只有"相位"这一步：介质里没有 N·L，用一个各向同性 + 轻微前向的
     相位代替（FOG_LIGHT_PHASE_*），这是体积散射的常规定义，不是我的发明。
 
+  · 雨天地面雾浪（cloudParams4.y/.z/.w + cloudParams9.w → wispEnabled /
+    wispStrength / wispWavelength / wispSpeed）
+    **2026-10-31 已整链删除**：用户实测"跟没有一样"。删除范围 = 着色器侧
+    常量与 fogWispShape()、evaluateAnalyticFog 的 4 个尾参数、JNI
+    setFogWispParams、Java 的 FogWispSettings 与设置界面 4 个控件、默认 JSON
+    的 4 个键。UBO 车道保留并写 0（std140 布局不动）。
+    删除同时带走的成本：每 march 步最多 2 次 textureLod + 一次 3D 噪声形状
+    计算 + smoothstep。若日后要复活，参考 git 历史 2026-10-23 那一版。
+
 编译期常量 = 参考出厂值（Settings.glsl）：
 VFOG_DENSITY 0.01 / VFOG_FALLOFF 40 / VFOG_QUALITY 6 /

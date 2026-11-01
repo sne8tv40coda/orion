@@ -329,6 +329,19 @@ layout(binding = 78, set = 0, r8ui)
 uniform readonly uimage2D sparseActiveMaskImage;
 
 // =====================================================
+// 2026-11-01 档 2：近场太阳阴影图（宿主 binding 79）。
+//
+// 生产者是 rt_sun_shadow.comp（1024²、盒半宽 160 格 = 10 区块、约 8 Hz 重建），
+// 与 sun_shadow.glsl 的 sunShadowVisibilityIn 共用同一份正交基/投影，
+// 所以"写进去的位置"与"查出来的位置"结构上不可能对不上。
+//
+// 用途：低太阳角时替代逐像素软影射线（那条射线在低角度下早停失效，
+// 实测把主 RT pass 从 1.77ms 推到 26ms）。
+// =====================================================
+layout(binding = 79, set = 0)
+uniform sampler2D sunShadowMapNear;
+
+// =====================================================
 // 2026-10-27：Remix 的**时空蓝噪声**（严格搬）
 //
 // 原文 utility/noise.slangh:161-249
@@ -709,6 +722,9 @@ ivec2 rtLaunchSize()
 // 2026-10-25：物理薄片（Remix thin-walled）滤波，与 glass_dielectric_common 分离
 // 以便单独 A/B（-DORION_GLASS_THINWALL_V2=0）。
 #include "glass_thinwall_common.glsl"
+// 2026-10-31：本地光源档案表（每档自带色温/发射色、满级亮度、基础传播距离）。
+// 与 rt_vpt_irradiance.comp、volumetric_fog.glsl 共用同一份，避免多处调色板漂移。
+#include "local_light_profile.glsl"
 
 // =====================================================
 // Perf-L10.1 - runtime GPU feature-isolation predicates
@@ -1302,7 +1318,7 @@ struct VPTDirectHistory
     vec4 normalAndPadding;
     // 2026-10-26 RTXDI 直接光 WRS reservoir（仅第 4 lane；EMA 路径不读不写，
     // v0/v1/v2 语义与旧版逐位一致）。WRS 布局：
-    //   v0 = (selectedSample.xyz, emission*8 + typeCode)
+    //   v0 = (selectedSample.xyz, emission*32 + typeCode)
     //   v1 = (W, M, lightRevision, 2.0)  // 2.0 = WRS 标签；EMA 在 v1.w 写 1.0
     //   v2 = (receiverPosition.xyz, valid)
     //   v3 = (receiverNormal.xyz, 0)
@@ -1346,7 +1362,6 @@ const uint VPT_PRIMARY_DDA_LIGHTS = 4u;
 const uint VPT_AREA_LIGHT_SAMPLES = 12u;
 const uint VPT_AREA_LIGHT_HISTORY_SAMPLES = 96u;
 const float VPT_LOCAL_MAX_DISTANCE = 30.0;
-const float VPT_LOCAL_RANGE_PER_EMISSION = 2.0;
 const float VPT_LOCAL_FADE_START_FRACTION = 0.40;
 // 2026-09-30: 虚拟发射体必须留在自己的方块内。原值 2.0 给出 ±1 格的样本散布，
 // 而真实发光方块只有 1x1、它正下方那块染色玻璃也只有 1x1。样本落到方块之外后
@@ -1833,16 +1848,12 @@ uint vliReadSourceVoxel(ivec3 worldBlock)
 }
 
 
+// 发射色：查光源档案表（local_light_profile.glsl）。
+// 2026-10-31：原来的 6 档硬编码调色板已并入档案表 —— 那里不只是颜色，
+// 还有每档的满级亮度与基础传播距离，火把/岩浆/信标不再共用一个口径。
 vec3 vliDecodeEmitterColor(uint typeCode)
 {
-    if(typeCode == 1u) return vec3(1.0, 0.55, 0.20);
-    if(typeCode == 2u) return vec3(0.20, 0.75, 1.0);
-    if(typeCode == 3u) return vec3(1.0, 0.12, 0.06);
-    if(typeCode == 4u) return vec3(1.0, 0.27, 0.05);
-    // 6 = 地狱传送门（紫）。Java 的 classifyLocalLightType 写这个 typeCode；
-    // 此前它落到下面的暖白兜底 ⇒ 门照着周围是白光。
-    if(typeCode == 6u) return vec3(0.70, 0.28, 1.0);
-    return vec3(1.0, 0.82, 0.48);
+    return localLightProfileColor(typeCode);
 }
 
 vec3 sampleHemisphereCosine(vec3 normal, inout uint state);
@@ -1864,18 +1875,19 @@ vec3 applyLocalGlassTint(vec3 radiance, vec3 transmittance);
 // block's real silhouette.
 //
 // Such a block is now class 3 and carries the free fraction of its cell in bits
-// 25..31 (7 bits, 127 = fully transparent).  A non-cube shape is modelled as a
+// 27..31 (5 bits, 31 = fully transparent).  A non-cube shape is modelled as a
 // uniform attenuation of the marched ray, which is an approximation, but it
 // removes the full-cube phantom.  Keep in lockstep with VLI_PARTIAL_SHIFT /
 // VLI_PARTIAL_MAX in SectionCompilerMixin and with rt_vpt_irradiance.comp.
+// 2026-10-31：7 bit 压到 5 bit，腾出的两位给了光源档案 id（bits 6..10）。
 // =====================================================
-const uint VPT_PARTIAL_TRANSMISSION_SHIFT = 25u;
-const uint VPT_PARTIAL_TRANSMISSION_MAX = 127u;
+const uint VPT_PARTIAL_TRANSMISSION_SHIFT = 27u;
+const uint VPT_PARTIAL_TRANSMISSION_MAX = 31u;
 
 float vptPartialTransmission(uint source)
 {
     return float((source >> VPT_PARTIAL_TRANSMISSION_SHIFT) &
-        VPT_PARTIAL_TRANSMISSION_MAX) * (1.0 / 127.0);
+        VPT_PARTIAL_TRANSMISSION_MAX) * (1.0 / 31.0);
 }
 
 // Occupied cell: a full cube (class 1) or a partial occluder (class 3).
@@ -2006,10 +2018,10 @@ vec3 evaluateVLIEmitterRadianceAtHit(
     // 诊断（B 通道）：唯一**既无玻璃过滤、也无可见性射线/遮挡**的本地光
     // 贡献——它直接把命中面背后那个发光方块的发射色当光叠加。
     vec3 safeAlbedo = max(hitAlbedo, vec3(0.0));
-    vec3 emitterTerm = vliDecodeEmitterColor((source >> 6u) & 7u) *
+    vec3 emitterTerm = vliDecodeEmitterColor((source >> 6u) & 31u) *
         3.2 *
         LOCAL_LIGHT_ENERGY_SCALE * localLightIntensity() *
-        (float(emission) / 15.0) *
+        localLightProfileBrightness((source >> 6u) & 31u, float(emission)) *
         safeAlbedo;
     // ===== DBG_KILL_VLI_EMITTER: 无玻璃过滤项归零（判决实验）=====
     if(DBG_KILL_VLI_EMITTER)
@@ -2040,7 +2052,7 @@ vec3 evaluateVLIEmitterRadianceAtHit(
         // R = 该项的染料浓度（它**没有**做玻璃过滤，所以应当恒为 0）
         // G = 该项的能量
         return vec3(
-            dbgDyeConcentration(vliDecodeEmitterColor((source >> 6u) & 7u)),
+            dbgDyeConcentration(vliDecodeEmitterColor((source >> 6u) & 31u)),
             dbgTermLuma(emitterTerm),
             0.0
         );
@@ -2587,8 +2599,15 @@ bool vptVoxelFaceNormalFromHit(
 // 再加上命中点贴近的所有暴露面，取最小。
 // 容差必须在本函数之前可见（本文件里同名宏的另一处定义在调用点之后，
 // 预处理器是顺序展开的 ⇒ 必须先有一份，否则 "undeclared identifier"）。
+// 2026-10-31：1.0e-3 → 5.0e-3。壳实验（ORION_OPAQUE_SHELL_OFFSET）把可见面沿
+// 平面外推 ~2e-3 格 ⇒ 命中点离开体素边界 1e-3 邻域 ⇒ 两处消费点（本函数的
+// 保守面集合、VPT_LOCAL_FACE_AXIS_FROM_POSITION 的几何面恢复）双双失效，
+// 回退到浮雕量化法线 ⇒ 10-01 那类"沿棱亮线"在壳开启时整片回来。
+// 真实地形面全部精确贴在体素边界（fract≈0，1e-3 本就覆盖），1e-3~5e-3 区间
+// 只有被壳位移过的面会落进去；半砖/雪层/水面都在 0.125 档位上，远在容差外。
+// ⚠ 本文件同名宏有两份定义（预处理器取第一份），改这里才是改生效值。
 #ifndef VPT_LOCAL_FACE_AXIS_EPS
-#define VPT_LOCAL_FACE_AXIS_EPS 1.0e-3
+#define VPT_LOCAL_FACE_AXIS_EPS 5.0e-3
 #endif
 
 // =====================================================
@@ -2857,24 +2876,29 @@ vec3 traceVptLocalLightVisibility(
     uint cullMask
 );
 
-float vptLocalLightRange(float emissionLevel)
+// rainWallParams1.w = 「本地光距离系数」（0.25 ~ 2.0，1.0 = 标准）。
+// 旧 DLL 恒写 0（reserved 位）⇒ 回落 1.0，双向兼容。
+float vptLocalLightRangeScale()
 {
-    // rainWallParams1.w = Java 滑块「本地光最远照明距离」（格）。
-    // 旧 DLL 恒写 0（reserved 位），此时回落到编译期默认，双向兼容。
-    float userLocalMax = cam.rainWallParams1.w;
-    float localMaxDistance =
-        userLocalMax > 0.5
-            ? min(VPT_LOCAL_MAX_DISTANCE, userLocalMax)
-            : VPT_LOCAL_MAX_DISTANCE;
-    return min(
-        localMaxDistance,
-        max(emissionLevel * VPT_LOCAL_RANGE_PER_EMISSION, 2.0)
-    );
+    float user = cam.rainWallParams1.w;
+    return (user >= 0.05 && user <= 8.0) ? user : 1.0;
 }
 
-float vptLocalLightRangeFade(float distanceToLight, float emissionLevel)
+// 传播距离 = 该光源档案的基础距离 × 用户系数，封顶 30 格。
+// 2026-10-31：不再用"emission × 2 格"这一个口径 —— 火把 11 格、营火 15 格、
+// 荧石 18 格、岩浆 26 格、信标 28 格，各自在 local_light_profile.glsl 里定好。
+float vptLocalLightRange(uint typeCode, float emissionLevel)
 {
-    float range = vptLocalLightRange(emissionLevel);
+    float base = localLightProfileBaseRange(typeCode, emissionLevel);
+    return clamp(base * vptLocalLightRangeScale(), 1.5, VPT_LOCAL_MAX_DISTANCE);
+}
+
+float vptLocalLightRangeFade(
+    float distanceToLight,
+    uint typeCode,
+    float emissionLevel)
+{
+    float range = vptLocalLightRange(typeCode, emissionLevel);
     return 1.0 - smoothstep(
         range * VPT_LOCAL_FADE_START_FRACTION,
         range,
@@ -3161,8 +3185,14 @@ vec3 evaluateVPTRISDirectLightingSingle(
 #ifndef VPT_LOCAL_FACE_AXIS_FROM_POSITION
 #define VPT_LOCAL_FACE_AXIS_FROM_POSITION 1
 #endif
+// 2026-10-31：1.0e-3 → 5.0e-3。原因：不透明面外扩壳实验（ORION_OPAQUE_SHELL_OFFSET，
+// 见 VulkanCore.cpp uploadChunk）把可见面沿平面外推 ~2e-3 格，命中点不再落在体素
+// 边界的 1e-3 邻域内 ⇒ 本恢复失败 ⇒ 回退到浮雕量化法线 ⇒ 10-01 那类"沿棱亮线"
+// 在壳开启时整片回来。真实地形面全部精确贴在体素边界（fract≈0，1e-3 本就覆盖），
+// 1e-3~5e-3 区间只有被壳位移过的面会落进去 ⇒ 放宽容差不影响任何真实几何的判定。
+// 半砖/楼梯顶（fract≈0.5）、雪层（0.125 的倍数）都远在容差外，不受影响。
 #ifndef VPT_LOCAL_FACE_AXIS_EPS
-#define VPT_LOCAL_FACE_AXIS_EPS 1.0e-3
+#define VPT_LOCAL_FACE_AXIS_EPS 5.0e-3
 #endif
 
 #if VPT_LOCAL_GEOMETRIC_COSINE_BOUND
@@ -3372,7 +3402,9 @@ vec3 evaluateVPTRISDirectLightingSingle(
         }
         float distanceToLight = sqrt(distanceSquared);
         float emissionLevel = float(emission);
-        if(distanceToLight > vptLocalLightRange(emissionLevel))
+        // 2026-10-31：档案 id 扩到 5 bit，距离/亮度都按档案走 ⇒ 先取 id。
+        uint typeCode = (packedEmitter >> 16u) & 31u;
+        if(distanceToLight > vptLocalLightRange(typeCode, emissionLevel))
         {
             continue;
         }
@@ -3393,7 +3425,6 @@ vec3 evaluateVPTRISDirectLightingSingle(
             continue;
         }
 
-        uint typeCode = (packedEmitter >> 16u) & 7u;
         vec3 centreDirection = toLight / distanceToLight;
         vec3 referenceAxis = abs(centreDirection.y) < 0.95
             ? vec3(0.0, 1.0, 0.0)
@@ -3433,9 +3464,9 @@ vec3 evaluateVPTRISDirectLightingSingle(
 #endif
         if(sampledCosine <= 0.0) continue;
         float scale = 3.2 * LOCAL_LIGHT_ENERGY_SCALE * localLightIntensity() *
-            (emissionLevel / 15.0) *
+            localLightProfileBrightness(typeCode, emissionLevel) *
             vptLocalLightDistanceAttenuation(sampledDistance) *
-            vptLocalLightRangeFade(sampledDistance, emissionLevel);
+            vptLocalLightRangeFade(sampledDistance, typeCode, emissionLevel);
         vec3 contribution = vliDecodeEmitterColor(typeCode) * scale * sampledCosine;
         // The section Alias table already includes power and distance; the
         // emitter Alias table uses exact emission power.  Keep the real PDF
@@ -3763,7 +3794,7 @@ vec3 dynamicLightContribution(
         return vec3(0.0);
     }
     float distanceToLight = sqrt(distanceSquared);
-    if(distanceToLight > vptLocalLightRange(emissionLevel))
+    if(distanceToLight > vptLocalLightRange(typeCode, emissionLevel))
     {
         return vec3(0.0);
     }
@@ -3774,12 +3805,13 @@ vec3 dynamicLightContribution(
         return vec3(0.0);
     }
     // 与 evaluateVPTRISDirectLightingSingle 的 scale **逐项同构**，只多乘一个动态光源
-    // 自己的强度旋钮。
+    // 自己的强度旋钮。2026-10-31 起亮度/距离也走档案表（动态光源 id 一般是 0，
+    // 即"未分类"，退回旧口径）。
     float scale = 3.2 * LOCAL_LIGHT_ENERGY_SCALE * localLightIntensity() *
         dynamicLightIntensity() *
-        (emissionLevel / 15.0) *
+        localLightProfileBrightness(typeCode, emissionLevel) *
         vptLocalLightDistanceAttenuation(distanceToLight) *
-        vptLocalLightRangeFade(distanceToLight, emissionLevel);
+        vptLocalLightRangeFade(distanceToLight, typeCode, emissionLevel);
     // 2026-10-17 修复「移动光源把周围糊成一层平色」：调用方早已不再乘 albedo / 0.92
     //（见 evaluateDynamicLightRISDirect 末尾），但这里一直只返回 `color * scale * N·L`
     // ⇒ albedo 与镜面项被整个丢掉，灯把纯色直接糊在任何表面上（暗方块也被染满）。
@@ -4150,7 +4182,7 @@ vec3 evaluateVPTLocalSecondaryBounce(
             // the fence stop the bounce outright, which is the "handled as a
             // full block" behaviour this class exists to remove.
             glassTransmission *=
-                max(vec3(vptPartialTransmission(source)), vec3(1.0 / 127.0));
+                max(vec3(vptPartialTransmission(source)), vec3(1.0 / 31.0));
             continue;
         }
         if(voxelClass != 1u) continue;
@@ -4262,8 +4294,9 @@ vec3 traceVPTEmitterDDA(vec3 origin, vec3 direction, out vec3 blockerAlbedo,
         uint emission = (source >> 2u) & 15u;
         if(emission > 0u)
         {
-            return vliDecodeEmitterColor((source >> 6u) & 7u) *
-                (float(emission) / 15.0) * 3.2 *
+            return vliDecodeEmitterColor((source >> 6u) & 31u) *
+                localLightProfileBrightness(
+                    (source >> 6u) & 31u, float(emission)) * 3.2 *
                 LOCAL_LIGHT_ENERGY_SCALE * localLightIntensity() *
                 vptSaturateGlassTransmission(glassTransmission);
         }
@@ -4274,7 +4307,7 @@ vec3 traceVPTEmitterDDA(vec3 origin, vec3 direction, out vec3 blockerAlbedo,
             // emitter light, it does not extinguish it.  Same model as
             // transmissionToEmitter in rt_vpt_irradiance.comp.
             glassTransmission *=
-                max(vec3(vptPartialTransmission(source)), vec3(1.0 / 127.0));
+                max(vec3(vptPartialTransmission(source)), vec3(1.0 / 31.0));
             continue;
         }
         if(voxelClass == 1u)
@@ -5983,6 +6016,26 @@ vec3 evaluateTransparentReceiverDirectLighting(
 )
 {
 #if GI_TRANSPARENT_RECEIVER_TEMPORAL
+#if GI_HALFRES
+    // 2026-10-31（第六轮）：gi_half 变体的 gl_LaunchIDEXT 是半分辨率坐标，
+    // 而 26/27 历史按**全分辨率像素**索引 —— 这里若走时域，会把被着色像素
+    // (2i,2j) 的 pane/水面历史写进 (i,j) 槽位：键必然失配（历史永久重置），
+    // 还会把主变体 (i,j) 的历史槽位覆盖成错误表面的数据（玻璃/水面椒盐噪点
+    // 的根因之一，与玻璃 G-buffer 写入的坐标腐蚀同源）。退回单帧 RIS：
+    // 无历史读写，时域由主变体独占。
+    uint giHalfRisSeed =
+        uint(gl_LaunchIDEXT.x) * 1973u +
+        uint(gl_LaunchIDEXT.y) * 9277u ^
+        cam.frameCount * 26699u;
+    pcg_hash(giHalfRisSeed);
+    return evaluateVPTRISDirectLighting(
+        hitPosition,
+        hitNormal,
+        hitAlbedo,
+        receiverGeometricNormal,
+        vec3(-1.0), -1.0, 1.0,
+        giHalfRisSeed);
+#else
     // The salt is unused here: reuse is decided by the history match on the
     // receiver's own world position and normal, not by keeping two sample
     // streams apart.
@@ -5997,6 +6050,7 @@ vec3 evaluateTransparentReceiverDirectLighting(
         ivec2(gl_LaunchIDEXT.xy),
         ivec2(rtLaunchSize())
     );
+#endif
 #else
     // The pre-2026-09-25 stream, kept bit-exact so -D...TEMPORAL=0 is a true
     // A/B: the water call sites pass 0x57424F54u so the receiver never shares
@@ -6440,7 +6494,7 @@ bool vptLocalEmitterContributionAt(
     // 距离闸与提案循环同口径（那里量的是**发射体中心**到接收点，不是采样点），
     // 否则 max range 边缘那一圈采样的 target 会被本函数判 0，合并出一个偏置。
     vec3 emitterCenter = floor(samplePosition) + vec3(0.5);
-    if(length(emitterCenter - hitPos) > vptLocalLightRange(emissionLevel))
+    if(length(emitterCenter - hitPos) > vptLocalLightRange(typeCode, emissionLevel))
     {
         return false;
     }
@@ -6464,9 +6518,9 @@ bool vptLocalEmitterContributionAt(
         return false;
     }
     float scale = 3.2 * LOCAL_LIGHT_ENERGY_SCALE * localLightIntensity() *
-        (emissionLevel / 15.0) *
+        localLightProfileBrightness(typeCode, emissionLevel) *
         vptLocalLightDistanceAttenuation(distanceToLight) *
-        vptLocalLightRangeFade(distanceToLight, emissionLevel);
+        vptLocalLightRangeFade(distanceToLight, typeCode, emissionLevel);
     contribution = vliDecodeEmitterColor(typeCode) * scale * cosine;
     return true;
 }
@@ -6778,8 +6832,8 @@ bool vptMergeReservoirCandidate(
         geometricFaceKnown,
         geometricFaceRecovered,
         candidateSample,
-        packedIdentity >> 3u,
-        packedIdentity & 7u,
+        packedIdentity >> 5u,
+        packedIdentity & 31u,
         contributionNow))
     {
         return false;
@@ -6799,8 +6853,8 @@ bool vptMergeReservoirCandidate(
             false,
             vec3(0.0, 1.0, 0.0),
             candidateSample,
-            packedIdentity >> 3u,
-            packedIdentity & 7u,
+            packedIdentity >> 5u,
+            packedIdentity & 31u,
             contributionPreviousSurface))
         {
             targetPreviousSurface = max(dot(contributionPreviousSurface,
@@ -6895,7 +6949,9 @@ vec3 evaluateVPTDirectLightReservoirTail(
 
     VPTReservoirState state = vptReservoirStateEmpty();
     state.samplePos = currentSample;
-    state.sampleIdentity = (currentEmission << 3u) | currentTypeCode;
+    // 2026-10-31：档案 id 5 bit ⇒ emission 左移 5。整包 9 bit，仍远小于 24 bit
+    // 的 float 尾数精度上限（历史做法见 state.sampleIdentity 的注释）。
+    state.sampleIdentity = (currentEmission << 5u) | currentTypeCode;
     state.selectedContribution = currentContribution;
     state.weightSum = currentTargetPdf * initialW;
     state.M = 1.0;
@@ -7092,15 +7148,15 @@ vec3 evaluateVPTDirectLightReservoirTail(
 
     const vec3 selectedContribution = state.selectedContribution;
     const vec3 selectedSample = state.samplePos;
-    const uint selectedEmission = state.sampleIdentity >> 3u;
-    const uint selectedTypeCode = state.sampleIdentity & 7u;
+    const uint selectedEmission = state.sampleIdentity >> 5u;
+    const uint selectedTypeCode = state.sampleIdentity & 31u;
 
     // reservoir 先落盘、再判可见性：被遮挡的样本下一帧仍可复用并重新测遮挡
     //（官方 temporal reuse 也是先存 reservoir，可见性只影响着色）。
     VPTDirectHistory outputHistory;
     outputHistory.radianceAndSampleCount = vec4(
         selectedSample,
-        float((selectedEmission << 3u) | selectedTypeCode)
+        float((selectedEmission << 5u) | selectedTypeCode)
     );
     outputHistory.hitPositionAndValid = vec4(
         finalW,
@@ -8273,7 +8329,9 @@ vec3 evaluateGlassReceiverDeterministicLocalLighting(
 
         float distanceToLight = sqrt(distanceSquared);
         float emissionLevel = float(emission);
-        if(distanceToLight > vptLocalLightRange(emissionLevel))
+        // 2026-10-31：档案 id 扩到 5 bit（bits 4..8），距离/亮度按档案走。
+        uint candidateTypeCode = (candidate.w >> 4u) & 31u;
+        if(distanceToLight > vptLocalLightRange(candidateTypeCode, emissionLevel))
         {
             continue;
         }
@@ -8285,9 +8343,9 @@ vec3 evaluateGlassReceiverDeterministicLocalLighting(
         }
 
         float score =
-            emissionLevel *
+            localLightProfileBrightness(candidateTypeCode, emissionLevel) * 15.0 *
             vptLocalLightDistanceAttenuation(distanceToLight) *
-            vptLocalLightRangeFade(distanceToLight, emissionLevel) *
+            vptLocalLightRangeFade(distanceToLight, candidateTypeCode, emissionLevel) *
             NdotL;
 
         // Stable tie break: Binding 29 itself has a stable CPU ordering.
@@ -8298,7 +8356,7 @@ vec3 evaluateGlassReceiverDeterministicLocalLighting(
             bestEmitterBlock = emitterBlock;
             bestDistance = distanceToLight;
             bestEmission = emissionLevel;
-            bestTypeCode = (candidate.w >> 4u) & 7u;
+            bestTypeCode = candidateTypeCode;
         }
     }
 
@@ -8334,9 +8392,9 @@ vec3 evaluateGlassReceiverDeterministicLocalLighting(
     float radianceScale =
         3.2 *
         LOCAL_LIGHT_ENERGY_SCALE * localLightIntensity() *
-        (bestEmission / 15.0) *
+        localLightProfileBrightness(bestTypeCode, bestEmission) *
         vptLocalLightDistanceAttenuation(bestDistance) *
-        vptLocalLightRangeFade(bestDistance, bestEmission);
+        vptLocalLightRangeFade(bestDistance, bestTypeCode, bestEmission);
 
     return
         vliDecodeEmitterColor(bestTypeCode) *
@@ -10196,97 +10254,9 @@ vec3 decodeLocalLightColor(
     uint typeCode
 )
 {
-    // 0 = fallback / 未分类
-    if(typeCode == 0u)
-    {
-        return
-            vec3(
-                1.00,
-                0.90,
-                0.75
-            );
-    }
-
-
-    // 1 = 火把 / 灯笼 / 营火 / 普通火
-    if(typeCode == 1u)
-    {
-        return
-            vec3(
-                1.00,
-                0.62,
-                0.28
-            );
-    }
-
-
-    // 2 = 灵魂火系列
-    if(typeCode == 2u)
-    {
-        return
-            vec3(
-                0.25,
-                0.72,
-                1.00
-            );
-    }
-
-
-    // 3 = 红石火把
-    if(typeCode == 3u)
-    {
-        return
-            vec3(
-                1.00,
-                0.18,
-                0.08
-            );
-    }
-
-
-    // 4 = 岩浆
-    if(typeCode == 4u)
-    {
-        return
-            vec3(
-                1.00,
-                0.34,
-                0.08
-            );
-    }
-
-
-    // 5 = 萤石 / 海晶灯 / 菌光体 /
-    //     南瓜灯 / 红石灯
-    if(typeCode == 5u)
-    {
-        return
-            vec3(
-                1.00,
-                0.82,
-                0.52
-            );
-    }
-
-
-    // 6 = 地狱传送门（紫）
-    if(typeCode == 6u)
-    {
-        return
-            vec3(
-                0.70,
-                0.28,
-                1.00
-            );
-    }
-
-
-    return
-        vec3(
-            1.00,
-            0.90,
-            0.75
-        );
+    // 2026-10-31：原来的 7 档硬编码调色板并入 local_light_profile.glsl 的
+    // 32 档档案表 —— 那里每档不只有颜色，还带满级亮度与基础传播距离。
+    return localLightProfileColor(typeCode);
 }
 // =====================================================
 // E1-1 - Unified Local Emitter Radiance
@@ -10364,9 +10334,12 @@ vec3 evaluateLocalEmitterCandidateRadiance(
         );
 
 
+    // 2026-10-31：亮度改按光源档案（每档自己的满级亮度），不再统一 emission / 15。
     float emitterLevel01 =
-        emitterLevel /
-        15.0;
+        localLightProfileBrightness(
+            candidateLight.meta.x,
+            emitterLevel
+        );
 
 
     vec3 emitterColor =
@@ -10662,9 +10635,12 @@ vec3 evaluateLocalEmitterSurfaceRadiance(
             );
 
 
+        // 2026-10-31：亮度改按光源档案（每档自己的满级亮度）。
         float emitterLevel01 =
-            emitterLevel /
-            15.0;
+            localLightProfileBrightness(
+                candidateLight.meta.x,
+                emitterLevel
+            );
 
 
         vec3 emitterColor =
@@ -10693,23 +10669,24 @@ vec3 evaluateLocalEmitterSurfaceRadiance(
     return
         emitterRadiance;
 }
+// L4/L7 旧路径（主可见性 / 次级漫反射 GI）的距离淡出。
+// 2026-10-31：射程改按光源档案 —— 每个方块自己的基础距离 × 用户系数，封顶 30 格。
+// 淡出起点仍是射程的 80%（17 格光 → 24 格开始淡、30 格归零，与旧值一致）。
 float localLightRangeFade(
     float distanceToLight,
+    uint typeCode,
     float emissionLevel
 )
 {
-    // C-2:
-    // Minecraft emission level 15 -> 30 block effective range.
     float range =
-        max(
-            emissionLevel * 2.0,
-            2.0
+        clamp(
+            localLightProfileBaseRange(typeCode, emissionLevel) *
+                vptLocalLightRangeScale(),
+            1.5,
+            VPT_LOCAL_MAX_DISTANCE
         );
 
 
-    // 15-level light:
-    // 24 blocks = fade start
-    // 30 blocks = zero
     float fadeStart =
         range *
         0.80;
@@ -10834,9 +10811,10 @@ bool isPointLikeLocalLightType(
     uint typeCode
 )
 {
-    return
-        typeCode >= 1u &&
-        typeCode <= 3u;
+    // 2026-10-31：几何形状改由光源档案给出（火把/蜡烛/末地烛 = 点状，
+    // 荧石/岩浆/海晶灯 = 整块）。旧的"1..3 号都是点状"是按 7 档分类写的，
+    // 换到 32 档后已不再成立。
+    return localLightProfilePointLike(typeCode);
 }
 
 
@@ -11283,7 +11261,8 @@ vec3 sampleLocalLightCubeSurface(
 float localLightApproxScore(
     vec3 surfacePos,
     vec3 N,
-    vec4 worldPosEmission
+    vec4 worldPosEmission,
+    uint typeCode
 )
 {
     float emissionLevel =
@@ -11329,6 +11308,7 @@ float localLightApproxScore(
     float rangeFade =
         localLightRangeFade(
             distanceToLight,
+            typeCode,
             emissionLevel
         );
 
@@ -11371,13 +11351,13 @@ float distanceAttenuation =
     );
 
 
-    float emission01 =
-        emissionLevel /
-        15.0;
+    // 2026-10-31：打分也用档案亮度（×15 保持旧的 0..15 量级，排序口径不变）。
+    float emissionScore =
+        localLightProfileBrightness(typeCode, emissionLevel) * 15.0;
 
 
 return
-    emission01 *
+    emissionScore *
     distanceAttenuation *
     rangeFade *
     NdotL;
@@ -11473,7 +11453,8 @@ float g2bLocalGuideSelectionWeight(
             localLightApproxScore(
                 surfacePos,
                 surfaceNormal,
-                light.worldPosEmission
+                light.worldPosEmission,
+                light.meta.x
             ),
             0.0
         );
@@ -13062,7 +13043,8 @@ vec3 evaluatePrimaryLocalLights(
                         localLightApproxScore(
                             hitPos,
                             N,
-                            worldPosEmission
+                            worldPosEmission,
+                            candidateLight.meta.x
                         );
 
 
@@ -13188,6 +13170,7 @@ float emissionLevel =
         float centerRangeFade =
             localLightRangeFade(
                 centerDistance,
+                typeCode,
                 emissionLevel
             );
 
@@ -13198,9 +13181,12 @@ float emissionLevel =
         }
 
 
+        // 2026-10-31：亮度按光源档案（每档自己的满级亮度），不再统一 emission/15。
         float emission01 =
-            emissionLevel /
-            15.0;
+            localLightProfileBrightness(
+                typeCode,
+                emissionLevel
+            );
 
 
         vec3 localLightColor =
@@ -13307,6 +13293,7 @@ for(
             float sampleRangeFade =
                 localLightRangeFade(
                     sampleDistance,
+                    typeCode,
                     emissionLevel
                 );
 
@@ -13882,7 +13869,8 @@ vec3 evaluateSecondaryDiffuseLocalLights(
             localLightApproxScore(
                 hitPos,
                 N,
-                candidateWorldPosEmission
+                candidateWorldPosEmission,
+                candidateLight.meta.x
             );
 
 
@@ -14072,6 +14060,7 @@ vec3 evaluateSecondaryDiffuseLocalLights(
         float sampleRangeFade =
             localLightRangeFade(
                 sampleDistance,
+                typeCode,
                 emissionLevel
             );
 
@@ -14295,9 +14284,12 @@ vec3 evaluateSecondaryDiffuseLocalLights(
             BSDF_LOCAL_DIFFUSE_SCALE;
 
 
+        // 2026-10-31：亮度按光源档案（每档自己的满级亮度）。
         float emission01 =
-            emissionLevel /
-            15.0;
+            localLightProfileBrightness(
+                typeCode,
+                emissionLevel
+            );
 
 
 float distanceAttenuation =
@@ -15990,6 +15982,23 @@ vec3 tracePrimaryGenericTransparentRadiance(
 // "reset 每帧把 74 号图写成 invalid、update 被剔除" 的半死状态，
 // 整条 alpha blend 链静默空转（症状：改任何参数画面都不变）。详见共享头注释。
 #if VPT_GLASS_ALPHA_BLEND && VPT_GLASS_ALPHA_BLEND_DEFERRED_COMPOSITE && VPT_GLASS_ALPHA_BLEND_SURFACE_RADIANCE
+#if VPT_GLASS_DETERMINISTIC_CHAIN
+    // =====================================================
+    // 2026-10-31（第五轮）：确定性链起点 —— 契约见 glass_chain_common.glsl。
+    // 只写骨架，不写层内容：
+    //   74.x = 1 − a0（最近层的背景透射率已计入，深层权重因此天然正确）；
+    //   74.y 保持 0（无效）—— 最近层内容在 trace 返回后回填；清玻璃早退
+    //   路径走不到回填 ⇒ 天然不产生合成（10-28 双重合成教训的守护）。
+    // a0 与两个 rahit 的 chainAlpha 同式（GLASS_FIXED_ALPHA 与剖面表取大）。
+    // 链射线剔除背面 ⇒ 每个玻璃体只有入射面进 any-hit，无需出入面配对。
+    // 抽签口径（蓝噪声阈值 + lane 5/6 排查档）完整保留在 #else 分支。
+    // =====================================================
+    glassAlphaBlendChainResetDeterministic(
+        ivec2(gl_LaunchIDEXT.xy),
+        max(GLASS_FIXED_ALPHA,
+            1.0 - clamp(glassChainProfileAlpha(uint(transparentProfile)),
+                0.0, 1.0)));
+#else
     // 原文 geometry_resolver.slangh:3238：链起点处
     //   alphaBlendSurface.randomThreshold = getNextSampleBlueNoise(randomState);
     // 本引擎没有蓝噪声纹理 ⇒ 用同源整数哈希（等价物：同分布、逐帧变化，
@@ -16034,6 +16043,7 @@ vec3 tracePrimaryGenericTransparentRadiance(
             ivec2(gl_LaunchIDEXT.xy),
             alphaBlendThreshold);
     }
+#endif
 #endif
 
     // =====================================================
@@ -17143,6 +17153,86 @@ vec3 localEntityIrradiance =
         behindRadiance * ((1.0 - blendAlpha0) * paneChainTransmittance) +
         behindIrradiance * blendSurfaceWeight;
 #if VPT_GLASS_ALPHA_BLEND_DEFERRED_COMPOSITE
+#if !GI_HALFRES
+    // =====================================================
+    // 2026-10-31（第六轮，椒盐噪点真根因）：**变体坐标腐蚀门控**。
+    //
+    // GI_HALFRES 变体的 dispatch 是 (w+1)/2×(h+1)/2，gl_LaunchIDEXT 是
+    // **半分辨率坐标**（本文件 GI_HALFRES pixelCoord 派生处的注释警告过），
+    // 但它同样执行完整主射线着色（含玻璃路径）。此前（含抽签口径）：
+    //   · reset / update / WriteNearest 以 launchID 写 73/74 ⇒ 像素 (i,j) 被
+    //     像素 (2i,2j) 的玻璃状态覆写 ⇒ 合成错位；
+    //   · 77 号图的 pane 时域 RIS 以 launchID 索引 26/27 历史 ⇒ 像素 (2i,2j)
+    //     的 pane 历史写进 (i,j) 槽位 ⇒ 主变体在 (i,j) 读历史必然位置失配
+    //     ⇒ 历史永久重置 ⇒ 染色项永远只有单帧 RIS 噪声 = 密集椒盐噪点
+    //     （染色亮处青椒点 / 暗背景处黑椒点，2026-10-31 晚截图形态）。
+    // GI 变体的 GI 计算不需要 G-buffer / pane 受光 ⇒ 这些写入整体跳过：
+    //   74.y 由宿主每帧 clear 保持 0 ⇒ gi 触及的像素天然不参与合成；
+    //   主变体（全分辨率、后行）完整覆写自己负责的像素。
+    // 顺带收益：gi 变体每个半分辨率像素省 ~6 条射线（太阳 NEE + RIS）。
+    // =====================================================
+#if VPT_GLASS_DETERMINISTIC_CHAIN
+    // 最近层确定性回填：74.x 已由 reset 置 1−a0、any-hit 又累乘了深层 ⇒
+    // 不动；rgb 是加法（深层累积已就位，w_0/a_div = 1 ⇒ 本层贡献恰为
+    // tint0）；74.y 在这里才置位 ⇒ deferred 合成自此生效。
+    glassAlphaBlendChainWriteNearest(
+        ivec2(gl_LaunchIDEXT.xy),
+        blendTint0,
+        N,
+        blendPaneHitT);
+
+    // 77 号图换血（固定形状噪点的病根修复）：
+    // 旧内容 evaluateVPTExactFaceDirectLighting = 16^3×6 面缓存的逐方块面
+    // 量化烘焙 —— 查表、逐帧不变、在 RR 之后合成 ⇒ 静态噪点且任何 RR 挡位
+    // 都无效（2026-10-31 诊断结论；09-30"采样数怎么调都不动"与 10-01
+    // "the squares the user sees" 同源）。
+    // 新内容 = pane 自身位置的三项受光（albedo=1 的辐照度，tint 在消费端乘）：
+    //   太阳 NEE（解析确定性）+ 环境底光（解析确定性）
+    //   + 本地光时域 RIS：evaluateTransparentReceiverDirectLighting 复用
+    //   26/27 世界空间历史（4 RIS 提案 + 4 可见性射线 + 1 动态光，96 帧历史
+    //   + 火萤钳制 + 运动自适应封顶）。键 = historyKeyPosition（pane 原始命中
+    //   点，该参数的本职），身份法线 = pane 几何法线 —— 正是这套机制的设计场景。
+    // 量纲：blend.comp 的 ×(1/π) 完成兰伯特重建；旧 bake 存 0.92/π·E 又被
+    // 除一次 π，本就量纲错位，本口径顺带修正（玻璃染色亮度会略变，A/B 确认）。
+    // 回滚：VPT_GLASS_PANE_ILLUMINATION_TEMPORAL=0 ⇒ 回 bake 读。
+    #ifndef VPT_GLASS_PANE_ILLUMINATION_TEMPORAL
+    #define VPT_GLASS_PANE_ILLUMINATION_TEMPORAL 1
+    #endif
+    #if VPT_GLASS_PANE_ILLUMINATION_TEMPORAL
+    imageStore(
+        glassAlphaBlendVolumeImage,
+        ivec2(gl_LaunchIDEXT.xy),
+        vec4(
+            evaluateDirectSunLighting(
+                glassSurfacePosition,
+                N,
+                V,
+                vec3(1.0),
+                0.06,
+                0.0,
+                1.0,
+                sunDirection) +
+            getSurfaceAmbientRadiance() +
+            evaluateTransparentReceiverDirectLighting(
+                historyKeyPosition,
+                glassNormal,
+                glassSurfacePosition,
+                N,
+                vec3(1.0),
+                0x676C6173u),
+            1.0));
+    #else
+    imageStore(
+        glassAlphaBlendVolumeImage,
+        ivec2(gl_LaunchIDEXT.xy),
+        vec4(
+            evaluateVPTExactFaceDirectLighting(
+                transmissionInfo.receiverWorldPos,
+                transmissionInfo.receiverNormal,
+                vec3(1.0)),
+            1.0));
+    #endif
+#else
     // 2026-10-26（第四轮，严格搬）：默认路径（PANE_ILLUMINATION=0）下
     // 主命中面同样是第一层候选，见上面 PANE_ILLUMINATION 分支的说明。
     glassAlphaBlendSurfaceUpdate(
@@ -17162,6 +17252,11 @@ vec3 localEntityIrradiance =
                 transmissionInfo.receiverNormal,
                 vec3(1.0)),
             1.0));
+#endif
+#else
+    // GI_HALFRES 变体：跳过全部 73/74/75/77 写入（坐标腐蚀，见上注释）。
+    // 74.y 由宿主 clear 保持 0 ⇒ gi 覆盖的像素不参与 deferred 合成。
+#endif
 
     // 2026-10-27：透过玻璃看到的背景不允许纯黑。
     // 背景为 0 时 alpha/折射合成都退化成"纯玻璃色"，
@@ -19818,9 +19913,18 @@ float traceWaterReflectedSun(
             receiverPos,
             length(receiverPos - cam.viewInverse[3].xyz),
             projScale);
+        // 2026-11-01：宿主改成 compute 生产，反射参考面从 +4 格抬到 +16 格
+        // （覆盖到水面以上 32 格）。图的键仍是"源水面坐标"，所以要按接收面的
+        // **实际高度**扣掉平坦反射位移 —— 否则 2~8 格（洞穴顶/桥下，最常见）
+        // 会过冲成大光斑，30 格处又会偏小。
+        const float reflectHeight = max(
+            waterHitPos.y - cam.waterSimSurfaceAndOrigin.x, 0.0);
+        const vec2 flatReflectOffset = vec2(-sunDirection.x, -sunDirection.z) *
+            (reflectHeight / max(abs(sunDirection.y), 0.02));
         float causticDensity = textureLod(
             waterReflectCausticMap,
-            waterHitPos.xz / max(cam.waterFftParams.x, 1.0e-3),
+            (waterHitPos.xz - flatReflectOffset) /
+                max(cam.waterFftParams.x, 1.0e-3),
             causticLod).r;
         if(causticDensity > 1.0e-4)
         {
@@ -22871,6 +22975,49 @@ if(!vptPixelActive)
 }
 
 // =====================================================
+// 2026-11-01 档 2：低太阳角 + 近场图覆盖范围内，改用阴影图，不再发射线。
+//
+// 病灶：低太阳角时太阳软影射线几乎水平，TerminateOnFirstHit 靠"撞到东西"
+// 早停；开阔地/高处撞不到 ⇒ 每条射线要横穿 tMax 格。正午射线垂直，几十格
+// 内就被地面挡住。前两轮已经把 tMax 收到 160 格，这一轮把"射线"本身换成
+// "查图"——近场太阳阴影图（1024²、160 格半径、8 Hz 重建）本来就是同一条
+// 数学，只是用 1M 条射线预计算过。
+//
+// 只对 140 格内生效：留 20 格余量避开图边界的 outside 淡出，否则图外像素会
+// 被平滑地判成背光（SUN_SHADOW_OUTSIDE_VISIBILITY = 0.08）而整体变暗。
+// 140 格外仍走射线，那里的 tMax 已经是 160 格。
+// =====================================================
+const float sunHeightForNearMap =
+    clamp(sunDir.y / 0.81915204429, 0.0, 1.0);
+const bool useNearShadowMap =
+    (sunHeightForNearMap < 0.30) &&
+    (rtLodDistance <= 140.0 * perfL10TierScale());
+
+float nearShadowMapVisibility = 1.0;
+
+if(useNearShadowMap)
+{
+    shadowSamples = 0;
+
+    float nearOutsideFade = 0.0;
+    nearShadowMapVisibility = clamp(
+        sunShadowVisibilityIn(
+            sunShadowMapNear,
+            hitPos,
+            sunDir,
+            0,
+            SUN_SHADOW_EXTENT_XY,
+            SUN_SHADOW_EXTENT_Z,
+            SUN_SHADOW_TEXEL,
+            SUN_SHADOW_CENTER_QUANTUM,
+            SUN_SHADOW_OUTSIDE_VISIBILITY,
+            SUN_SHADOW_BIAS_NEAR,
+            nearOutsideFade),
+        0.0,
+        1.0);
+}
+
+// =====================================================
 // 远场档标记（2026-10-01）
 //
 // ⚠ 原路线 A（"远场直射阴影改查 1024² 远场太阳阴影图"）**已撤回**，取证记录：
@@ -22959,6 +23106,58 @@ if(shadowSamples < 2)
 pcg_hash(shadowSeed);
 
 
+// =====================================================
+// 2026-11-01 低太阳角的太阳软影射线长度封顶（性能）
+//
+// 实测（PERF L10 GPU，277 个窗口）：主 RT pass 在日出/日落从 1.77ms 涨到
+// 26ms，而近场太阳阴影图只有 0.05ms —— 账全在这条**逐像素**的太阳可见性
+// 射线上。两个效应同时放大：
+//   1) 门控是 `NdotL > 0`（见上方 2026-10-06 注释）：正午太阳在天顶，竖直面
+//      NdotL <= 0 ⇒ 直接跳过射线；日出日落太阳贴地，所有朝太阳的竖直面都
+//      > 0 ⇒ 屏幕上一大半像素都要发。
+//   2) 射线是水平的，TerminateOnFirstHit 靠"撞到东西"早停；开阔地/高处撞
+//      不到，于是要横穿 tMax = 10000 格。正午垂直下打，几十格内就被地面
+//      挡住，两项都不成立。
+//
+// 修法只动 tMax，且**只对远场像素**（rtLodDistance >= 64 格）：
+//   太阳高度 < 0.03（约 1.7°）时收到 384 格（24 区块），升到约 20° 时完全
+//   回到 10000 —— 白天逐位不变；近景（< 64 格，玩家实际盯着的范围）恒
+//   10000，近处长阴影逐位不变。被截掉的只是"低太阳角下 24 区块之外的阴影"，
+//   那部分本来就被大气透视压得很淡。
+// 回退：把 shadowRayMaxDistance 换回字面量 10000.0 即逐字回到改动前。
+// =====================================================
+float sunHeight01 =
+    clamp(sunDir.y / 0.81915204429, 0.0, 1.0);
+
+// 2026-11-01（第二轮）：门槛 64 -> 16 格、封顶 384 -> 160 格。
+//
+// 依据（NVIDIA《最佳实践：使用 NVIDIA RTX 光线跟踪》）：背面/正面剔除在光追里
+// **不是优化**，反而更慢（与光栅化相反），所以不走剔除路线；有效的只有
+// TerminateOnFirstHit（已用）、缩短 tMax、降低每像素射线数（UE 的
+// r.RayTracing.Shadows.SamplesPerPixel 默认 1，与本工程一致，无余量）。
+//
+// 160 = 近场太阳阴影图的半径（SUN_SHADOW_EXTENT_XY）。封顶超过它就只是
+// "用一条昂贵的逐像素射线去复算一张已经有的图"，没有新增信息。
+// 16 格内的像素仍保留 10000（第一人称近景的长阴影逐位不变）。
+// 2026-11-01（第三轮，用户定案）：封顶**固定 10 区块 = 160 格**。
+//
+// 作废的两个方向（记在这里，避免以后重复讨论）：
+//   1) "跟随远平面放宽到 320 格" —— 射线变长一倍，只是把漏阴影的分界推到更远，
+//      远处阴影该有的问题并没有解决；
+//   2) "按显存预算分档（extent/分辨率）" —— extent 同时喂 BLAS 实例保留盒
+//      （VulkanCore.cpp:69188 / 69569），放大 2.4 倍会让**所有** RT pass 的
+//      TLAS 变大，不是免费的质量提升。
+//
+// 定案：光追阴影只负责 10 区块内；8 区块以外将来改走**光栅阴影**（计划中），
+// 所以这条射线的覆盖范围以后只会缩、不会涨。
+const float shadowRayCap = 160.0;
+
+float shadowRayMaxDistance =
+    (rtLodDistance >= 16.0 * perfL10TierScale())
+        ? mix(10000.0, shadowRayCap, 1.0 - smoothstep(0.03, 0.35, sunHeight01))
+        : 10000.0;
+
+
 for (int si = 0;
      si < shadowSamples;
      ++si)
@@ -23000,7 +23199,7 @@ for (int si = 0;
             hitPos + shadowDir * 0.001,
             0.02,
             shadowDir,
-            10000.0,
+            shadowRayMaxDistance,
             gl_RayFlagsTerminateOnFirstHitEXT |
             gl_RayFlagsSkipClosestHitShaderEXT,
             0xff,
@@ -23025,11 +23224,49 @@ for (int si = 0;
                 shadowDir * 0.001,
             0.02,
             shadowDir,
-            10000.0,
+            shadowRayMaxDistance,
             0
         );
     }
 
+
+    // =================================================
+    // 2026-11-01 太阳可见性的体素保守门（10-02 机制延伸到日/月直射）。默认开启。
+    //
+    // 病灶（用户 2026-10-31 三个判据 + 2026-11-01 档 32 消融实证"AB有效，没缝了"）：
+    // 亮线只出现在**不同高度的阶梯凹角**、共面交界没有、无材质包也有 —— 即
+    // 2026-10-02 注释记录的同一几何缺陷（"相邻块四边形只在棱上共边，精度下可以
+    // 从棱缝擦过去"）的**日/月直射版本**：贴着阶梯凹角共享棱擦过的低角度日/月
+    // 可见性射线，穿过 1 格厚的阶梯实体误报"直射无遮挡" ⇒ 沿棱的日/月色亮线
+    // （亮度随太阳高度角变化）。共面交界不可见的机理：擦进板内的射线会被板
+    // 另一侧的面挡住（face-forward 材质着色为暗），而阶梯角射线贴棱穿过实体后
+    // 到达的是真正朝向天空的通道。
+    //
+    // 修法与本地光 10-02 修法同源：硬件射线报"通"时，用体素 DDA 保守复检同一条
+    // 路径 —— 穿实心体素（class==1）或贴棱/贴角通过（VPT_VOXEL_PATH_CORNER_EPS）
+    // 判遮挡。体素 DDA 不依赖网格棱的水密性。
+    //
+    // 2026-11-01 转正：默认开启（档 0 即生效）。显式关闭臂 = 档 33
+    // （ORION_PERF_ABLATION=alt:33，运行时 A/B，无需重编；档 33 原为空闲档）。
+    // 档 32 同样保持开启（= 默认档），其宿主侧名字 glossyBudgetOff 是遗留
+    // 空操作（kGlossyRayBudget 已是 10000，:18825），无冲突。
+    // 16 格门限：漏光射线在最初 1~2 格内就会穿过阶梯实体，16 格覆盖充分，
+    // 同时把户外每样本的 DDA 成本压到最低。
+    // 已知副作用（与本地光 10-02 修复同类、可接受）：户外贴着体素棱/角通过的
+    // 太阳射线会被保守判挡，棱线附近直射可能偏暗一档。
+    // =================================================
+    if(hit.hitDistance < 0.0 &&
+       cam.perfAblationStage.x != 33u &&
+       vptVoxelPathBlocked(
+           hitPos,
+           hitPos + shadowDir * 16.0,
+           ivec3(1000000, 1000000, 1000000),
+           16.0
+       ))
+    {
+        // 体素保守门判遮挡：这次"硬件报通"的样本按被挡处理（不累加透射）。
+        hit.hitDistance = 1.0;
+    }
 
     if(hit.hitDistance < 0.0)
     {
@@ -23045,11 +23282,19 @@ for (int si = 0;
 
 
 // 按实际发出的样本数归一化（0 样本时按 1 处理，避免 0/0）。
-shadowTransmittance /=
-    max(
-        float(shadowSamples),
-        1.0
-    );
+if(useNearShadowMap)
+{
+    // 2026-11-01 档 2：这一格的可见性来自近场图，没有射线样本可归一化。
+    shadowTransmittance = vec3(nearShadowMapVisibility);
+}
+else
+{
+    shadowTransmittance /=
+        max(
+            float(shadowSamples),
+            1.0
+        );
+}
 
 // One vertical visibility query is required only for a rain-active primary
 // solid surface.  The existing GLASS_VISIBILITY Any-Hit path preserves

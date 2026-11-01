@@ -283,8 +283,7 @@ void main()
         cam.cloudParams7.x, cam.cloudParams7.y, cam.cloudParams7.z, cam.cloudParams7.w,
         cam.cloudParams8.x, cam.cloudParams8.y, cam.cloudParams8.z, cam.cloudParams8.w,
         cam.cloudParams9.x, cam.cloudParams9.y, cam.cloudParams9.z,
-        cam.fogExtrasParams.y, cam.fogExtrasParams.w, cam.fogExtrasParams.x,
-        cam.cloudParams4.y, cam.cloudParams4.z, cam.cloudParams4.w, cam.cloudParams9.w);
+        cam.fogExtrasParams.y, cam.fogExtrasParams.w, cam.fogExtrasParams.x);
 
     {
         float aerialStrength = clamp(cam.cloudAerialParams.x, 0.0, 2.0);

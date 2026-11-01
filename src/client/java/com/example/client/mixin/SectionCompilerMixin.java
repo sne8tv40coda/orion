@@ -44,9 +44,21 @@ public class SectionCompilerMixin {
     private static final int VLI_VOXEL_OPAQUE = 1;
     private static final int VLI_VOXEL_TRANSLUCENT = 2;
     private static final int VLI_VOXEL_PARTIAL = 3;
-    private static final int VLI_STAINED_GLASS_BIT = 1 << 24;
-    private static final int VLI_PARTIAL_SHIFT = 25;
-    private static final int VLI_PARTIAL_MAX = 127;
+
+    // 体素字 32 bit 布局（2026-10-31 重排，给 typeCode 腾出 5 bit）：
+    //   bits  0..1   voxelClass
+    //   bits  2..5   emission（原版光级 0..15）
+    //   bits  6..10  光源档案 id（0..31，见 local_light_profile.glsl）
+    //   bits 11..15  r5
+    //   bits 16..20  g5
+    //   bits 21..25  b5
+    //   bit  26      染色玻璃标记
+    //   bits 27..31  partialTransmission（5 bit，31 = 全透）
+    // ⚠ 改这里必须同步：glass_tint_common.glsl、rt_test.rgen、rt_vpt_irradiance.comp、
+    //   VulkanCore.cpp 的 (word >> 6) / partial 解包点。
+    private static final int VLI_STAINED_GLASS_BIT = 1 << 26;
+    private static final int VLI_PARTIAL_SHIFT = 27;
+    private static final int VLI_PARTIAL_MAX = 31;
     private static final boolean DEBUG = Boolean.getBoolean("rtx.debug");
 
     private static final int TERRAIN_LAYER_MASK =
@@ -104,6 +116,10 @@ public class SectionCompilerMixin {
 
     private static final IdentityHashMap<Block, Integer> STAINED_PANE_MARKERS =
             createStainedPaneMarkers();
+
+    /** Block → 光源档案 id。方块种类有限，查表后不必每次再走注册名匹配。 */
+    private static final Map<Block, Integer> LIGHT_PROFILE_CACHE =
+            new ConcurrentHashMap<>();
 
 
 
@@ -1469,73 +1485,152 @@ public class SectionCompilerMixin {
     }
 
 
+    /**
+     * 光源档案 id（5 bit，0..31），写进体素字的 bits 6..10。
+     *
+     * <p>2026-10-31：取代原来 7 档的粗略分类。每档在
+     * {@code cpp/shaders/local_light_profile.glsl} 里自带色温/发射色、满级亮度、
+     * 基础传播距离 —— 于是火把、灯笼、营火、岩浆、荧石、海晶灯不再共用
+     * {@code emission / 15} 同一个口径。**本方法的返回值与那张表的顺序逐项对应。**</p>
+     *
+     * <p>按注册名匹配而不是按 {@code Blocks.*} 常量：17 色蜡烛、3 色蛙明灯、
+     * 4 级紫水晶芽这些变体自动归并，也不用为每个变体列一行。</p>
+     */
     private static int classifyLocalLightType(
             BlockState blockState
     ) {
-        var block =
-                blockState.getBlock();
+        final Block block = blockState.getBlock();
+        final Integer cached = LIGHT_PROFILE_CACHE.get(block);
+        if (cached != null) {
+            return cached;
+        }
+        final int resolved = classifyLocalLightTypeUncached(block);
+        LIGHT_PROFILE_CACHE.putIfAbsent(block, resolved);
+        return resolved;
+    }
 
-
-        if (
-                block == Blocks.TORCH ||
-                        block == Blocks.WALL_TORCH ||
-                        block == Blocks.LANTERN ||
-                        block == Blocks.CAMPFIRE ||
-                        block == Blocks.FIRE
-        ) {
-            return 1;
+    private static int classifyLocalLightTypeUncached(
+            Block block
+    ) {
+        final var blockKey =
+                BuiltInRegistries.BLOCK.getKey(block);
+        if (blockKey == null || !"minecraft".equals(blockKey.getNamespace())) {
+            // 模组方块：没有档案就不猜色温，落到 0 档（暖白 + 原版口径）。
+            return 0;
         }
 
+        final String path = blockKey.getPath();
 
+        switch (path) {
+            case "torch":
+            case "wall_torch":
+                return 1;
 
-        if (
-                block == Blocks.SOUL_TORCH ||
-                        block == Blocks.SOUL_WALL_TORCH ||
-                        block == Blocks.SOUL_LANTERN ||
-                        block == Blocks.SOUL_CAMPFIRE ||
-                        block == Blocks.SOUL_FIRE
-        ) {
-            return 2;
+            case "lantern":
+                return 2;
+
+            case "campfire":
+                return 3;
+
+            case "fire":
+                return 4;
+
+            case "soul_torch":
+            case "soul_wall_torch":
+                return 5;
+
+            case "soul_lantern":
+                return 6;
+
+            case "soul_campfire":
+                return 7;
+
+            case "soul_fire":
+                return 8;
+
+            case "redstone_torch":
+            case "redstone_wall_torch":
+                return 9;
+
+            case "redstone_lamp":
+                return 10;
+
+            case "lava":
+                return 11;
+
+            case "magma_block":
+                return 12;
+
+            case "glowstone":
+                return 13;
+
+            case "sea_lantern":
+                return 14;
+
+            case "shroomlight":
+                return 15;
+
+            case "jack_o_lantern":
+                return 16;
+
+            case "end_rod":
+                return 17;
+
+            case "beacon":
+                return 18;
+
+            case "conduit":
+                return 19;
+
+            case "nether_portal":
+                return 20;
+
+            case "glow_lichen":
+                return 21;
+
+            case "crying_obsidian":
+                return 24;
+
+            case "respawn_anchor":
+                return 25;
+
+            // 只有点燃态才会有 emission > 0，所以不用额外判 LIT 属性。
+            case "furnace":
+            case "blast_furnace":
+            case "smoker":
+                return 26;
+
+            case "ochre_froglight":
+            case "verdant_froglight":
+            case "pearlescent_froglight":
+                return 27;
+
+            case "brewing_stand":
+                return 28;
+
+            case "cave_vines":
+                return 29;
+
+            case "brown_mushroom":
+                return 30;
+
+            case "enchanting_table":
+                return 31;
+
+            default:
+                break;
         }
 
-
-
-        if (
-                block == Blocks.REDSTONE_TORCH ||
-                        block == Blocks.REDSTONE_WALL_TORCH
-        ) {
-            return 3;
+        // candle / white_candle / … / candle_cake / white_candle_cake
+        if (path.startsWith("candle") || path.endsWith("_candle")
+                || path.endsWith("_candle_cake")) {
+            return 23;
         }
 
-
-
-        if (
-                block == Blocks.LAVA
-        ) {
-            return 4;
+        // amethyst_cluster / large_amethyst_bud / medium_… / small_…
+        if (path.endsWith("amethyst_cluster") || path.endsWith("_amethyst_bud")) {
+            return 22;
         }
-
-
-
-        if (
-                block == Blocks.GLOWSTONE ||
-                        block == Blocks.SEA_LANTERN ||
-                        block == Blocks.SHROOMLIGHT ||
-                        block == Blocks.JACK_O_LANTERN ||
-                        block == Blocks.REDSTONE_LAMP
-        ) {
-            return 5;
-        }
-
-
-
-        if (
-                block == Blocks.NETHER_PORTAL
-        ) {
-            return 6;
-        }
-
-
 
         return 0;
     }
@@ -1951,9 +2046,9 @@ public class SectionCompilerMixin {
                                 voxelClass |
                                         (emissionClamped << 2) |
                                         (typeCode << 6) |
-                                        (r5 << 9) |
-                                        (g5 << 14) |
-                                        (b5 << 19) |
+                                        (r5 << 11) |
+                                        (g5 << 16) |
+                                        (b5 << 21) |
                                         (stainedGlass ? VLI_STAINED_GLASS_BIT : 0) |
                                         (partialTransmission << VLI_PARTIAL_SHIFT);
 

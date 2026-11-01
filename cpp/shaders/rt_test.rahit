@@ -916,6 +916,24 @@ void main() {
 
         // 面预算照旧推进：这套口径下 transmittanceAccum 不再变化，
         // 终止只能靠 bgT 与预算两条，所以预算必须每层加一（防无限穿透）。
+#if VPT_GLASS_DETERMINISTIC_CHAIN
+        // =====================================================
+        // 2026-10-31（第五轮）：确定性多层累积 —— 契约见 glass_chain_common.glsl。
+        // 深层玻璃第一次有贡献（旧口径 SINGLE_LAYER 下完全丢失）；每个玻璃体
+        // 只有入射面到达这里（链射线剔除背面）⇒ 天然一体一层；面预算耗尽按
+        // 遮挡收尾。最近层不经过这里 —— 相机主命中面由 rgen 在 trace 返回后写入。
+        // =====================================================
+        const float chainBackgroundTransparency =
+            glassAlphaBlendChainAccumulate(
+                ivec2(gl_LaunchIDEXT.xy),
+                vec4(chainPaneAlbedo / max(chainAlpha, 1.0e-3), chainAlpha));
+
+        if(chainBackgroundTransparency <
+           GLASS_ALPHA_BLEND_MIN_BACKGROUND_TRANSPARENCY)
+        {
+            return;
+        }
+#else
 #if VPT_GLASS_ALPHA_BLEND_SINGLE_LAYER
         // 2026-10-27：整条链只记录**最近的一层**。
         // 背景透射率保持 1-a（而非 Π(1-a)），异色玻璃也不会混成第三种颜色。
@@ -954,6 +972,7 @@ void main() {
         {
             return;
         }
+#endif
 #elif VPT_GLASS_ALPHA_BLEND_SURFACE_RADIANCE
         // 加性口径（旧档，A/B 保留）
         bool chainAcceptLayer;

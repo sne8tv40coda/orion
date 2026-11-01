@@ -37,7 +37,11 @@
 //     ray handed back.
 // =============================================================================
 
-const uint VPT_STAINED_GLASS_BIT = 1u << 24u;
+// 2026-10-31：体素字重排（给光源档案 id 腾出 5 bit）。
+// 新布局：0-1 class / 2-5 emission / 6-10 光源档案 / 11-15 r5 /
+// 16-20 g5 / 21-25 b5 / 26 染色玻璃标记 / 27-31 partial。
+// ⚠ 与 SectionCompilerMixin 的 VLI_STAINED_GLASS_BIT / VLI_PARTIAL_SHIFT 逐位对应。
+const uint VPT_STAINED_GLASS_BIT = 1u << 26u;
 
 bool vptReadSourceVoxel(ivec3 worldBlock, out uint source);
 
@@ -130,9 +134,9 @@ vec3 glassPaneTransmissionColor(vec3 spriteRgb, vec3 vertexRgb)
 vec3 glassDecodeVoxelAlbedo(uint source)
 {
     return vec3(
-        float((source >> 9u) & 31u),
-        float((source >> 14u) & 31u),
-        float((source >> 19u) & 31u)
+        float((source >> 11u) & 31u),
+        float((source >> 16u) & 31u),
+        float((source >> 21u) & 31u)
     ) * (1.0 / 31.0);
 }
 

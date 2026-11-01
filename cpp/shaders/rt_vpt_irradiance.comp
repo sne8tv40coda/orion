@@ -7,6 +7,9 @@ layout(binding = 2, set = 0) uniform CameraProperties {
     #include "camera_ubo.glsl"
 } cam;
 
+// 光源档案表：色温/发射色、满级亮度、基础传播距离（与 rgen、雾共用一份）。
+#include "local_light_profile.glsl"
+
 const uint TABLE_CAPACITY = 8192u;
 const uint SOURCE_WORDS = 4096u;
 const uint PROBE_EDGE = 9u;
@@ -17,17 +20,18 @@ const uint PAGE_WORDS = SOURCE_WORDS + DIRECTIONAL_CACHE_WORDS;
 const uint SURFACE_FACE_WORDS = SOURCE_WORDS * DIRECTION_COUNT;
 const uint CANDIDATES_PER_PAGE = 8u;
 const float MAX_LIGHT_DISTANCE = 30.0;
-const float LOCAL_RANGE_PER_EMISSION = 2.0;
 const float LOCAL_FADE_START_FRACTION = 0.60;
 const float INV_PI = 0.3183098861837907;
-const uint SOURCE_STAINED_GLASS_BIT = 1u << 24u;
-const uint SOURCE_PARTIAL_TRANSMISSION_SHIFT = 25u;
-const uint SOURCE_PARTIAL_TRANSMISSION_MAX = 127u;
+// 2026-10-31：体素字重排（光源档案 id 扩到 5 bit）。与 SectionCompilerMixin /
+// glass_tint_common.glsl / rt_test.rgen 逐位对应。
+const uint SOURCE_STAINED_GLASS_BIT = 1u << 26u;
+const uint SOURCE_PARTIAL_TRANSMISSION_SHIFT = 27u;
+const uint SOURCE_PARTIAL_TRANSMISSION_MAX = 31u;
 
 float vliPartialTransmission(uint source)
 {
     return float((source >> SOURCE_PARTIAL_TRANSMISSION_SHIFT) &
-        SOURCE_PARTIAL_TRANSMISSION_MAX) * (1.0 / 127.0);
+        SOURCE_PARTIAL_TRANSMISSION_MAX) * (1.0 / 31.0);
 }
 
 // Occupied cell: a full cube (class 1) or a partial occluder (class 3).
@@ -217,12 +221,7 @@ bool lookupVoxelPageAndIndex(
 
 vec3 emitterColor(uint typeCode)
 {
-    if(typeCode == 1u) return vec3(1.0, 0.55, 0.20);
-    if(typeCode == 2u) return vec3(0.20, 0.75, 1.0);
-    if(typeCode == 3u) return vec3(1.0, 0.12, 0.06);
-    if(typeCode == 4u) return vec3(1.0, 0.27, 0.05);
-    if(typeCode == 6u) return vec3(0.70, 0.28, 1.0);
-    return vec3(1.0, 0.82, 0.48);
+    return localLightProfileColor(typeCode);
 }
 
 uint packRGB(vec3 color)
@@ -267,9 +266,9 @@ uint faceIndexFromNormal(vec3 normal)
 vec3 decodeVoxelAlbedo(uint source)
 {
     return vec3(
-        float((source >>  9u) & 31u),
-        float((source >> 14u) & 31u),
-        float((source >> 19u) & 31u)
+        float((source >> 11u) & 31u),
+        float((source >> 16u) & 31u),
+        float((source >> 21u) & 31u)
     ) * (1.0 / 31.0);
 }
 
@@ -288,17 +287,24 @@ vec3 saturateGlassTransmission(vec3 transmission)
     );
 }
 
-float localLightRange(float emissionLevel)
+// 用户旋钮「本地光距离系数」（0.25 ~ 2.0，1.0 = 标准；未下发 ⇒ 1.0）。
+float localLightRangeScale()
 {
-    return min(
-        MAX_LIGHT_DISTANCE,
-        max(emissionLevel * LOCAL_RANGE_PER_EMISSION, 2.0)
-    );
+    float user = cam.rainWallParams1.w;
+    return (user >= 0.05 && user <= 8.0) ? user : 1.0;
 }
 
-float localRangeFade(float distanceToLight, float emissionLevel)
+// 传播距离 = 该光源档案的基础距离 × 用户系数，封顶 30 格。
+// 2026-10-31：不再用"emission × 2 格"的统一口径。
+float localLightRange(uint typeCode, float emissionLevel)
 {
-    float range = localLightRange(emissionLevel);
+    float base = localLightProfileBaseRange(typeCode, emissionLevel);
+    return clamp(base * localLightRangeScale(), 1.5, MAX_LIGHT_DISTANCE);
+}
+
+float localRangeFade(float distanceToLight, uint typeCode, float emissionLevel)
+{
+    float range = localLightRange(typeCode, emissionLevel);
     return 1.0 - smoothstep(
         range * LOCAL_FADE_START_FRACTION,
         range,
@@ -380,7 +386,7 @@ vec3 transmissionToEmitter(vec3 origin, ivec3 targetBlock)
         }
         if(voxelClass == 3u)
         {
-            transmission *= max(vliPartialTransmission(source), 1.0 / 127.0);
+            transmission *= max(vliPartialTransmission(source), 1.0 / 31.0);
         }
         if((source & SOURCE_STAINED_GLASS_BIT) != 0u)
         {
@@ -416,7 +422,9 @@ vec3 solveDirectIrradiance(uint receiverPage, vec3 receiverPos, vec3 receiverNor
 
         float distanceToLight = sqrt(distanceSquared);
         float emissionLevel = float(emission);
-        if(distanceToLight > localLightRange(emissionLevel))
+        // 2026-10-31：档案 id 扩到 5 bit（bits 4..8），距离/亮度改按档案。
+        uint typeCode = (candidate.w >> 4u) & 31u;
+        if(distanceToLight > localLightRange(typeCode, emissionLevel))
         {
             continue;
         }
@@ -439,14 +447,13 @@ vec3 solveDirectIrradiance(uint receiverPage, vec3 receiverPos, vec3 receiverNor
         }
         glassTransmission = saturateGlassTransmission(glassTransmission);
 
-        uint typeCode = (candidate.w >> 4u) & 7u;
         float radianceScale =
             3.2 *
             0.78 *
             localLightIntensity() *
-            (emissionLevel / 15.0) *
+            localLightProfileBrightness(typeCode, emissionLevel) *
             localDistanceAttenuation(distanceToLight) *
-            localRangeFade(distanceToLight, emissionLevel);
+            localRangeFade(distanceToLight, typeCode, emissionLevel);
         irradiance += emitterColor(typeCode) * radianceScale * receiverCosine *
             glassTransmission;
     }

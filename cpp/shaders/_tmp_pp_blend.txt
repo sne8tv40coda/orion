@@ -1,0 +1,1376 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(rgba16f, set = 0, binding = 0) uniform image2D sceneColor;
+layout(rgba16f, set = 0, binding = 1) uniform image2D alphaBlendGbuffer;
+layout(rgba16f, set = 0, binding = 2) uniform image2D alphaBlendMeta;
+layout(rgba16f, set = 0, binding = 3) uniform image2D alphaBlendAux;
+layout(rgba16f, set = 0, binding = 4) uniform image2D alphaBlendRadiance;
+layout(r32f, set = 0, binding = 5) uniform image2D sceneDepth;
+layout(rgba16f, set = 0, binding = 6) uniform image2D sceneNormalRoughness;
+layout(rgba16f, set = 0, binding = 7) uniform image2D sceneDiffuseAlbedo;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+layout(binding = 9, set = 0, std430) readonly buffer GlassBlueNoiseBuffer
+{
+    uint words[64u * 128u * 128u / 4u];
+} glassBlueNoise;
+
+vec2 glassBlueNoiseR2(uint index)
+{
+    const float g = 1.32471795724474602596;
+    return fract(vec2(float(index) / g, float(index) / (g * g)));
+}
+
+float glassBlueNoiseSample(uvec2 pixelIdx, uint temporalIdx, uint seedIndex)
+{
+    const uvec2 seedOffset = uvec2(glassBlueNoiseR2(seedIndex) * vec2(128.0));
+    const uint x = (pixelIdx.x + seedOffset.x) & 127u;
+    const uint y = (pixelIdx.y + seedOffset.y) & 127u;
+    const uint layer = temporalIdx & 63u;
+    const uint byteIndex = 16384u * layer + 128u * y + x;
+    const uint word = glassBlueNoise.words[byteIndex >> 2u];
+    const uint raw = (word >> ( (byteIndex & 3u) * 8u)) & 0xFFu;
+    return min(float(raw) * (1.0 / 255.0), 1.0 - 1.0 / 255.0);
+}
+
+layout(rgba16f, set = 0, binding = 10) uniform image2D alphaBlendVolume;
+
+
+layout(rgba16f, set = 0, binding = 11) uniform readonly image3D volumeShY;
+layout(rgba16f, set = 0, binding = 12) uniform readonly image3D volumeShCoCg;
+
+layout(set = 0, binding = 8) uniform CameraProperties
+{
+#line 1 "./camera_ubo.glsl"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    mat4 viewInverse;
+    mat4 projInverse;
+    uvec2 vertexBufferAddr;
+    uint frameCount;
+    uint padding;
+
+
+    vec4 cameraParams;
+
+    uint historyReadIndex;
+    uint historyValid;
+    uint historyPadding0;
+    uint historyPadding1;
+
+
+    uvec4 perfPrimary;
+    uvec4 perfSecondary;
+
+    mat4 prevViewInverse;
+    mat4 prevProjInverse;
+
+
+    vec4 historyParams;
+
+    vec4 playerPositionAndWater;
+    vec4 playerVelocityAndSpeed;
+
+
+    vec4 waterSimSurfaceAndOrigin;
+    uvec4 waterSimState;
+    vec4 waterSimImpulse;
+
+
+    vec4 weatherParams;
+
+
+    vec4 cloudParams0;
+    vec4 cloudParams1;
+    vec4 cloudParams2;
+    vec4 cloudParams3;
+    vec4 cloudParams4;
+
+
+
+    vec4 cloudParams5;
+    vec4 cloudParams6;
+    vec4 cloudParams7;
+    vec4 cloudParams8;
+    vec4 cloudParams9;
+
+
+
+    vec4 skyParams0;
+
+    vec4 skyParams1;
+
+
+
+    vec4 godRayParams0;
+
+
+    vec4 godRayParams1;
+
+    vec4 godRayParams2;
+
+
+    vec4 rainWallParams0;
+    vec4 rainWallParams1;
+
+
+
+    vec4 waterStyleParams0;
+
+    vec4 waterStyleParams1;
+
+
+
+    uvec4 perfSerAb;
+
+
+
+    vec4 dhFarFieldParams;
+
+    mat4 dhFarFieldInvMvp;
+
+    vec4 dhFarFieldLight;
+
+    mat4 dhFarFieldMvp;
+
+
+    vec4 sunShadowFarParams;
+
+
+
+
+
+
+
+
+
+
+    vec4 highCloudParams0;
+    vec4 highCloudParams1;
+    vec4 highCloudParams2;
+    vec4 highCloudParams3;
+    vec4 highCloudParams4;
+
+    vec4 cloudMsParams;
+    vec4 cloudMarchParams;
+
+
+
+
+
+
+    vec4 waterParams;
+
+    vec4 cloudPhiParams;
+    vec4 cloudLightParams;
+
+
+
+
+    vec4 cloudShapeParams;
+
+    vec4 cloudMoonParams;
+
+    vec4 cloudShape2Params;
+
+
+    vec4 cloudAmbientParams;
+    vec4 cloudMsParams2;
+
+
+
+    vec4 cloudLightParams2;
+    vec4 cloudProfileParams;
+    vec4 cloudDetailParams;
+
+
+
+
+
+
+    vec4 waterWaveParams;
+
+
+
+
+
+    vec4 waterWaveShapeParams;
+
+    vec4 waterSssParams;
+
+
+
+    vec4 waterFftParams;
+
+
+    vec4 waterFftParams2;
+
+
+    vec4 auroraParams;
+
+
+
+
+
+    vec4 rtSampleParams;
+
+
+
+
+    uvec4 perfAblationStage;
+
+    vec4 galaxyParams;
+
+
+
+
+
+
+
+
+
+
+
+    vec4 fogExtrasParams;
+
+
+
+
+
+
+
+    vec4 cloudTemporalParams;
+
+
+
+
+
+
+
+
+
+
+
+
+    vec4 cloudAerialParams;
+
+
+
+
+
+    uvec4 sharcBuffersLo;
+    uvec4 sharcBuffersHi;
+
+
+
+
+    uvec4 sharcCacheParams;
+
+
+
+
+
+
+
+
+
+
+
+
+
+    vec4 cloudSkyHueParams;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    vec4 cloudPhysicsParams;
+
+
+
+
+
+
+
+
+
+    vec4 pomParams;
+
+
+
+
+
+
+
+
+
+
+
+
+    vec4 sssParams;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    vec4 ueCloudA;
+    vec4 ueCloudB;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    vec4 giHalfParams;
+
+
+
+
+
+
+
+    vec4 giRayParams;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    vec4 hpShapeA;
+    vec4 hpShapeB;
+    vec4 hpShapeC;
+    vec4 hpShapeD;
+    vec4 hpLightA;
+    vec4 hpLightB;
+    vec4 hpMiscA;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    vec4 sparseParams;
+#line 115 "glass_alpha_blend.comp"
+ } cam;
+
+
+
+layout(push_constant) uniform GlassAlphaBlendPush
+{
+    uint extentX;
+    uint extentY;
+    uint searchIterations;
+    uint frameIndex;
+    float initialSearchRadius;
+    float radiusExpand;
+    float normalSimilarity;
+    float depthDifference;
+    float planarDifference;
+
+
+    float shMaxDistance;
+    float shDepthExponent;
+    float shValid;
+    uint useNeighborSearch;
+    uint useRadianceVolume;
+    uint searchTheSameObject;
+    uint shareNeighbors;
+    uint shFroxelW;
+    uint shFroxelH;
+    uint shFroxelDepth;
+    uint dbgMode;
+} pc;
+
+const float GLASS_ALPHA_BLEND_TAU = 6.28318530718;
+const float GLASS_ALPHA_BLEND_NO_GEOMETRY_DISTANCE = 1.0e30;
+const float GLASS_ALPHA_BLEND_ALBEDO_FLOOR = 0.05;
+const vec3 GLASS_ALPHA_BLEND_LUMA = vec3(0.2126, 0.7152, 0.0722);
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+vec3 glassAlphaBlendDecodeNormal(vec2 encoded)
+{
+    vec3 v = vec3(encoded.x, encoded.y, 1.0 - abs(encoded.x) - abs(encoded.y));
+    const float t = clamp(- v.z, 0.0, 1.0);
+    v.xy += vec2(v.x >= 0.0 ? - t : t, v.y >= 0.0 ? - t : t);
+    return normalize(v);
+}
+
+uint glassAlphaBlendHash(uint state)
+{
+    state ^= state >> 16u;
+    state *= 0x7FEB352Du;
+    state ^= state >> 15u;
+    state *= 0x846CA68Bu;
+    state ^= state >> 16u;
+    return state;
+}
+
+float glassAlphaBlendRandom(inout uint state)
+{
+    state = glassAlphaBlendHash(state + 0x9E3779B9u);
+    return float(state & 0x00FFFFFFu) * (1.0 / 16777216.0);
+}
+
+bool glassAlphaBlendInside(ivec2 pixel, ivec2 extent)
+{
+    return pixel.x >= 0 && pixel.y >= 0 &&
+           pixel.x < extent.x && pixel.y < extent.y;
+}
+
+
+
+float glassAlphaBlendSceneDistance(vec2 ndc, float depthValue)
+{
+    if (depthValue <= 1.0e-5)
+    {
+        return GLASS_ALPHA_BLEND_NO_GEOMETRY_DISTANCE;
+    }
+
+    vec4 sceneViewPosition = cam.projInverse * vec4(ndc, depthValue, 1.0);
+    if (abs(sceneViewPosition.w) <= 1.0e-6)
+    {
+        return GLASS_ALPHA_BLEND_NO_GEOMETRY_DISTANCE;
+    }
+
+    return length(sceneViewPosition.xyz / sceneViewPosition.w);
+}
+
+vec3 glassAlphaBlendPixelWorldDirection(vec2 ndc)
+{
+    vec4 viewPosition = cam.projInverse * vec4(ndc, 1.0, 1.0);
+    vec3 viewDirection = normalize(viewPosition.xyz / max(abs(viewPosition.w), 1.0e-6));
+    return normalize( (cam.viewInverse * vec4(viewDirection, 0.0)).xyz);
+}
+
+
+
+
+
+
+vec3 glassAlphaBlendNeighborLight(ivec2 neighbor)
+{
+    vec3 radiance = max(imageLoad(sceneColor, neighbor).rgb, vec3(0.0));
+    vec3 albedo = clamp(imageLoad(sceneDiffuseAlbedo, neighbor).rgb, vec3(0.0), vec3(1.0));
+
+
+
+    if (dot(albedo, GLASS_ALPHA_BLEND_LUMA) < GLASS_ALPHA_BLEND_ALBEDO_FLOOR)
+    {
+        return radiance;
+    }
+    return radiance / max(albedo, vec3(GLASS_ALPHA_BLEND_ALBEDO_FLOOR));
+}
+
+#line 1 "./spherical_harmonics.glsl"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+struct SphericalHarmonic
+{
+    vec4 shY;
+    vec2 cocg;
+};
+
+
+
+vec3 shRgbToYCoCg(vec3 color)
+{
+    return vec3(
+        0.25 * color.r + 0.5 * color.g + 0.25 * color.b,
+        0.5 * color.r + 0.0 * color.g - 0.5 * color.b,
+        - 0.25 * color.r + 0.5 * color.g - 0.25 * color.b);
+}
+
+
+
+
+
+
+vec3 shYCoCgToRgb(vec3 color)
+{
+    return vec3(
+        color.x + color.y - color.z,
+        color.x + color.z,
+        color.x - color.y - color.z);
+}
+
+
+SphericalHarmonic shCreate()
+{
+    SphericalHarmonic sh;
+    sh.shY = vec4(0.0);
+    sh.cocg = vec2(0.0);
+    return sh;
+}
+
+
+vec4 shEvalBasis(vec3 D)
+{
+    const float L00 = (0.5 * sqrt(1.0 / 3.14159265359));
+    const float L1_1 = (0.5 * sqrt(3.0 / 3.14159265359)) * D.y;
+    const float L10 = (0.5 * sqrt(3.0 / 3.14159265359)) * D.z;
+    const float L11 = (0.5 * sqrt(3.0 / 3.14159265359)) * D.x;
+    return vec4(L11, L1_1, L10, L00);
+}
+
+
+void shAddRadiance(inout SphericalHarmonic sh, vec3 color, vec3 dir)
+{
+    const vec3 YCoCg = shRgbToYCoCg(color);
+    const float Y = YCoCg.x;
+
+
+    if (any(isnan(dir)))
+    {
+        dir = vec3(0.0);
+    }
+
+    sh.cocg += YCoCg.yz;
+    sh.shY += shEvalBasis(dir) * Y;
+}
+
+
+vec3 shGetIrradiance(SphericalHarmonic sh)
+{
+    const float Y = max(0.0, sh.shY.w);
+    return shYCoCgToRgb(vec3(Y, sh.cocg * (0.5 * sqrt(1.0 / 3.14159265359))));
+}
+
+
+vec3 shResolveColorToDiffuse(SphericalHarmonic sh, vec3 N, float cosHalfAngle)
+{
+    const float d = dot(sh.shY.xyz, N);
+    float Y = 0.25 * sqrt(4.0 * 3.14159265359) * sh.shY.w +
+              0.5 * sqrt(4.0 * 3.14159265359 / 3.0) * d;
+
+
+    Y *= (2.0 * 3.14159265359 * (1.0 - cosHalfAngle)) / 3.14159265359;
+
+
+    const float modifier =
+        (sh.shY.w == 0.0 || Y == 0.0) ? 0.0 : ( (0.5 * sqrt(1.0 / 3.14159265359)) * Y / sh.shY.w);
+    const vec2 adjCoCg = sh.cocg * modifier;
+
+    return shYCoCgToRgb(vec3(Y, adjCoCg));
+}
+
+
+void shScale(inout SphericalHarmonic sh, float scalar)
+{
+    sh.shY *= scalar;
+    sh.cocg *= scalar;
+}
+
+
+void shHanningFilter(inout SphericalHarmonic sh, float k)
+{
+    sh.shY.xyz *= (1.0 + cos(3.14159265359 / k)) * 0.5;
+}
+
+
+vec3 shEvaluateHenyeyGreenstein(SphericalHarmonic sh, vec3 D, float g)
+{
+    const vec4 shBasis = shEvalBasis(D);
+    const vec4 hgBasis = vec4(vec3(g), 1.0);
+    const vec4 hgProjectedZH = hgBasis * shBasis;
+    const float resultY = dot(sh.shY, hgProjectedZH);
+
+    const float modifier =
+        (sh.shY.w == 0.0 || resultY == 0.0) ? 0.0 : ( (0.5 * sqrt(1.0 / 3.14159265359)) * resultY / sh.shY.w);
+    const vec2 adjCoCg = sh.cocg * modifier;
+
+    return max(vec3(0.0), shYCoCgToRgb(vec3(resultY, adjCoCg)));
+}
+
+
+SphericalHarmonic shLerp(SphericalHarmonic x, SphericalHarmonic y, float s)
+{
+    SphericalHarmonic result;
+    result.shY = mix(x.shY, y.shY, s);
+    result.cocg = mix(x.cocg, y.cocg, s);
+    return result;
+}
+
+
+SphericalHarmonic shLoad3D(
+    sampler3D texY,
+    sampler3D texCoCg,
+    ivec3 coordinate)
+{
+    SphericalHarmonic result;
+    result.shY = texelFetch(texY, coordinate, 0);
+    result.cocg = texelFetch(texCoCg, coordinate, 0).xy;
+    return result;
+}
+
+
+
+SphericalHarmonic shLoadFiltered3D(
+    sampler3D texY,
+    sampler3D texCoCg,
+    vec3 uvw)
+{
+    SphericalHarmonic result;
+    result.shY = textureLod(texY, uvw, 0.0);
+    result.cocg = textureLod(texCoCg, uvw, 0.0).xy;
+    return result;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+#line 247 "glass_alpha_blend.comp"
+
+
+
+
+
+
+
+
+
+
+
+vec3 glassAlphaBlendSampleVolumeSh(vec3 worldPosition)
+{
+    if (pc.shValid < 0.5 || pc.shFroxelW == 0u || pc.shFroxelH == 0u || pc.shFroxelDepth == 0u)
+    {
+        return vec3(0.0);
+    }
+
+
+    const mat4 viewMatrix = inverse(cam.viewInverse);
+    const mat4 projMatrix = inverse(cam.projInverse);
+    const vec4 viewPosition = viewMatrix * vec4(worldPosition, 1.0);
+    const vec4 clipPosition = projMatrix * viewPosition;
+
+    if (abs(clipPosition.w) < 1.0e-6)
+    {
+        return vec3(0.0);
+    }
+
+    const vec2 ndc = clipPosition.xy / clipPosition.w;
+
+    const vec2 uv = ndc * vec2(0.5, - 0.5) + 0.5;
+
+    if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0))))
+    {
+        return vec3(0.0);
+    }
+
+    const float viewZ = - viewPosition.z;
+    const float nearPlane = max(cam.cameraParams.x, 1.0e-3);
+    const float t = clamp( (viewZ - nearPlane) / max(pc.shMaxDistance, 1.0), 0.0, 1.0);
+
+    const float sliceT = pow(t, 1.0 / max(pc.shDepthExponent, 1.0));
+
+    const ivec3 size = ivec3(int(pc.shFroxelW), int(pc.shFroxelH), int(pc.shFroxelDepth));
+    const vec3 coordinate = vec3(uv * vec2(size.xy), sliceT * float(size.z));
+
+    const vec3 clamped = clamp(coordinate, vec3(0.0), vec3(size - ivec3(1)));
+    const ivec3 base = ivec3(floor(clamped));
+    const ivec3 upper = min(base + ivec3(1), size - ivec3(1));
+    const vec3 fraction = clamped - vec3(base);
+
+    SphericalHarmonic sh = shCreate();
+
+    for (int dz = 0; dz < 2; ++ dz)
+    {
+        for (int dy = 0; dy < 2; ++ dy)
+        {
+            for (int dx = 0; dx < 2; ++ dx)
+            {
+                const ivec3 p = ivec3(
+                    dx == 0 ? base.x : upper.x,
+                    dy == 0 ? base.y : upper.y,
+                    dz == 0 ? base.z : upper.z);
+
+                const float w =
+                    (dx == 0 ? 1.0 - fraction.x : fraction.x) *
+                    (dy == 0 ? 1.0 - fraction.y : fraction.y) *
+                    (dz == 0 ? 1.0 - fraction.z : fraction.z);
+
+                sh.shY += imageLoad(volumeShY, p) * w;
+                sh.cocg += imageLoad(volumeShCoCg, p).xy * w;
+            }
+        }
+    }
+
+
+    shHanningFilter(sh, 0.7);
+
+    return shGetIrradiance(sh);
+}
+
+void main()
+{
+    const ivec2 extent = ivec2(int(pc.extentX), int(pc.extentY));
+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (! glassAlphaBlendInside(pixel, extent))
+    {
+        return;
+    }
+
+
+
+
+
+    const vec4 meta = imageLoad(alphaBlendMeta, pixel);
+
+
+    if (meta.y <= 0.0)
+    {
+
+
+
+        if (pc.dbgMode == 1u)
+        {
+            imageStore(alphaBlendRadiance, pixel, vec4(1.0, 0.0, 1.0, 1.0));
+        }
+        return;
+    }
+
+
+    vec4 surface = imageLoad(alphaBlendGbuffer, pixel);
+
+
+
+
+
+
+
+
+
+    if (pc.dbgMode == 9u)
+    {
+        imageStore(alphaBlendRadiance, pixel, vec4(0.0));
+        return;
+    }
+
+
+
+
+    if (pc.dbgMode == 6u)
+    {
+        imageStore(
+            alphaBlendRadiance,
+            pixel,
+            vec4(vec3(clamp(meta.x, 0.0, 1.0)), 1.0));
+        return;
+    }
+
+    if (pc.dbgMode == 1u)
+    {
+        const float layerCount = imageLoad(alphaBlendAux, pixel).w;
+        imageStore(
+            alphaBlendRadiance,
+            pixel,
+            vec4(clamp(meta.x, 0.0, 1.0),
+                 clamp(surface.a, 0.0, 1.0),
+                 clamp(layerCount / 8.0, 0.0, 1.0),
+                 1.0));
+        return;
+    }
+
+    const vec3 paneNormal = glassAlphaBlendDecodeNormal(meta.zw);
+    const vec3 cameraPosition = cam.viewInverse[3].xyz;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    const vec2 uv = (vec2(pixel) + 0.5) / vec2(extent);
+    const vec2 ndc = uv * 2.0 - 1.0;
+    const vec3 worldDirection = glassAlphaBlendPixelWorldDirection(ndc);
+    const vec3 surfacePosition = cameraPosition + worldDirection * meta.y;
+
+    vec3 surfaceLight = vec3(0.0);
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    vec4 glassAlbedoSum = vec4(0.0);
+    vec3 glassDirectSum = vec3(0.0);
+    float glassGatherWeight = 0.0;
+    float glassDirectWeight = 0.0;
+
+
+
+
+    for (int dy = - 2; dy <= 2; ++ dy)
+    {
+        for (int dx = - 2; dx <= 2; ++ dx)
+        {
+            const ivec2 q = clamp(
+                pixel + ivec2(dx, dy),
+                ivec2(0),
+                extent - ivec2(1));
+
+
+
+            if (imageLoad(alphaBlendMeta, q).y <= 0.0)
+            {
+                continue;
+            }
+
+            const float w = 1.0 / (1.0 + float(dx * dx + dy * dy));
+
+            glassAlbedoSum += imageLoad(alphaBlendGbuffer, q) * w;
+            glassGatherWeight += w;
+
+            const vec4 directTap = imageLoad(alphaBlendVolume, q);
+
+            if (directTap.a > 0.0)
+            {
+                glassDirectSum += max(directTap.rgb, vec3(0.0)) * w;
+                glassDirectWeight += w;
+            }
+
+
+
+
+
+
+        }
+    }
+
+
+
+    if (glassGatherWeight > 0.0)
+    {
+        surface = glassAlbedoSum / glassGatherWeight;
+    }
+
+
+
+    const vec3 directLight = glassDirectWeight > 0.0
+        ? glassDirectSum / glassDirectWeight * (1.0 / 3.14159265359)
+        : vec3(0.0);
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    {
+        const vec3 receiverAlbedo =
+            clamp(imageLoad(sceneDiffuseAlbedo, pixel).rgb, vec3(0.0), vec3(1.0));
+
+        surfaceLight =
+            dot(receiverAlbedo, GLASS_ALPHA_BLEND_LUMA) <
+                GLASS_ALPHA_BLEND_ALBEDO_FLOOR
+                ? max(imageLoad(sceneColor, pixel).rgb, vec3(0.0))
+                : directLight * receiverAlbedo;
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    if (pc.dbgMode == 10u)
+    {
+
+
+
+
+
+        imageStore(alphaBlendRadiance, pixel, vec4(1.0, 0.0, 0.0, 1.0));
+        return;
+    }
+    if (pc.dbgMode == 12u)
+    {
+        surfaceLight = vec3(1.0);
+    }
+    else if (pc.dbgMode == 13u)
+    {
+        surfaceLight = max(imageLoad(sceneColor, pixel).rgb, vec3(0.0));
+    }
+
+
+
+
+    const vec3 alphaBlendColor =
+        max(surface.rgb, vec3(0.0)) * surface.a * surfaceLight;
+
+    imageStore(alphaBlendRadiance, pixel, vec4(max(alphaBlendColor, vec3(0.0)), 1.0));
+}
+

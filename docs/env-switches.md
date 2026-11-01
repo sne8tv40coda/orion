@@ -1,8 +1,8 @@
 # `ORION_*` 环境变量总表
 
 后端（`rtx_backend.dll`）的行为闸门全部通过**进程环境变量**读取，共 81 个（2026-10-29
-按 `cpp/VulkanCore.cpp` 里 `"ORION_*"` 字面量去重实测；原表写"47 个"已过期），全部在
-`cpp/VulkanCore.cpp`。之所以用环境变量而不是 `-D` 系统属性：C++ 侧是 `std::getenv()`，
+按 `cpp/backend/` 里 `"ORION_*"` 字面量去重实测（2026-11-01 拆分前在单文件
+`cpp/VulkanCore.cpp`，现分布于 backend/ 各模块）；原表写"47 个"已过期）。之所以用环境变量而不是 `-D` 系统属性：C++ 侧是 `std::getenv()`，
 Java 的 `-D` 传不进去（`build.gradle` 里的 `vmArg` 也到不了游戏 JVM）。
 
 > **所有闸门都是"第一次调用时读一次"**（`static const X = [](){ ... }();`），

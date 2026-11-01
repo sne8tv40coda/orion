@@ -86,7 +86,9 @@ vec4 reconstructCloud(vec2 uv, bool oneToOne, bool downsampling)
                        textureLod(cloudInput, uv + vec2(0, texel.y), 0.0) +
                        textureLod(cloudInput, uv - vec2(0, texel.y), 0.0);
     const vec4 sharpened = centerSample * 1.42 - cross * 0.105;
-    result = mix(result, sharpened, 0.25);
+    // 2026-10-31：0.25 -> 0.10。雾在半分辨率上没有真实细节可锐化，
+    // 这一步只会把低分辨率网格的抖动残差放大成可见的屏幕网格。
+    result = mix(result, sharpened, 0.10);
 
     result.rgb = max(result.rgb, vec3(0.0));
     result.a = clamp(result.a, 0.0, 1.0);

@@ -391,6 +391,7 @@ void main()
 
     float maxDistance = params.layer.w > 1.0 ? params.layer.w : 1.0e9;
     float hitDistance;
+    float hpMeanDistance;
     vec4 march;
 
     if(mode == 8)
@@ -422,7 +423,7 @@ void main()
     hp.jitter = fract(ingn);
 
         march = hpTraceVolumetricRay(origin, dir, maxDistance, hp, atlasTex, baseTex,
-            worleyTex, hitDistance);
+            worleyTex, hitDistance, hpMeanDistance);
 
         int hpCh = int(params.volume.w + 0.5);
         if(params.volume.w > 0.5 && hpCh <= 4)

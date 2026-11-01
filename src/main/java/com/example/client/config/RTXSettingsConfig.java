@@ -125,11 +125,29 @@ public final class RTXSettingsConfig {
     private static boolean trueSubsurfaceScattering =
             false;
 
+    /**
+     * 「本地光范围系数」（0.25 ~ 2.0，1.0 = 标准）。
+     *
+     * <p>2026-10-31 起语义变了：以前这里是**绝对最远距离（格）**，现在每个光源方块
+     * 在 {@code cpp/shaders/local_light_profile.glsl} 里有各自的基础传播距离，
+     * 这个值只当**整体系数**乘上去，乘积最后仍被 30 格封顶。</p>
+     *
+     * <p>字段名沿用旧名，好让旧配置里的 15.0（超出新区间）自然回落成 1.0，
+     * 而不是被当成 15 倍系数把整屏照爆。</p>
+     */
     private static float localLightMaxDistance =
-            15.0f;
-
-    private static float localLightIntensity =
             1.0f;
+
+    /**
+     * 「整体光源亮度系数」（0..4）。
+     *
+     * <p>每个光源方块的**绝对亮度**由 {@code local_light_profile.glsl} 的
+     * {@code lumens} 决定；这个滑杆只是整体系数。出厂档为 4.0：档案表里 1.0
+     * 的档位（火把/灯笼级别）在 4.0 下与改动前逐值一致，荧石/岩浆等更亮的
+     * 光源在这个基准上各自高出一截。</p>
+     */
+    private static float localLightIntensity =
+            4.0f;
 
     private static float dynamicLightIntensity =
             1.0f;
@@ -163,6 +181,15 @@ public final class RTXSettingsConfig {
 
     private static float cloudSunForwardScattering =
             1.0f;
+
+    // 2026-11-01 天空散射模型：0 = Bruneton 预计算 LUT（出厂），1 = Hillaire 结构
+    // （逐像素 march + 解析多次散射，见 cpp/shaders/sky_hillaire_common.glsl）。
+    // 车道 = CameraUBO.skyModelParams.x / .y。
+    private static int skyModel = 0;
+    private static float skyModelScale = 1.0f;
+    // 2026-11-01：夜间天空底光 / 雨天压暗倍率（CameraUBO.skyModelParams.z / .w）
+    private static float nightSkyAmbientScale = 1.0f;
+    private static float rainSkyDimScale = 1.0f;
 
     private static float auroraBrightness =
             1.0f;
@@ -221,7 +248,7 @@ public final class RTXSettingsConfig {
             "Billowy 权重",
             "顶部拉伸上限",
             "顶部拉伸强度",
-            "覆盖度标定",
+            "覆盖映射倍率",
             "Sc 强度",
             "Sc 高度压缩",
             "Sc 胞厚",
@@ -581,20 +608,24 @@ public final class RTXSettingsConfig {
     public record CloudShapeSettings(
             float bottomSmoothHeight,
             float bottomSmoothPow,
-            float twoTierThreshold) {
+            float twoTierThreshold,
+            float lightErosion) {
         public CloudShapeSettings {
             if(!Float.isFinite(bottomSmoothHeight) || bottomSmoothHeight < -1 || bottomSmoothHeight > 1 ||
                !Float.isFinite(bottomSmoothPow) || bottomSmoothPow < -1 || bottomSmoothPow > 8 ||
-               !Float.isFinite(twoTierThreshold) || twoTierThreshold < -1 || twoTierThreshold > 0.5f)
+               !Float.isFinite(twoTierThreshold) || twoTierThreshold < -1 || twoTierThreshold > 0.5f ||
+               !Float.isFinite(lightErosion) || lightErosion < 0 || lightErosion > 1)
                 throw new IllegalArgumentException("Invalid cloud shape settings");
         }
 
+        // 第 4 分量 = 光步侵蚀细节开关（0/1）。cloudShapeParams.w 原为 0 占位，
+        // 2026-11-01 起着色器读取：1 = 光步做 erosion（参考行为，+~40% 云 pass）。
         public float[] toParamArray() {
-            return new float[] { bottomSmoothHeight, bottomSmoothPow, twoTierThreshold, 0.0f };
+            return new float[] { bottomSmoothHeight, bottomSmoothPow, twoTierThreshold, lightErosion };
         }
     }
     private static CloudShapeSettings cloudShapeSettings = new CloudShapeSettings(
-            0.22f, 1.0f, 0.004f);
+            0.22f, 1.0f, 0.004f, 0.0f);
     public static synchronized CloudShapeSettings getCloudShapeSettings() { return cloudShapeSettings; }
     public static synchronized void setCloudShapeSettings(CloudShapeSettings settings) {
         cloudShapeSettings = java.util.Objects.requireNonNull(settings);
@@ -941,38 +972,9 @@ public final class RTXSettingsConfig {
         markDirty();
     }
 
-    // 2026-10-23 雨天地面雾浪（rain-driven ground mist wisps）。
-    //
-    // 车道：cloudParams4.y/.z/.w + cloudParams9.w（复用旧档 Rayleigh 残留与保留位，
-    // 见 cpp/VulkanCore.cpp 的 atomic 段）。着色器实现、噪声/各向异性/域扭曲的
-    // 设计说明见 cpp/shaders/volumetric_fog.glsl 的「雨天地面雾浪」常量段。
-    //
-    // 关键约束：**只在雨天出现** —— 着色器里乘 smoothstep(0, 0.35, 雨强)，
-    // 所以晴天无论怎么调都看不到它，也就不需要另做一个"晴天开关"。
-    public record FogWispSettings(
-            boolean enabled,
-            float strength,
-            float wavelength,
-            float speed) {
-        public FogWispSettings {
-            if(!Float.isFinite(strength) || strength < 0 || strength > 4 ||
-               !Float.isFinite(wavelength) || wavelength < 8 || wavelength > 1024 ||
-               !Float.isFinite(speed) || speed < 0 || speed > 8)
-                throw new IllegalArgumentException("Invalid fog wisp settings");
-        }
-
-        public float[] toParamArray() {
-            return new float[] {
-                    enabled ? 1.0f : 0.0f, strength, wavelength, speed };
-        }
-    }
-    private static FogWispSettings fogWispSettings =
-            new FogWispSettings(true, 1.2f, 180.0f, 0.55f);
-    public static synchronized FogWispSettings getFogWispSettings() { return fogWispSettings; }
-    public static synchronized void setFogWispSettings(FogWispSettings settings) {
-        fogWispSettings = java.util.Objects.requireNonNull(settings);
-        markDirty();
-    }
+    // 2026-10-31：「雨天地面雾浪」（FogWispSettings / setFogWispParams）整链删除。
+    // 用户实测该效果基本不可见，着色器侧（volumetric_fog.glsl）与 JNI 入口已同步移除；
+    // UBO 车道 cloudParams4.y/.z/.w + cloudParams9.w 保留为 0，布局不动。
 
  // 2026-10-10 **#3 天光自遮挡 / #4 时域速度抑制**
     //（CameraUBO.cloudTemporalParams，偏移 1392）。三项**出厂 0 = 关 ⇒ 逐位旧档**。
@@ -2139,17 +2141,19 @@ public final class RTXSettingsConfig {
             float value
     ) {
         if(!Float.isFinite(value) ||
-                value < 4.0f ||
-                value > 30.0f) {
+                value < 0.25f ||
+                value > 2.0f) {
 
             throw new IllegalArgumentException(
-                    "Invalid local light max distance: "
+                    "Invalid local light range scale: "
                             + value
             );
         }
 
 
-        float rounded = Math.round(value);
+        float rounded =
+                Math.round(value * 100.0f) / 100.0f;
+
         if (Float.compare(localLightMaxDistance, rounded) != 0) {
             localLightMaxDistance = rounded;
             markDirty();
@@ -2350,6 +2354,63 @@ public final class RTXSettingsConfig {
         float rounded = Math.round(value * 20.0f) / 20.0f;
         if(Float.compare(powderStrength, rounded) != 0) {
             powderStrength = rounded;
+            markDirty();
+        }
+    }
+
+    public static synchronized int getSkyModel() {
+        return skyModel;
+    }
+
+    public static synchronized void setSkyModel(int value) {
+        int clamped = Math.max(0, Math.min(1, value));
+        if(skyModel != clamped) {
+            skyModel = clamped;
+            markDirty();
+        }
+    }
+
+    public static synchronized float getSkyModelScale() {
+        return skyModelScale;
+    }
+
+    public static synchronized void setSkyModelScale(float value) {
+        if(!Float.isFinite(value) || value < 0.05f || value > 8.0f) {
+            throw new IllegalArgumentException("Invalid sky model scale: " + value);
+        }
+        float rounded = Math.round(value * 20.0f) / 20.0f;
+        if(Float.compare(skyModelScale, rounded) != 0) {
+            skyModelScale = rounded;
+            markDirty();
+        }
+    }
+
+    public static synchronized float getNightSkyAmbientScale() {
+        return nightSkyAmbientScale;
+    }
+
+    public static synchronized void setNightSkyAmbientScale(float value) {
+        if(!Float.isFinite(value) || value < 0.0f || value > 2.0f) {
+            throw new IllegalArgumentException("Invalid night sky ambient scale: " + value);
+        }
+        float rounded = Math.round(value * 20.0f) / 20.0f;
+        if(Float.compare(nightSkyAmbientScale, rounded) != 0) {
+            nightSkyAmbientScale = rounded;
+            markDirty();
+        }
+    }
+
+    public static synchronized float getRainSkyDimScale() {
+        return rainSkyDimScale;
+    }
+
+    public static synchronized void setRainSkyDimScale(float value) {
+        if(!Float.isFinite(value) || value < 0.0f || value > 2.0f) {
+            throw new IllegalArgumentException("Invalid rain sky dim scale: " + value);
+        }
+        float rounded = Math.round(value * 20.0f) / 20.0f;
+        if(Float.compare(rainSkyDimScale, rounded) != 0) {
+            rainSkyDimScale = rounded;
             markDirty();
         }
     }
@@ -2729,10 +2790,10 @@ public final class RTXSettingsConfig {
                     false;
 
             localLightMaxDistance =
-                    15.0f;
+                    1.0f;
 
             localLightIntensity =
-                    1.0f;
+                    4.0f;
 
             dynamicLightIntensity =
                     1.0f;
@@ -2806,10 +2867,10 @@ public final class RTXSettingsConfig {
                         false;
 
                 localLightMaxDistance =
-                        15.0f;
+                        1.0f;
 
                 localLightIntensity =
-                        1.0f;
+                        4.0f;
 
                 dynamicLightIntensity =
                         1.0f;
@@ -2891,6 +2952,11 @@ public final class RTXSettingsConfig {
 
                 powderStrength =
                         3.0f;
+
+                skyModel = 0;
+                skyModelScale = 1.0f;
+                nightSkyAmbientScale = 1.0f;
+                rainSkyDimScale = 1.0f;
 
                 cloudSunForwardScattering =
                         1.0f;
@@ -3005,18 +3071,20 @@ public final class RTXSettingsConfig {
 
             if(data.localLightMaxDistance != null &&
                     Float.isFinite(data.localLightMaxDistance) &&
-                    data.localLightMaxDistance >= 4.0f &&
-                    data.localLightMaxDistance <= 30.0f) {
+                    data.localLightMaxDistance >= 0.25f &&
+                    data.localLightMaxDistance <= 2.0f) {
 
                 localLightMaxDistance =
                         Math.round(
-                                data.localLightMaxDistance
-                        );
+                                data.localLightMaxDistance * 100.0f
+                        ) / 100.0f;
 
             } else {
 
+                // 旧档里这个字段是"最远距离（格）"（4~30），必然落在新区间外
+                // ⇒ 自动回落成 1.0（标准系数），不会被当成 15 倍系数。
                 localLightMaxDistance =
-                        15.0f;
+                        1.0f;
 
             }
 
@@ -3033,7 +3101,7 @@ public final class RTXSettingsConfig {
             } else {
 
                 localLightIntensity =
-                        1.0f;
+                        4.0f;
 
             }
 
@@ -3091,12 +3159,18 @@ public final class RTXSettingsConfig {
                             DEFAULT_ATMOSPHERE_SETTINGS.sunTintStrength(), 0.0f, 1.0f, 0.01f),
                     data.physicalSkyEnabled == null || data.physicalSkyEnabled,
                     validCloudSetting(data.scatterIntensity,
-                            DEFAULT_ATMOSPHERE_SETTINGS.scatterIntensity(), 0.0f, 2.0f, 0.05f),
+                            DEFAULT_ATMOSPHERE_SETTINGS.scatterIntensity(), 0.0f, 8.0f, 0.05f),
                     validCloudSetting(data.ozoneStrength,
                             DEFAULT_ATMOSPHERE_SETTINGS.ozoneStrength(), 0.0f, 2.0f, 0.05f)
             );
 
             powderStrength = validCloudSetting(data.powderStrength, 3.0f, 0.0f, 3.0f, 0.05f);
+            skyModel = data.skyModel == null ? 0 : Math.max(0, Math.min(1, data.skyModel));
+            skyModelScale = validCloudSetting(data.skyModelScale, 1.0f, 0.05f, 8.0f, 0.05f);
+            nightSkyAmbientScale =
+                    validCloudSetting(data.nightSkyAmbientScale, 1.0f, 0.0f, 2.0f, 0.05f);
+            rainSkyDimScale =
+                    validCloudSetting(data.rainSkyDimScale, 1.0f, 0.0f, 2.0f, 0.05f);
 
             auroraBrightness = validCloudSetting(data.auroraBrightness, 1.0f, 0.0f, 3.0f, 0.05f);
 
@@ -3136,7 +3210,9 @@ public final class RTXSettingsConfig {
                 cloudShapeSettings = new CloudShapeSettings(
                         validCloudSetting(data.cloudBottomSmoothHeight, 0.22f, 0, 1, 0.02f),
                         validCloudSetting(data.cloudBottomSmoothPow, 1.0f, 0.05f, 8, 0.05f),
-                        validCloudSetting(data.cloudTwoTierThreshold, 0.004f, 0, 0.5f, 0.001f));
+                        validCloudSetting(data.cloudTwoTierThreshold, 0.004f, 0, 0.5f, 0.001f),
+                        data.cloudLightErosion == null ? 0.0f
+                            : (data.cloudLightErosion > 0.5f ? 1.0f : 0.0f));
                 cloudMoonSettings = new CloudMoonSettings(
                         validCloudSetting(data.cloudMoonStrength, 1.0f, -1, 4, 0.05f),
                         validCloudSetting(data.cloudMoonPhase, 1.0f, -1, 1, 0.05f));
@@ -3181,11 +3257,6 @@ public final class RTXSettingsConfig {
                         validCloudSetting(data.fogGroundAnchorStrength, 1.0f, 0, 1, 0.05f),
                         validCloudSetting(data.fogSkyAmbientStrength, 1.0f, 0, 1, 0.05f),
                         validCloudSetting(data.fogTemporalJitterStrength, 1.0f, 0, 1, 0.05f));
-                fogWispSettings = new FogWispSettings(
-                        data.fogWispEnabled == null || data.fogWispEnabled,
-                        validCloudSetting(data.fogWispStrength, 1.2f, 0, 4, 0.05f),
-                        validCloudSetting(data.fogWispWavelength, 180.0f, 8, 1024, 1.0f),
-                        validCloudSetting(data.fogWispSpeed, 0.55f, 0, 8, 0.05f));
                 cloudTemporalSettings = new CloudTemporalSettings(
                         validCloudSetting(data.cloudSkyVisibilityStrength, 0.0f, 0, 1, 0.05f),
                         validCloudSetting(data.cloudSkyVisibilitySteps, 0.0f, 0, 32, 1.0f),
@@ -3208,7 +3279,7 @@ public final class RTXSettingsConfig {
                 cloudErosionScale = validCloudSetting(data.cloudErosionScale, 1.0f, 0f, 2f, 0.05f);
                 cloudWeatherScale = validCloudSetting(data.cloudWeatherScale, 0.75f, 0.0f, 0.99f, 0.01f);
                 cloudSilver = validCloudSetting(data.cloudSilver, 0.08f, 0.0f, 1.0f, 0.01f);
-                cloudViewDistance = validCloudSetting(data.cloudViewDistance, 120000f, 2000f, 200000f, 1000f);
+                cloudViewDistance = validCloudSetting(data.cloudViewDistance, 25000f, 4000f, 60000f, 1000f);
                 cloudMarchSettings = new CloudMarchSettings(
                         validCloudSetting(data.cloudAdaptiveLightRange, 2000.0f, 0, 12000, 100.0f),
                         data.cloudTwoTierStep == null || data.cloudTwoTierStep,
@@ -3274,14 +3345,14 @@ public final class RTXSettingsConfig {
                 cloudSettings = new CloudSettings(
                         data.cloudEnabled == null || data.cloudEnabled,
         validCloudSetting(data.cloudBottom, DEFAULT_CLOUD_SETTINGS.bottom(), 96.0f, 4000.0f, 16.0f),
-                validCloudSetting(data.cloudThickness, DEFAULT_CLOUD_SETTINGS.thickness(), 128.0f, 5000.0f, 16.0f),
+                validCloudSetting(data.cloudThickness, DEFAULT_CLOUD_SETTINGS.thickness(), 256.0f, 5000.0f, 16.0f),
                         validCloudSetting(data.cloudCoverage, DEFAULT_CLOUD_SETTINGS.coverage(), 0.10f, 0.90f, 0.01f),
                         validCloudSetting(data.cloudDensity, DEFAULT_CLOUD_SETTINGS.density(), 0.25f, 5.0f, 0.05f),
                 validCloudSetting(data.cloudDetailStrength, DEFAULT_CLOUD_SETTINGS.detailStrength(), 0.0f, 1.0f, 0.01f),
                         validCloudSetting(data.cloudWindSpeed, DEFAULT_CLOUD_SETTINGS.windSpeed(), 0.0f, 32.0f, 0.5f),
                         validCloudSetting(data.cloudEvolution, DEFAULT_CLOUD_SETTINGS.evolution(), 0.0f, 2.0f, 0.05f),
                         validSetting(data.cloudQuality, DEFAULT_CLOUD_SETTINGS.quality(), 0, 2),
-                        validCloudSetting(data.cloudSize, DEFAULT_CLOUD_SETTINGS.size(), 0.25f, 2.0f, 0.05f),
+                        validCloudSetting(data.cloudSize, DEFAULT_CLOUD_SETTINGS.size(), 0.5f, 3.0f, 0.05f),
                         validCloudSetting(data.cloudDistribution, DEFAULT_CLOUD_SETTINGS.distribution(), 0.0f, 1.0f, 0.05f),
                 validCloudSetting(data.cloudBaseFeather, DEFAULT_CLOUD_SETTINGS.baseFeather(), 0.0f, 0.33f, 0.01f),
                         validCloudSetting(data.cloudSunlightStrength, DEFAULT_CLOUD_SETTINGS.sunlightStrength(), 0.0f, 3.0f, 0.01f)
@@ -3547,10 +3618,10 @@ public final class RTXSettingsConfig {
                     false;
 
             localLightMaxDistance =
-                    15.0f;
+                    1.0f;
 
             localLightIntensity =
-                    1.0f;
+                    4.0f;
 
             dynamicLightIntensity =
                     1.0f;
@@ -3618,6 +3689,11 @@ public final class RTXSettingsConfig {
 
             powderStrength =
                     3.0f;
+
+            skyModel = 0;
+            skyModelScale = 1.0f;
+            nightSkyAmbientScale = 1.0f;
+            rainSkyDimScale = 1.0f;
 
             cloudSunForwardScattering =
                     1.0f;
@@ -3739,6 +3815,10 @@ public final class RTXSettingsConfig {
             data.scatterIntensity = atmosphereSettings.scatterIntensity();
             data.ozoneStrength = atmosphereSettings.ozoneStrength();
             data.powderStrength = powderStrength;
+            data.skyModel = skyModel;
+            data.skyModelScale = skyModelScale;
+            data.nightSkyAmbientScale = nightSkyAmbientScale;
+            data.rainSkyDimScale = rainSkyDimScale;
             data.cloudSunForwardScattering = cloudSunForwardScattering;
             data.auroraBrightness = auroraBrightness;
             data.auroraFlowSpeed = auroraFlowSpeed;
@@ -3771,6 +3851,7 @@ public final class RTXSettingsConfig {
             data.cloudBottomSmoothHeight = cloudShapeSettings.bottomSmoothHeight();
             data.cloudBottomSmoothPow = cloudShapeSettings.bottomSmoothPow();
             data.cloudTwoTierThreshold = cloudShapeSettings.twoTierThreshold();
+            data.cloudLightErosion = cloudShapeSettings.lightErosion();
             data.cloudMoonStrength = cloudMoonSettings.moonStrength();
             data.cloudMoonPhase = cloudMoonSettings.moonPhase();
             data.cloudDetailScale = cloudShape2Settings.detailScale();
@@ -3805,10 +3886,6 @@ public final class RTXSettingsConfig {
             data.fogGroundAnchorStrength = fogExtrasSettings.groundAnchorStrength();
             data.fogSkyAmbientStrength = fogExtrasSettings.skyAmbientStrength();
             data.fogTemporalJitterStrength = fogExtrasSettings.temporalJitterStrength();
-            data.fogWispEnabled = fogWispSettings.enabled();
-            data.fogWispStrength = fogWispSettings.strength();
-            data.fogWispWavelength = fogWispSettings.wavelength();
-            data.fogWispSpeed = fogWispSettings.speed();
             data.cloudSkyVisibilityStrength = cloudTemporalSettings.skyVisibilityStrength();
             data.cloudSkyVisibilitySteps = cloudTemporalSettings.skyVisibilitySteps();
             data.cloudTemporalDampStrength = cloudTemporalSettings.temporalDampStrength();
@@ -4125,6 +4202,10 @@ public final class RTXSettingsConfig {
         Float scatterIntensity;
         Float ozoneStrength;
         Float powderStrength;
+        Integer skyModel;
+        Float skyModelScale;
+        Float nightSkyAmbientScale;
+        Float rainSkyDimScale;
         Float cloudSunForwardScattering;
         Float auroraBrightness;
         Float auroraFlowSpeed;
@@ -4157,6 +4238,7 @@ public final class RTXSettingsConfig {
         Float cloudAoUpwardScale;
         Float cloudSunsetAmbientTint;
         Float cloudBottomSmoothHeight;
+        Float cloudLightErosion;
         Float cloudBottomSmoothPow;
         Float cloudTwoTierThreshold;
         Float cloudMoonStrength;
@@ -4193,10 +4275,6 @@ public final class RTXSettingsConfig {
         Float fogGroundAnchorStrength;
         Float fogSkyAmbientStrength;
         Float fogTemporalJitterStrength;
-        Boolean fogWispEnabled;
-        Float fogWispStrength;
-        Float fogWispWavelength;
-        Float fogWispSpeed;
         Float cloudSkyVisibilityStrength;
         Float cloudSkyVisibilitySteps;
         Float cloudTemporalDampStrength;
@@ -4695,7 +4773,7 @@ public final class RTXSettingsConfig {
                     !Float.isFinite(scatterIntensity) || !Float.isFinite(ozoneStrength) ||
                     starIntensity < 0.0f || starIntensity > 2.0f ||
                     sunTintStrength < 0.0f || sunTintStrength > 1.0f ||
-                    scatterIntensity < 0.0f || scatterIntensity > 2.0f ||
+                    scatterIntensity < 0.0f || scatterIntensity > 8.0f ||
                     ozoneStrength < 0.0f || ozoneStrength > 2.0f) {
                 throw new IllegalArgumentException("Invalid atmosphere settings");
             }
