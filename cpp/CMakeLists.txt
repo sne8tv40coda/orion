@@ -41,9 +41,45 @@ if(NOT EXISTS "${NRD_SHADERMAKE_BLOB_LIB}")
 endif()
 
 # 源文件
+# 2026-11-01 规范化拆分：原单文件 VulkanCore.cpp（约 7.1 万行）拆为 backend/ 下
+# 按领域划分的编译单元；共享声明在 backend/OrionInternal.h，全局变量定义集中在
+# backend/State.cpp（保持原声明顺序以复现静态初始化次序）。模块说明见
+# backend/README.md。
 set(SOURCES
-        VulkanCore.cpp
-        # 2026-10-29：BC7 编码器（独立 TU；VulkanCore.cpp 只 include 它的头）。
+        backend/As.cpp
+        backend/Cleanup.cpp
+        backend/Clouds.cpp
+        backend/Device.cpp
+        backend/Entities.cpp
+        backend/Frame.cpp
+        backend/Geometry.cpp
+        backend/Glass.cpp
+        backend/JniSettings.cpp
+        backend/Lights.cpp
+        backend/Lod.cpp
+        backend/Memory.cpp
+        backend/Nrd.cpp
+        backend/Particles.cpp
+        backend/Perf.cpp
+        backend/PipelineCache.cpp
+        backend/Platform.cpp
+        backend/PostFx.cpp
+        backend/RtPipeline.cpp
+        backend/Sections.cpp
+        backend/Settings.cpp
+        backend/Shaders.cpp
+        backend/Shadow.cpp
+        backend/Sharc.cpp
+        backend/Sky.cpp
+        backend/State.cpp
+        backend/Streamline.cpp
+        backend/Textures.cpp
+        backend/Tracking.cpp
+        backend/Vli.cpp
+        backend/VolRestir.cpp
+        backend/Water.cpp
+        backend/WorldGeometry.cpp
+        # 2026-10-29：BC7 编码器（独立 TU；backend/Textures.cpp 只 include 它的头）。
         external/bc7enc/bc7enc.cpp
 )
 

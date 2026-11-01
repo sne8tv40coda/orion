@@ -150,3 +150,8 @@ cpp/external/**/.git
 /cpp/shaders/*.md
 /cpp/shaders/rt_ser_probe_compile.txt
 
+# cpp 手工备份归档（2026-11-01 拆分时移入）
+cpp/_archive/
+
+# ZCode 工具目录（拆分脚本与拆分前快照存档）
+.zcode/
