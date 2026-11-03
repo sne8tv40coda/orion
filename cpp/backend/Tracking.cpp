@@ -470,6 +470,20 @@ VkResult rtxTrackedCreateShaderModule(
     const VkResult result =
         vkCreateShaderModule(device, createInfo, allocator, shaderModule);
 
+    // 2026-11-02 P0（冷编分解）：登记 module -> SPV 哈希。compute 管线创建日志
+    // 只拿得到 VkShaderModule，靠这张表反查 loadSpv 登记的文件路径。只做观测。
+    if(result == VK_SUCCESS &&
+       shaderModule != nullptr &&
+       createInfo != nullptr &&
+       createInfo->pCode != nullptr &&
+       createInfo->codeSize >= sizeof(uint32_t))
+    {
+        OrionPipelineRegisterShaderModule(
+            *shaderModule,
+            OrionPipelineSpvHash(createInfo->pCode, createInfo->codeSize)
+        );
+    }
+
     if(rtxMemObjTrackEnabled() && result == VK_SUCCESS)
     {
         g_rtxMemObj.shader.fetch_add(1u, std::memory_order_relaxed);
@@ -485,6 +499,13 @@ VkResult rtxTrackedCreateComputePipelines(
     const VkAllocationCallbacks* allocator,
     VkPipeline* pipelines)
 {
+    // 2026-11-02 P0（冷编分解）：全部 compute 管线都经过这里（TrackingHooks.h 把
+    // vkCreateComputePipelines 整体宏到本函数），所以只此一处计时即可把
+    // "启动里 compute 编译占多少"打成逐条 [PERF PIPE]。
+    // 注意：只观测，pipelineCache 与 allocator 原样透传，不影响命中率。
+    const auto orionPipelineCreateStart =
+        std::chrono::steady_clock::now();
+
     const VkResult result = vkCreateComputePipelines(
         device,
         pipelineCache,
@@ -492,6 +513,24 @@ VkResult rtxTrackedCreateComputePipelines(
         createInfos,
         allocator,
         pipelines
+    );
+
+    const double orionPipelineCreateMilliseconds =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - orionPipelineCreateStart
+        ).count();
+
+    const char* orionPipelineSpvName =
+        (createInfoCount > 0u && createInfos != nullptr)
+            ? OrionPipelineSpvNameOfModule(createInfos[0].stage.module)
+            : "<none>";
+
+    OrionPipelineLogCreate(
+        "compute",
+        orionPipelineSpvName,
+        pipelineCache != VK_NULL_HANDLE,
+        orionPipelineCreateMilliseconds,
+        result
     );
 
     if(rtxMemObjTrackEnabled() && result == VK_SUCCESS)

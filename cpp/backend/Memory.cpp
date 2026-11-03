@@ -389,6 +389,12 @@ void createCameraUBO() {
     ubo->giHalfParams[2] = 0.0f;
     ubo->giHalfParams[3] = 0.0f;
 
+    // 2026-11-02 屏幕空间降级链（SSR + SSPT）：出厂关闭
+    ubo->ssHybridParams[0] = 0.0f;
+    ubo->ssHybridParams[1] = 0.0f;
+    ubo->ssHybridParams[2] = 0.0f;
+    ubo->ssHybridParams[3] = 0.0f;
+
     ubo->giRayParams[0] = 0.0f;
     ubo->giRayParams[1] = 0.0f;
     ubo->giRayParams[2] = 0.0f;

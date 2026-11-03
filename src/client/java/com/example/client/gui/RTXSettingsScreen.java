@@ -44,6 +44,10 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
     private float pendingPOMDepth;
     private boolean pendingPOMSharp;
 
+    // 2026-11-02 屏幕空间降级链（单位：区块；0 = 关）
+    private float pendingSsptRange;
+    private float pendingSsrRange;
+
     private int pendingGiNearRate;
     private boolean pendingGlossyRoughLod;
 
@@ -428,6 +432,12 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
 
         this.pendingPOMSharp =
                 RTXSettingsConfig.isPOMSharp();
+
+        this.pendingSsptRange =
+                RTXSettingsConfig.getSsptRange();
+
+        this.pendingSsrRange =
+                RTXSettingsConfig.getSsrRange();
 
         this.pendingGiNearRate =
                 NativeVulkan.getGiNearRate();
@@ -1682,6 +1692,18 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
         );
 
 
+        // 2026-11-02 屏幕空间降级链（走 G-buffer；两项默认都是 0 = 关）
+        //   SSPT：射程 0..12 区块，屏幕空间路径追踪替换该半径内的间接光项
+        //   SSR ：射程上限 0..64 区块，硬性下限 12 —— 只有"RT 镜面命中距离
+        //         > 12 区块"的像素才允许被 SSR 接手（判据在 ss_hybrid.comp）
+        this.addOptionRow(cloudSlider("SSPT 射程（0=关）", 0.0, 12.0, 1.0,
+                this.pendingSsptRange, "%.0f 区块",
+                value -> this.pendingSsptRange = (float) value));
+        this.addOptionRow(cloudSlider("SSR 射程（0=关，最低 12）", 0.0, 64.0, 1.0,
+                this.pendingSsrRange, "%.0f 区块",
+                value -> this.pendingSsrRange = (float) value));
+
+
         CycleButton<Integer> giNearRateButton =
                 CycleButton.builder(
                                 level -> Component.literal(
@@ -2834,6 +2856,33 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
                     this.pendingAuroraFlowSpeed
             );
         } else {
+            allApplied = false;
+        }
+
+        // 2026-11-02 屏幕空间降级链。native 失败时回滚 pending（与其它项同口径）。
+        if(!NativeVulkan.isLoaded() || NativeVulkan.setSSPTRange(
+                this.pendingSsptRange
+        )) {
+            RTXSettingsConfig.setSsptRange(
+                    this.pendingSsptRange
+            );
+        } else {
+            this.pendingSsptRange = RTXSettingsConfig.getSsptRange();
+            allApplied = false;
+        }
+
+        if(!NativeVulkan.isLoaded() || NativeVulkan.setSSRRange(
+                this.pendingSsrRange
+        )) {
+            RTXSettingsConfig.setSsrRange(
+                    this.pendingSsrRange
+            );
+
+            // 1..11 会被硬性约束抬到 12，滑条读数必须跟着回写，
+            // 否则界面上仍显示"5 区块"而实际是 12
+            this.pendingSsrRange = RTXSettingsConfig.getSsrRange();
+        } else {
+            this.pendingSsrRange = RTXSettingsConfig.getSsrRange();
             allApplied = false;
         }
 

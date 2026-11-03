@@ -197,6 +197,13 @@ public final class RTXSettingsConfig {
     private static float auroraFlowSpeed =
             1.0f;
 
+    // 2026-11-02 屏幕空间降级链（SSR + SSPT）。默认都是 0 = 关（逐位旧画面）。
+    //   ssptRange = SSPT 射程（区块，0..12，0 = 关）
+    //   ssrRange  = SSR 射程上限（区块，0 = 关；硬性下限 12 —— SSR 只在
+    //               "镜面命中距离 > 12 区块"的像素上出现，判据在着色器里）
+    private static float ssptRange = 0.0f;
+    private static float ssrRange = 0.0f;
+
 
     private static float cloudSunReddening =
             0.0f;
@@ -2430,6 +2437,44 @@ public final class RTXSettingsConfig {
         }
     }
 
+    public static synchronized float getSsptRange() {
+        return ssptRange;
+    }
+
+    /** SSPT 射程，单位区块（0..12）。0 = 关。 */
+    public static synchronized void setSsptRange(float value) {
+        if(!Float.isFinite(value) || value < 0.0f || value > 12.0f) {
+            throw new IllegalArgumentException("Invalid SSPT range: " + value);
+        }
+        float rounded = Math.round(value);
+        if(Float.compare(ssptRange, rounded) != 0) {
+            ssptRange = rounded;
+            markDirty();
+        }
+    }
+
+    public static synchronized float getSsrRange() {
+        return ssrRange;
+    }
+
+    /**
+     * SSR 射程上限，单位区块。0 = 关；1..11 会被抬到 12（硬性约束：
+     * SSR 只在 > 12 区块的镜面命中上出现）。上限 64。
+     */
+    public static synchronized void setSsrRange(float value) {
+        if(!Float.isFinite(value) || value < 0.0f || value > 64.0f) {
+            throw new IllegalArgumentException("Invalid SSR range: " + value);
+        }
+        float rounded = Math.round(value);
+        if(rounded > 0.0f && rounded < 12.0f) {
+            rounded = 12.0f;
+        }
+        if(Float.compare(ssrRange, rounded) != 0) {
+            ssrRange = rounded;
+            markDirty();
+        }
+    }
+
     public static synchronized float getAuroraFlowSpeed() {
         return auroraFlowSpeed;
     }
@@ -3176,6 +3221,14 @@ public final class RTXSettingsConfig {
 
             auroraFlowSpeed = validCloudSetting(data.auroraFlowSpeed, 1.0f, 0.0f, 4.0f, 0.05f);
 
+            // 2026-11-02 屏幕空间降级链：默认 0 = 关
+            ssptRange = validCloudSetting(data.ssptRange, 0.0f, 0.0f, 12.0f, 1.0f);
+            ssrRange = validCloudSetting(data.ssrRange, 0.0f, 0.0f, 64.0f, 1.0f);
+            if(ssrRange > 0.0f && ssrRange < 12.0f) {
+                // 硬性约束与 native 侧同口径
+                ssrRange = 12.0f;
+            }
+
             cloudSunForwardScattering =
                     validCloudSetting(data.cloudSunForwardScattering, 1.0f, 0.0f, 1.0f, 0.05f);
 
@@ -3822,6 +3875,8 @@ public final class RTXSettingsConfig {
             data.cloudSunForwardScattering = cloudSunForwardScattering;
             data.auroraBrightness = auroraBrightness;
             data.auroraFlowSpeed = auroraFlowSpeed;
+            data.ssptRange = ssptRange;
+            data.ssrRange = ssrRange;
 
             data.cloudModelVersion = CLOUD_MODEL_VERSION;
             data.waterWaveVersion = WATER_WAVE_VERSION;
@@ -4209,6 +4264,9 @@ public final class RTXSettingsConfig {
         Float cloudSunForwardScattering;
         Float auroraBrightness;
         Float auroraFlowSpeed;
+        // 2026-11-02 屏幕空间降级链（区块；0 = 关）
+        Float ssptRange;
+        Float ssrRange;
 
         Integer cloudModelVersion;
         Integer waterWaveVersion;

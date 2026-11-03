@@ -245,9 +245,6 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_initDeviceHandlesNat
                     VK_PIPELINE_CREATE_RAY_TRACING_OPACITY_MICROMAP_BIT_EXT;
             }
 
-            auto createPipe=reinterpret_cast<PFN_vkCreateRayTracingPipelinesKHR>(vkGetDeviceProcAddr(g_device,"vkCreateRayTracingPipelinesKHR"));
-            if(!createPipe)throw std::runtime_error("vkCreateRayTracingPipelinesKHR unavailable");
-
             const VkPipelineCache rtPipelineCache =
                 rtPipelineCacheDisabled()
                     ? VK_NULL_HANDLE
@@ -258,7 +255,15 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_initDeviceHandlesNat
                 pci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
             }
 
-            check(createPipe(g_device,VK_NULL_HANDLE,rtPipelineCache,1,&pci,nullptr,&g_rayTracingPipeline),"Failed to create RT pipeline");
+            // 2026-11-02 P0（冷编分解）：走计时包装，参数（cache / deferredOperation=null
+            // / 1 条 createInfo）与原调用逐位一致，只多一条 [PERF PIPE] kind=rt 日志。
+            check(OrionCreateRayTracingPipelineTimed(
+                      "main",
+                      1u,
+                      &pci,
+                      rtPipelineCache,
+                      &g_rayTracingPipeline),
+                  "Failed to create RT pipeline");
 
             persistSharedPipelineCache();
             RTLog(

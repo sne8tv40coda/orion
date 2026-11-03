@@ -202,7 +202,7 @@ PERF_L10_TIME_STALL("tlasQueueIdle", check(
 << "[RT INIT] TLAS BUILD COMPLETE\n";
 }
 VkDescriptorSetLayout createRTDescriptorSetLayout(){
-    VkDescriptorSetLayoutBinding b[80]{};
+    VkDescriptorSetLayoutBinding b[86]{};
 
     b[0].binding=0; b[0].descriptorType=VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR; b[0].descriptorCount=1; b[0].stageFlags=VK_SHADER_STAGE_RAYGEN_BIT_KHR|VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
     b[1].binding=1; b[1].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; b[1].descriptorCount=1; b[1].stageFlags=VK_SHADER_STAGE_RAYGEN_BIT_KHR|VK_SHADER_STAGE_COMPUTE_BIT;
@@ -218,7 +218,8 @@ VkDescriptorSetLayout createRTDescriptorSetLayout(){
         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     b[7].descriptorCount = 1;
     b[7].stageFlags =
-        VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+        VK_SHADER_STAGE_RAYGEN_BIT_KHR |
+        VK_SHADER_STAGE_COMPUTE_BIT;
     b[8].binding = 8;
     b[8].descriptorType =
         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
@@ -263,7 +264,8 @@ VkDescriptorSetLayout createRTDescriptorSetLayout(){
         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     b[13].descriptorCount = 1;
     b[13].stageFlags =
-        VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+        VK_SHADER_STAGE_RAYGEN_BIT_KHR |
+        VK_SHADER_STAGE_COMPUTE_BIT;
 
 
     b[14].binding = 14;
@@ -271,7 +273,8 @@ VkDescriptorSetLayout createRTDescriptorSetLayout(){
         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     b[14].descriptorCount = 1;
     b[14].stageFlags =
-        VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+        VK_SHADER_STAGE_RAYGEN_BIT_KHR |
+        VK_SHADER_STAGE_COMPUTE_BIT;
 
 
     b[15].binding = 15;
@@ -279,7 +282,8 @@ VkDescriptorSetLayout createRTDescriptorSetLayout(){
         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     b[15].descriptorCount = 1;
     b[15].stageFlags =
-        VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+        VK_SHADER_STAGE_RAYGEN_BIT_KHR |
+        VK_SHADER_STAGE_COMPUTE_BIT;
 
 
     b[16].binding = 16;
@@ -287,7 +291,8 @@ VkDescriptorSetLayout createRTDescriptorSetLayout(){
         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     b[16].descriptorCount = 1;
     b[16].stageFlags =
-        VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+        VK_SHADER_STAGE_RAYGEN_BIT_KHR |
+        VK_SHADER_STAGE_COMPUTE_BIT;
 
 
     b[17].binding = 17;
@@ -561,7 +566,8 @@ VkDescriptorSetLayout createRTDescriptorSetLayout(){
     b[62].binding = 62;
     b[62].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     b[62].descriptorCount = 1;
-    b[62].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+    b[62].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR |
+                       VK_SHADER_STAGE_COMPUTE_BIT;
 
     b[63].binding = 63;
     b[63].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
@@ -654,7 +660,8 @@ VkDescriptorSetLayout createRTDescriptorSetLayout(){
     b[76].binding = 76;
     b[76].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     b[76].descriptorCount = 1;
-    b[76].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+    b[76].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR |
+                       VK_SHADER_STAGE_COMPUTE_BIT;
 
     b[77].binding = 77;
     b[77].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
@@ -674,10 +681,59 @@ VkDescriptorSetLayout createRTDescriptorSetLayout(){
     b[79].descriptorCount = 1;
     b[79].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
 
+    // 2026-11-02：per-tile best-light（每 tile 一个 r32ui 打包键，两半 ping-pong）。
+    // 只由 rgen 直接光 reservoir tail 使用，其它 pass 不绑定也不读。
+    b[80].binding = 80;
+    b[80].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    b[80].descriptorCount = 1;
+    b[80].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+
+
+    // ========================================================================
+    // 2026-11-02 屏幕空间降级链（SSR + SSPT）的分项 G-buffer 与两帧色
+    //
+    // 81 / 82 由 rt_test.rgen（RAYGEN）写、ss_hybrid.comp（COMPUTE）读：
+    //   81 = 间接光项贡献 rgb + a = 该项入射辐亮度
+    //   82 = 镜面反射项贡献 rgb + a = 镜面权重
+    // 83 / 84 只有 ss_hybrid.comp 用：
+    //   83 = 本帧颜色副本（替换前的基准色）
+    //   84 = 上一帧最终色（屏幕空间辐射源）
+    // 为什么必须新加：SSR/SSPT 要替换而不是叠加，否则镜面/间接各被加两遍。
+    // ========================================================================
+    b[81].binding = 81;
+    b[81].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    b[81].descriptorCount = 1;
+    b[81].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR |
+                       VK_SHADER_STAGE_COMPUTE_BIT;
+
+    b[82].binding = 82;
+    b[82].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    b[82].descriptorCount = 1;
+    b[82].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR |
+                       VK_SHADER_STAGE_COMPUTE_BIT;
+
+    b[83].binding = 83;
+    b[83].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    b[83].descriptorCount = 1;
+    b[83].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+    b[84].binding = 84;
+    b[84].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    b[84].descriptorCount = 1;
+    b[84].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+    // 2026-11-02（第二轮）Hi-Z 深度金字塔（1/2 .. 1/64 共 6 级）。
+    // 用 storage buffer 而不是 mip 图：每级一个 image view + 一个 binding
+    // 会让布局膨胀 6 个槽位，而 buffer 只需要一个槽位 + 下标运算。
+    // 写方 = ss_hzb.comp（逐级 max 归约），读方 = ss_hybrid.comp（保守跳过）。
+    b[85].binding = 85;
+    b[85].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    b[85].descriptorCount = 1;
+    b[85].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
     VkDescriptorSetLayoutCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     static_assert(
-        sizeof(b) / sizeof(b[0]) == 80u,
+        sizeof(b) / sizeof(b[0]) == 86u,
         "RT descriptor set layout: update this assert together with b[]"
     );
     ci.bindingCount = static_cast<uint32_t>(sizeof(b) / sizeof(b[0]));
@@ -1194,4 +1250,201 @@ void recycleMainRtPipeline()
     g_rtPipeLastRecycle = now;
 
     recreateMainRtPipeline();
+}
+
+// ===========================================================================
+// 2026-11-02 P1：SPV 热重载（ORION_RT_PIPE_HOT_RELOAD=1）
+//
+// 动机（本机实测，[PERF PIPE] kind=rt）：
+//   同一份 SPV 命中缓存 182.8 ms；任一变体内容变化后，主 RT 管线（6 stage）
+//   全量编译 519 772 ~ 1 064 060 ms（8m40s ~ 17m44s），单核、不可中断、不可取消。
+//   而改一次 shader 的代价不止编译：还要重启客户端、重进世界、重建 BLAS/TLAS。
+// 本函数只解决"后一半"：在游戏内盯 run/shaders 下 8 个参与 RT 管线的 SPV，
+// 变化稳定后调用现有 recreateMainRtPipeline()（新建 pipeline → 重建 SBT →
+// 失败整体回滚到旧 pipeline），保留世界、摄像机位置与复现现场。
+//
+// 边界（务必知情）：
+//   · 编译时间**不会**因此缩短，仍是一次全量 RTPSO；期间渲染线程阻塞在
+//     vkDeviceWaitIdle，窗口会假死，属预期。
+//   · 只在 run/shaders 的文件变化时触发。若通过 `gradlew runClient` 启动，
+//     run/shaders 会在启动时被 build/resources 覆盖，所以编辑要落在
+//     src/main/resources/shaders 或 build/resources/main/shaders 再手动拷到 run/。
+//   · 防抖：检测到变化后先等下一轮轮询（30 帧 ≈ 0.5 s）确认不再变化才重建，
+//     避免编辑器连续保存把多次重建叠加成 30 分钟。
+//   · 不设环境变量时，每帧只有一次 static bool 判断，零额外开销。
+// ===========================================================================
+namespace
+{
+
+struct RtSpvFileStamp
+{
+    uint64_t writeTime = 0u;
+    uint64_t size = 0u;
+};
+
+RtSpvFileStamp readRtSpvFileStamp(const std::string& fullPath)
+{
+    RtSpvFileStamp stamp{};
+
+    WIN32_FILE_ATTRIBUTE_DATA data{};
+
+    if(GetFileAttributesExA(fullPath.c_str(), GetFileExInfoStandard, &data))
+    {
+        stamp.writeTime =
+            (static_cast<uint64_t>(data.ftLastWriteTime.dwHighDateTime) << 32) |
+            static_cast<uint64_t>(data.ftLastWriteTime.dwLowDateTime);
+        stamp.size =
+            (static_cast<uint64_t>(data.nFileSizeHigh) << 32) |
+            static_cast<uint64_t>(data.nFileSizeLow);
+    }
+
+    return stamp;
+}
+
+} // namespace
+
+void pollRtPipelineHotReload()
+{
+    static const bool enabled = []() -> bool
+    {
+        const char* raw = std::getenv("ORION_RT_PIPE_HOT_RELOAD");
+
+        return raw != nullptr &&
+               (std::strcmp(raw, "1") == 0 || std::strcmp(raw, "true") == 0);
+    }();
+
+    if(!enabled)
+    {
+        return;
+    }
+
+    // 首次进入时探测一次 deferred host operations 能力并打日志 —— 冷编期间
+    // 用户需要立刻知道这台设备到底走异步还是回退同步，不必等到触发重建才看见。
+    static const bool deferredProbed = []() -> bool
+    {
+        asyncRtPipelineRebuildSupported();
+
+        return true;
+    }();
+
+    (void)deferredProbed;
+
+    // 每帧先推进分片异步编译（不受下面的 30 帧节流限制）。
+    pollAsyncRtPipelineRebuild();
+
+    if(g_device == VK_NULL_HANDLE || g_rayTracingPipeline == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    // 编译进行中：不再检测新变化，避免把第二次重建排进队列。
+    if(asyncRtPipelineRebuildActive())
+    {
+        return;
+    }
+
+    // 每 30 帧看一次（60fps 下约 0.5 s）；8 次 GetFileAttributesExA 可忽略。
+    static uint32_t pollCounter = 0u;
+
+    if((++pollCounter % 30u) != 0u)
+    {
+        return;
+    }
+
+    const std::string directory = GetRTXBackendDirectory();
+
+    if(directory.empty())
+    {
+        return;
+    }
+
+    static std::vector<RtSpvFileStamp> baseline;
+    static bool hasBaseline = false;
+    static bool reloadPending = false;
+
+    std::vector<RtSpvFileStamp> current;
+
+    current.reserve(
+        sizeof(RT_PIPELINE_SPV_FILES) / sizeof(RT_PIPELINE_SPV_FILES[0])
+    );
+
+    for(const char* relative : RT_PIPELINE_SPV_FILES)
+    {
+        current.push_back(
+            readRtSpvFileStamp(directory + "\\" + relative)
+        );
+    }
+
+    if(!hasBaseline)
+    {
+        baseline = current;
+        hasBaseline = true;
+
+        return;
+    }
+
+    const char* changedFile = nullptr;
+
+    for(size_t i = 0u; i < current.size() && i < baseline.size(); ++i)
+    {
+        if(current[i].writeTime != baseline[i].writeTime ||
+           current[i].size != baseline[i].size)
+        {
+            changedFile = RT_PIPELINE_SPV_FILES[i];
+            break;
+        }
+    }
+
+    if(changedFile != nullptr)
+    {
+        baseline = current;
+        reloadPending = true;
+
+        const std::string text =
+            std::string("[RT PIPE HOT] spv changed, waiting for stable: ") +
+            changedFile;
+
+        fprintf(stderr, "%s\n", text.c_str());
+        fflush(stderr);
+        RTLogFlushed(text);
+
+        return;
+    }
+
+    if(!reloadPending)
+    {
+        return;
+    }
+
+    reloadPending = false;
+
+    // 优先走分片异步：编译期间游戏继续用旧管线渲染，不假死。
+    // 设备未启用 VK_KHR_deferred_host_operations 时 supported() 为 false，落到同步路径。
+    if(asyncRtPipelineRebuildSupported() &&
+       beginAsyncRtPipelineRebuild("hot-reload"))
+    {
+        fprintf(stderr, "[RT PIPE HOT] async rebuild started\n");
+        fflush(stderr);
+        RTLogFlushed(
+            "[RT PIPE HOT] async rebuild started "
+            "(frames keep rendering with the previous pipeline)"
+        );
+
+        return;
+    }
+
+    fprintf(stderr, "[RT PIPE HOT] stable, rebuilding main RT pipeline (sync)...\n");
+    fflush(stderr);
+    RTLogFlushed(
+        "[RT PIPE HOT] stable, rebuilding main RT pipeline (sync; "
+        "render thread blocks until compiled)"
+    );
+
+    const bool rebuilt = recreateMainRtPipeline();
+
+    RTLogFlushed(
+        rebuilt
+            ? "[RT PIPE HOT] rebuild OK"
+            : "[RT PIPE HOT] rebuild FAILED (rolled back to previous pipeline)"
+    );
 }

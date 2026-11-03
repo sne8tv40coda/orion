@@ -137,6 +137,19 @@ public final class NativeVulkan {
      * 的乘数）。0 = 凝固，1 = 现网观感。
      */
     public static native boolean setAuroraFlowSpeed(float value);
+    /**
+     * 2026-11-02 屏幕空间降级链：SSPT 射程，单位区块 [0,12]。
+     * 写进 CameraUBO.ssHybridParams.x（0 = 关，宿主不建图/不建管线/不 dispatch）。
+     * 消费方 cpp/shaders/ss_hybrid.comp：屏幕空间路径追踪替换该半径内的间接光项。
+     */
+    public static native boolean setSSPTRange(float chunks);
+    /**
+     * 2026-11-02 屏幕空间降级链：SSR 射程上限，单位区块 [0,64]，0 = 关。
+     * 写进 CameraUBO.ssHybridParams.y。硬性约束：只有"RT 镜面命中距离 > 12 区块
+     * （192 格）或未命中"的像素才会被 SSR 接手，1..11 会在 native/Java 两侧都被
+     * 抬到 12（判据本身在 ss_hybrid.comp 里逐像素成立）。
+     */
+    public static native boolean setSSRRange(float chunks);
     public static native boolean uploadVoxyLodAtlas(byte[] pixels, int size, int mipLevels);
 
     public static native void updateAtlas(long imageView, long sampler);
@@ -1825,6 +1838,17 @@ public final class NativeVulkan {
                 RTXSettingsConfig.getAuroraFlowSpeed()
         )) {
             System.err.println("[RTX CONFIG] Failed to restore aurora flow speed");
+        }
+        // 2026-11-02 屏幕空间降级链（默认 0 = 关 ⇒ 这两个调用等价于 no-op）
+        if(!setSSPTRange(
+                RTXSettingsConfig.getSsptRange()
+        )) {
+            System.err.println("[RTX CONFIG] Failed to restore SSPT range");
+        }
+        if(!setSSRRange(
+                RTXSettingsConfig.getSsrRange()
+        )) {
+            System.err.println("[RTX CONFIG] Failed to restore SSR range");
         }
         if(!setCloudSunReddening(
                 RTXSettingsConfig.getCloudSunReddening()

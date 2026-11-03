@@ -959,6 +959,9 @@ destroySharcUpdatePipeline();
     g_slVkDeviceWaitIdleProxy =
         nullptr;
 
+    // 2026-11-02 屏幕空间降级链（SSR + SSPT）资源
+    destroySSHybridResources();
+
     releaseSharedPipelineCache();
 
     g_instance =

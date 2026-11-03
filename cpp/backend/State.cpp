@@ -1020,6 +1020,47 @@ std::atomic<float>
     g_pomSharp{0.0f};
 std::atomic<float>
     g_sssMode{0.0f};
+
+// =====================================================
+// 【2026-11-02】屏幕空间降级链（SSR + SSPT）
+// 默认 0 = 关（不建资源、不 dispatch）。定义集中在这里，遵循
+// backend/README.md 的「全局变量只在 State.cpp 定义」契约。
+// =====================================================
+std::atomic<float> g_ssptChunks{0.0f};
+std::atomic<float> g_ssrChunks{0.0f};
+
+VkImage g_ssIndirectTermImage = VK_NULL_HANDLE;
+VkDeviceMemory g_ssIndirectTermMemory = VK_NULL_HANDLE;
+VkImageView g_ssIndirectTermView = VK_NULL_HANDLE;
+VkImageLayout g_ssIndirectTermLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+VkImage g_ssSpecularTermImage = VK_NULL_HANDLE;
+VkDeviceMemory g_ssSpecularTermMemory = VK_NULL_HANDLE;
+VkImageView g_ssSpecularTermView = VK_NULL_HANDLE;
+VkImageLayout g_ssSpecularTermLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+VkImage g_ssBaseColorImage = VK_NULL_HANDLE;
+VkDeviceMemory g_ssBaseColorMemory = VK_NULL_HANDLE;
+VkImageView g_ssBaseColorView = VK_NULL_HANDLE;
+VkImageLayout g_ssBaseColorLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+VkImage g_ssPrevColorImage = VK_NULL_HANDLE;
+VkDeviceMemory g_ssPrevColorMemory = VK_NULL_HANDLE;
+VkImageView g_ssPrevColorView = VK_NULL_HANDLE;
+VkImageLayout g_ssPrevColorLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+uint32_t g_ssHybridWidth = 0u;
+uint32_t g_ssHybridHeight = 0u;
+bool g_ssHybridHistoryValid = false;
+VkDescriptorSet g_ssHybridBoundSet = VK_NULL_HANDLE;
+VkPipelineLayout g_ssHybridPipelineLayout = VK_NULL_HANDLE;
+VkPipeline g_ssHybridPipeline = VK_NULL_HANDLE;
+bool g_ssHybridPipelineFailed = false;
+
+VkBuffer g_ssHzbBuffer = VK_NULL_HANDLE;
+VkDeviceMemory g_ssHzbMemory = VK_NULL_HANDLE;
+uint32_t g_ssHzbLevelCount = 0u;
+VkPipeline g_ssHzbPipeline = VK_NULL_HANDLE;
 std::atomic<float> g_ueCloudParams[UE_CLOUD_PARAM_COUNT] = {
     {1.0f}, {0.5f}, {0.5f}, {1.0f}, {0.15f}, {1.0f}, {0.35f}, {1.0f}
 };
@@ -1671,6 +1712,11 @@ uint32_t g_vptDirectHistoryWidth = 0u;
 uint32_t g_vptDirectHistoryHeight = 0u;
 VkDeviceSize g_vptDirectHistoryBytes = 0;
 bool g_vptDirectHistoryNeedsClear = false;
+VkBuffer g_vptBestLightBuffer = VK_NULL_HANDLE;
+VkDeviceMemory g_vptBestLightMemory = VK_NULL_HANDLE;
+VkDeviceSize g_vptBestLightBytes = 0;
+uint32_t g_vptBestLightTileColumns = 0u;
+uint32_t g_vptBestLightTileRows = 0u;
 std::mutex g_vliMutex;
 std::unordered_map<uint64_t, VLISectionCpuPage> g_vliSections;
 std::unordered_map<uint64_t, std::vector<uint64_t>> g_vliChunkSectionIndex;

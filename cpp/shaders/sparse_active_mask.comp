@@ -36,6 +36,76 @@ float sparseBlueNoiseThreshold(uvec2 pixelCoord, uint frameIdx)
     return float(raw) * (1.0 / 255.0);
 }
 
+// =====================================================
+// 2026-11-02：块内分层选点（替代逐像素蓝噪声独立抽签）。
+//
+// 动因：蓝噪声阈值独立抽签只保证**统计**上 rate 比例，单个 8×8 块每帧的活跃
+// 个数是二项分布（k=19 时 σ≈3.6），而且某像素可能连续 3~4 帧落空、下 3 帧连着
+// 命中 —— 时域 cover 不均匀，RR 的 history age 分布跟着乱。
+//
+// 这里换成 RTXPT `Rtxpt/Shaders/Misc/SubSampling.h` 的 BLOCK_STRATIFIED 口径
+// （它自己的 SOBOL_BLOCK 也是同一个性质）：把 8×8 块看成 64 个槽位，
+//   k      = round(rate * 64)            块内每帧恰好 k 个活跃
+//   offset = (frameIdx * k) mod 64       起点随帧滚动
+//   q      = bitReverse6(块内索引)        把连续弧打散到块内各处
+//   active = ((q - offset) mod 64) < k
+// 性质：块内每帧恰好 k 个；64 帧（一个 cycle）内每个像素被选中恰好 k 次
+// （k 与 64 互质时一轮走遍全部 64 个起点）。空间上不再聚簇，时域上精确分层。
+//
+// A/B：-DSPARSE_LAYERED_PATTERN=0 回到蓝噪声独立抽签。
+// =====================================================
+// 2026-11-02 实测回退：默认 0（走蓝噪声）。
+// 用 bitReverse6 实现"块内恰好 k 个"时出了满屏竖向黑线 —— 因为 slot = y*8+x 的
+// 低 3 位是 x，bit-reverse 后 x 的位跑到高位，[offset, offset+k) 这条连续弧映射
+// 回 8×8 网格就变成"不同 y、相同 x 的列同时活跃"，等于每帧画竖条纹，RR 时域平均
+// 也消不掉。要重做必须换成空间上无规律的置换（Kensler permute），不能靠位反转。
+#ifndef SPARSE_LAYERED_PATTERN
+#define SPARSE_LAYERED_PATTERN 0
+#endif
+
+const uint kLayeredTileSize = 8u;
+const uint kLayeredSlotCount = kLayeredTileSize * kLayeredTileSize;
+
+uint sparseBitReverse6(uint value)
+{
+    uint reversed = 0u;
+    reversed |= ((value >> 0u) & 1u) << 5u;
+    reversed |= ((value >> 1u) & 1u) << 4u;
+    reversed |= ((value >> 2u) & 1u) << 3u;
+    reversed |= ((value >> 3u) & 1u) << 2u;
+    reversed |= ((value >> 4u) & 1u) << 1u;
+    reversed |= ((value >> 5u) & 1u) << 0u;
+    return reversed;
+}
+
+bool sparseLayeredActive(uvec2 pixelCoord, uint frameIdx, float samplingRate)
+{
+    const uint slotCount =
+        uint(clamp(samplingRate, 0.0, 1.0) * float(kLayeredSlotCount) + 0.5);
+    if(slotCount == 0u)
+    {
+        return false;
+    }
+    if(slotCount >= kLayeredSlotCount)
+    {
+        return true;
+    }
+
+    const uint slot =
+        (pixelCoord.y & (kLayeredTileSize - 1u)) * kLayeredTileSize +
+        (pixelCoord.x & (kLayeredTileSize - 1u));
+    // bit-reverse：把 [offset, offset+k) 这条连续弧打散到块内各处，
+    // 避免活跃像素在块内聚成一片。
+    const uint shuffled = sparseBitReverse6(slot);
+    // 只取 frameIdx 的低 6 位即可 —— k*64 mod 64 恒为 0，高位不影响结果，
+    // 而且这样 frameIdx 增长不会溢出。
+    const uint offset = ((frameIdx & (kLayeredSlotCount - 1u)) * slotCount) &
+        (kLayeredSlotCount - 1u);
+
+    return ((shuffled + kLayeredSlotCount - offset) &
+        (kLayeredSlotCount - 1u)) < slotCount;
+}
+
 void main()
 {
     const uvec2 blockCoordinate = gl_GlobalInvocationID.xy;
@@ -59,10 +129,18 @@ void main()
             if(pixelCoordinate.x < pc.width &&
                pixelCoordinate.y < pc.height)
             {
+#if SPARSE_LAYERED_PATTERN
+                isPixelActive =
+                    sparseLayeredActive(
+                        pixelCoordinate,
+                        pc.frameIndex,
+                        pc.samplingRate);
+#else
                 isPixelActive =
                     sparseBlueNoiseThreshold(
                         pixelCoordinate,
                         pc.frameIndex) <= pc.samplingRate;
+#endif
             }
 
             const uint bitIndex = localY * 4u + localX;

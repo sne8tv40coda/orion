@@ -87,7 +87,7 @@ void main()
         return;
     }
 
-    if(pc.dbgMode >= 1u && pc.dbgMode <= 6u)
+    if((pc.dbgMode >= 1u && pc.dbgMode <= 6u) || pc.dbgMode == 11u)
     {
         imageStore(
             sceneColor,

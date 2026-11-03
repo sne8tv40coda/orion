@@ -198,7 +198,7 @@ inline constexpr uint32_t PERF_L10_ABLATION_ALT_MAX = 16u;
 
 
 inline constexpr uint64_t PERF_L10_ABLATION_FRAMES_PER_STAGE = 120u;
-inline constexpr uint32_t PERF_L10_ABLATION_STAGE_COUNT = 34u;
+inline constexpr uint32_t PERF_L10_ABLATION_STAGE_COUNT = 36u;
 inline constexpr bool PERF_L10_ENABLE_SECTION_REBUILD_LOGS = false;
 inline constexpr bool PERF_L10_ENABLE_LIGHT_REFRESH_LOGS = false;
 inline constexpr uint32_t PERF_L10_GPU_TIMESTAMP_RING_SIZE = 12u;
@@ -543,6 +543,13 @@ struct CameraUBO {
     // 消费方：cpp/shaders/sky_atmosphere.comp（模型选择）
     //         + cpp/shaders/sky_hillaire_common.glsl（标定倍率）。
     float skyModelParams[4];
+
+    // ── 2026-11-02 屏幕空间降级链（SSR + SSPT）──（追加在末尾）
+    //   x = SSPT 射程（区块，0 = 关；UI 滑条 0..12）
+    //   y = SSR 射程上限（区块，0 = 关；硬性下限 12 ⇒ 只有 >12 区块的
+    //       镜面命中才允许被 SSR 接手，判据在 ss_hybrid.comp 里逐像素成立）
+    //   z/w = 保留，写 0
+    float ssHybridParams[4];
 };
 static_assert(offsetof(CameraUBO, cloudParams) == 448,
     "cloudParams must stay at offset 448: shaders place it right after weatherParams");
@@ -708,7 +715,12 @@ static_assert(offsetof(CameraUBO, skyModelParams) == 1728,
     "skyModelParams must start at 1728, immediately after sparseParams: "
     "2026-11-01 sky scattering model switch (lane x: 0 = Bruneton LUT, "
     "1 = Hillaire structure) + Hillaire radiance calibration (lane y)");
-static_assert(sizeof(CameraUBO) == 1744,
+static_assert(offsetof(CameraUBO, ssHybridParams) == 1744,
+    "ssHybridParams must start at 1744, immediately after skyModelParams: "
+    "2026-11-02 screen-space degradation chain (lane x = SSPT range in chunks "
+    "0..12, lane y = SSR range ceiling in chunks, hard floor 12) is read by "
+    "cpp/shaders/ss_hybrid.comp through the shared camera_ubo.glsl block");
+static_assert(sizeof(CameraUBO) == 1760,
     "CameraUBO size must match the std140 size of the shaders' CameraProperties "
     "block (1712 -> 1728 when 2026-10-26 sparseParams (direct-light mode + "
     "sparse rendering rate) was appended at the tail; 1600 -> 1712 when "
@@ -1489,7 +1501,11 @@ inline constexpr uint64_t LOCAL_PLAYER_RT_LAYER_KEY =
     (6ull << 60ull) | ENTITY_RT_SPATIAL_KEY;
 inline constexpr uint64_t PARTICLE_RT_LAYER_KEY =
     (7ull << 60ull) | ENTITY_RT_SPATIAL_KEY;
-inline constexpr uint64_t LOCAL_PLAYER_AS_UPDATE_INTERVAL = 8u;
+// 2026-11-03：8 -> 1。手部（本地玩家代理 + 手持物）是**逐帧骨骼动画**，
+// 但 BLAS 原先每 8 帧才重建一次 ⇒ RT 里的手是"冻结 8 帧、跳一下"，
+// 表现为手部动画时有时无 / 顿挫。手部顶点数很小（手臂 + 手持物），
+// 每帧重建的提交开销远小于一个错误的观感。
+inline constexpr uint64_t LOCAL_PLAYER_AS_UPDATE_INTERVAL = 1u;
 inline constexpr uint32_t ENTITY_RT_TEXTURE_SLOT_COUNT = 128u;
 inline constexpr uint32_t PARTICLE_RT_TEXTURE_SLOT_COUNT = 3u;
 
@@ -2247,6 +2263,52 @@ void RTLog(
 void RTLogFlushed(
     const std::string& msg
 );
+// ---------------------------------------------------------------------------
+// 2026-11-02 P0：管线冷编耗时分项观测（实现见 PipelineDiag.cpp）
+//
+// 目的：把"改一个 SPV 就要等十几分钟"拆成 cache 加载 / compute 管线 / RT 管线
+// 三部分，输出统一前缀 [PERF PIPE]，与既有 [PERF PC.*] 同一 stderr 出口，
+// 便于对齐时间轴。只做观测，不改任何创建参数与返回码。
+//
+// compute 侧不需要逐个改调用点：TrackingHooks.h 已把 vkCreateComputePipelines
+// 宏到 rtxTrackedCreateComputePipelines，Tracking.cpp 里那一处计时即覆盖全部
+// 40+ 个创建点。
+// ---------------------------------------------------------------------------
+uint64_t OrionPipelineSpvHash(
+    const void* data,
+    size_t size
+);
+void OrionPipelineRegisterSpvName(
+    uint64_t hash,
+    const char* name
+);
+void OrionPipelineRegisterShaderModule(
+    VkShaderModule module,
+    uint64_t spvHash
+);
+const char* OrionPipelineSpvNameOfModule(
+    VkShaderModule module
+);
+void OrionPipelineLogCreate(
+    const char* kind,
+    const char* spvName,
+    bool cacheUsed,
+    double milliseconds,
+    VkResult result
+);
+void OrionPipelineLogCachePhase(
+    const char* phase,
+    double milliseconds,
+    size_t bytes,
+    const char* detail
+);
+VkResult OrionCreateRayTracingPipelineTimed(
+    const char* label,
+    uint32_t createInfoCount,
+    const VkRayTracingPipelineCreateInfoKHR* pCreateInfos,
+    VkPipelineCache pipelineCache,
+    VkPipeline* pPipelines
+);
 void RTXTerminateHandler();
 void RTXMarkPhase(const char* name);
 std::string RTXHex(uint64_t value);
@@ -2837,6 +2899,23 @@ void createRRGuideImage(
     VkImageView& view,
     VkImageLayout& layout);
 void updateRRGBufferDescriptors();
+
+// 【2026-11-02】屏幕空间降级链（SSR + SSPT）—— 实现见 cpp/backend/ScreenSpace.cpp
+bool ssHybridSsptEnabled();
+bool ssHybridSsrEnabled();
+bool ssHybridEnabled();
+void createSSHybridResources(
+    uint32_t width,
+    uint32_t height);
+void updateSSHybridDescriptors();
+void ensureSSHybridPipeline();
+void recordSSHybridPass(
+    VkCommandBuffer commandBuffer,
+    uint32_t width,
+    uint32_t height);
+void recordSSHybridHistoryCopy(
+    VkCommandBuffer commandBuffer);
+void destroySSHybridResources();
 void writeStableRadianceDisplayBinding(
     VkDescriptorSet set,
     const char* label);
@@ -3260,6 +3339,17 @@ bool deviceInitMilestone(const char* name);
 uint32_t rtPipeRecycleSeconds();
 bool recreateMainRtPipeline();
 void recycleMainRtPipeline();
+// 2026-11-02 P1：SPV 热重载轮询（ORION_RT_PIPE_HOT_RELOAD=1）。
+// 检测 run/shaders 下 8 个 RT 管线 SPV 的 mtime/size 变化，稳定后重建主 RT 管线
+// 与 SBT（失败回滚）。不改变任何渲染语义；不设环境变量时每帧只做一次 bool 判断。
+void pollRtPipelineHotReload();
+// 2026-11-02 P1.5：主 RT 管线的分片异步重建（VK_KHR_deferred_host_operations）。
+// 设备由 renderpearl 创建，扩展可能未启用，故先探测函数指针；
+// 不可用时 supported() 返回 false，调用方回退到同步的 recreateMainRtPipeline()。
+bool asyncRtPipelineRebuildSupported();
+bool beginAsyncRtPipelineRebuild(const char* reason);
+bool asyncRtPipelineRebuildActive();
+void pollAsyncRtPipelineRebuild();
 jobjectArray
 FGMakeJavaStringArray(
     JNIEnv* env,
@@ -3410,14 +3500,21 @@ inline constexpr const char* const RT_PIPELINE_SPV_FILES[] = {
     "shaders\\rt_test_translucent.rahit.spv",
     "shaders\\rr_guide_relax.comp.spv",
 };
+// 2026-11-02 P0（冷编分解）：原值 64 MiB 小于实测缓存体积 —— 日志里
+// [PERF PC.1] pipeline cache saved bytes=96642292，下一次启动就命中
+// "oversized, starting empty"，等于**什么都没改也要全量冷编**。
+// 抬到 256 MiB 只是把"整体丢弃"的触发线推到实际体积之上；它仍是保护，
+// 不是目标值。真要判断缓存该多大，看 [PERF PIPE] kind=load/save 的 ms 与 bytes。
 inline constexpr const size_t PIPELINE_CACHE_MAX_RESTORE_BYTES =
-    64u * 1024u * 1024u;
+    256u * 1024u * 1024u;
 
 
 
 inline constexpr const uint32_t PIPELINE_CACHE_KEEP_SEEDS = 3u;
+// 与 MAX_RESTORE 同口径：seed 预算低于单个缓存体积时，FindNewestOtherPipelineCaches
+// 会把唯一有用的那份 96 MiB 种子直接跳过（budget 不够），退化成空缓存启动。
 inline constexpr const size_t PIPELINE_CACHE_SEED_BUDGET_BYTES =
-    96u * 1024u * 1024u;
+    256u * 1024u * 1024u;
 extern size_t g_pipelineCachePersistedBytes;
 extern uint32_t g_pipelineCachePersistCountdown;
 inline constexpr const uint32_t PIPELINE_CACHE_PERSIST_INTERVAL = 1800;
@@ -3458,7 +3555,9 @@ inline constexpr const char* const PERF_L10_ABLATION_STAGE_NAMES
     "noMatNoGi",
     "secOmm4State",
     "glossyBudgetOff",
-    "emissiveFetch"
+    "emissiveFetch",
+    "voxelDdaGi",
+    "glossyTMax192"
 };
 extern uint32_t g_perfL10AblationStage;
 extern VkQueryPool g_perfL10GpuTimestampPool;
@@ -4353,6 +4452,55 @@ extern std::atomic<float>
     g_pomDepth;
 extern std::atomic<float>
     g_pomSharp;
+
+// =====================================================
+// 【2026-11-02】屏幕空间降级链（SSR + SSPT）的设置与资源
+//
+// 两条滑条是**同一条链**的两个入口，默认都为 0（关 ⇒ 宿主不建图、不建管线、
+// 不 dispatch，画面与接进来之前逐位一致）。
+//   g_ssptChunks = SSPT 射程（区块，UI 0..12）
+//   g_ssrChunks  = SSR 射程上限（区块，UI 硬性下限 12、0 = 关）
+// 实现与口径见 cpp/backend/ScreenSpace.cpp 的头部注释。
+// =====================================================
+extern std::atomic<float> g_ssptChunks;
+extern std::atomic<float> g_ssrChunks;
+
+// 分项 G-buffer（rt_test.rgen 写、ss_hybrid.comp 读）
+extern VkImage g_ssIndirectTermImage;
+extern VkDeviceMemory g_ssIndirectTermMemory;
+extern VkImageView g_ssIndirectTermView;
+extern VkImageLayout g_ssIndirectTermLayout;
+
+extern VkImage g_ssSpecularTermImage;
+extern VkDeviceMemory g_ssSpecularTermMemory;
+extern VkImageView g_ssSpecularTermView;
+extern VkImageLayout g_ssSpecularTermLayout;
+
+// 本帧 RT 输出副本（被替换前的基准色）与上一帧最终色（屏幕空间辐射源）
+extern VkImage g_ssBaseColorImage;
+extern VkDeviceMemory g_ssBaseColorMemory;
+extern VkImageView g_ssBaseColorView;
+extern VkImageLayout g_ssBaseColorLayout;
+
+extern VkImage g_ssPrevColorImage;
+extern VkDeviceMemory g_ssPrevColorMemory;
+extern VkImageView g_ssPrevColorView;
+extern VkImageLayout g_ssPrevColorLayout;
+
+// Hi-Z 深度金字塔（2026-11-02 第二轮）：storage buffer 里的扁平 mip 链，
+// 布局公式见 ss_hzb.comp 头注释（levelWidth(k)=ceil(W/2^k)，逐级累加偏移）。
+extern VkBuffer g_ssHzbBuffer;
+extern VkDeviceMemory g_ssHzbMemory;
+extern uint32_t g_ssHzbLevelCount;
+extern VkPipeline g_ssHzbPipeline;
+
+extern uint32_t g_ssHybridWidth;
+extern uint32_t g_ssHybridHeight;
+extern bool g_ssHybridHistoryValid;
+extern VkDescriptorSet g_ssHybridBoundSet;
+extern VkPipelineLayout g_ssHybridPipelineLayout;
+extern VkPipeline g_ssHybridPipeline;
+extern bool g_ssHybridPipelineFailed;
 extern std::atomic<float>
     g_sssMode;
 extern std::atomic<float> g_ueCloudParams[UE_CLOUD_PARAM_COUNT];
@@ -5001,6 +5149,14 @@ extern uint32_t g_vptDirectHistoryWidth;
 extern uint32_t g_vptDirectHistoryHeight;
 extern VkDeviceSize g_vptDirectHistoryBytes;
 extern bool g_vptDirectHistoryNeedsClear;
+// 2026-11-02：per-tile best-light（NEE-AT/RTXDI 的 RTXDI_FindGradientSampleAndBestLight
+// 等价物）。一块 buffer 分两半，按 cam.historyReadIndex 做 ping-pong；每 tile 一个
+// r32ui，内容是打包键 (量化亮度 << 7) | (tile 内像素索引 << 1) | 帧奇偶。
+extern VkBuffer g_vptBestLightBuffer;
+extern VkDeviceMemory g_vptBestLightMemory;
+extern VkDeviceSize g_vptBestLightBytes;
+extern uint32_t g_vptBestLightTileColumns;
+extern uint32_t g_vptBestLightTileRows;
 extern std::mutex g_vliMutex;
 extern std::unordered_map<uint64_t, VLISectionCpuPage> g_vliSections;
 extern std::unordered_map<uint64_t, std::vector<uint64_t>> g_vliChunkSectionIndex;

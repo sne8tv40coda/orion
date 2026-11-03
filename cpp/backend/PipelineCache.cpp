@@ -29,6 +29,28 @@ std::string ComputeRTPipelineCacheKey()
         }
     };
 
+    // 2026-11-02：A/B 用盐。
+    //
+    // 现状数据（[PERF PIPE] kind=rt）：同一份 SPV 命中缓存 182.8 ms；改 SPV 后
+    // 全量编译 519 772 / 874 477 / 1 064 060 ms（8m40s ~ 17m44s）。做一次对照实验
+    // 若必须改 shader 来换 key，实验成本就是 10~20 分钟起步，无法迭代。
+    // 这里允许用环境变量强制一个独立缓存键，从而**不改任何 SPV**复测冷编：
+    //   ORION_PC_KEY_SALT=noopt   → 新 key，必然走全量 RT 编译
+    //   ORION_PC_KEY_SALT=plain   → 又一新 key
+    // 与 ORION_RT_PIPE_NO_OPT / ORION_RT_PIPE_NO_CACHE 组合即可做矩阵。
+    // 不设该变量时行为逐位不变（空串也视为未设）。
+    {
+        const char* keySalt = std::getenv("ORION_PC_KEY_SALT");
+
+        if(keySalt != nullptr && keySalt[0] != '\0')
+        {
+            static const char saltTag[] = "ORION_PC_KEY_SALT:";
+
+            fold(saltTag, sizeof(saltTag) - 1u);
+            fold(keySalt, std::strlen(keySalt));
+        }
+    }
+
     for(const char* relative : RT_PIPELINE_SPV_FILES)
     {
         fold(relative, std::strlen(relative));
@@ -373,7 +395,22 @@ VkPipelineCache getSharedPipelineCache()
 
     if(!path.empty())
     {
+        const auto cacheLoadStart =
+            std::chrono::steady_clock::now();
+
         LoadPipelineCacheFile(path, initialData);
+
+        // 2026-11-02 P0（冷编分解）：加载可能是"0 字节新建"，也可能是
+        // "96 MiB 读盘 + 驱动校验"，不单独计时就分不清启动时间是花在这里
+        // 还是花在 vkCreate*Pipelines 的编译上。
+        OrionPipelineLogCachePhase(
+            "load",
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - cacheLoadStart
+            ).count(),
+            initialData.size(),
+            path.c_str()
+        );
     }
 
     std::vector<std::string> mergeSeedPaths;
@@ -513,6 +550,9 @@ VkPipelineCache getSharedPipelineCache()
 
     if(!mergeSeedPaths.empty() && g_pipelineCache != VK_NULL_HANDLE)
     {
+        const auto cacheMergeStart =
+            std::chrono::steady_clock::now();
+
         size_t mergedCount = 0u;
         size_t mergedBytes = 0u;
 
@@ -575,6 +615,17 @@ VkPipelineCache getSharedPipelineCache()
                 std::to_string(mergedBytes)
             );
         }
+
+        // 2026-11-02 P0：merge 是"把几份大 blob 合进当前 cache"，驱动侧可能很贵；
+        // count=0 也要打，否则会误以为没走这条路径。
+        OrionPipelineLogCachePhase(
+            "merge",
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - cacheMergeStart
+            ).count(),
+            mergedBytes,
+            (std::to_string(mergedCount) + " seeds").c_str()
+        );
     }
 
     fflush(stderr);
@@ -619,6 +670,11 @@ void persistSharedPipelineCache()
         return;
     }
 
+    // 2026-11-02 P0（冷编分解）：96 MiB 的 blob 每次落盘都要计一次 ——
+    // 这条路径在 RT 管线建完（Device.cpp）与每 1800 帧都会走，写盘时间不能算进"编译"。
+    const auto cacheSaveStart =
+        std::chrono::steady_clock::now();
+
     FILE* file = fopen(path.c_str(), "wb");
 
     if(file)
@@ -632,15 +688,23 @@ void persistSharedPipelineCache()
 
         fclose(file);
 
+        const double cacheSaveMilliseconds =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - cacheSaveStart
+            ).count();
+
         fprintf(
             stderr,
-            "[PERF PC.1] pipeline cache saved bytes=%zu\n",
-            written
+            "[PERF PC.1] pipeline cache saved bytes=%zu ms=%.1f\n",
+            written,
+            cacheSaveMilliseconds
         );
 
         RTLog(
             "[PERF PC.1] pipeline cache saved bytes=" +
-            std::to_string(written)
+            std::to_string(written) +
+            " ms=" +
+            std::to_string(static_cast<long long>(cacheSaveMilliseconds))
         );
     }
     else

@@ -254,6 +254,27 @@ void main()
         return;
     }
 
+    // 2026-11-01（第六轮）：**分色诊断** —— 玻璃层 = 染色累积 × 受光，一把刀
+    // 切成两半看：R/G 通道 = 染色累积（73.rgb × a，预解调还原），B 通道 =
+    // 受光亮度（77 号图的 luma × 0.25）。人字纹出现在 R/G ⇒ 病根在染色链
+    // （贴图/顶点色/多层累积）；出现在 B ⇒ 病根在 pane 受光（太阳 NEE / RIS）。
+    // 取代了旧的"受光不钳制"诊断档（其信息与 12/13 重叠）。
+    if(pc.dbgMode == 11u)
+    {
+        const vec4 tintAcc = imageLoad(alphaBlendGbuffer, pixel);
+        const vec3 tintPart =
+            clamp(tintAcc.rgb * max(tintAcc.a, 0.0), 0.0, 1.0);
+        const vec3 lightPart =
+            max(imageLoad(alphaBlendVolume, pixel).rgb, vec3(0.0));
+        const float lightLuma =
+            clamp(dot(lightPart, GLASS_ALPHA_BLEND_LUMA) * 0.25, 0.0, 1.0);
+        imageStore(
+            alphaBlendRadiance,
+            pixel,
+            vec4(tintPart.r, tintPart.g, lightLuma, 1.0));
+        return;
+    }
+
     if(pc.dbgMode == 6u)
     {
         imageStore(

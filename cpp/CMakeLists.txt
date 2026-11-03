@@ -62,9 +62,15 @@ set(SOURCES
         backend/Particles.cpp
         backend/Perf.cpp
         backend/PipelineCache.cpp
+        # 2026-11-02 P0：管线冷编耗时分解（[PERF PIPE]，只做观测）
+        backend/PipelineDiag.cpp
         backend/Platform.cpp
         backend/PostFx.cpp
         backend/RtPipeline.cpp
+        # 2026-11-02 P1.5：主 RT 管线的分片异步重建（deferred host operations）
+        backend/RtPipelineAsync.cpp
+        # 2026-11-02：屏幕空间降级链（SSR + SSPT），见 backend/ScreenSpace.cpp 头注释
+        backend/ScreenSpace.cpp
         backend/Sections.cpp
         backend/Settings.cpp
         backend/Shaders.cpp

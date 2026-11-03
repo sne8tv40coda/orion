@@ -769,6 +769,54 @@ JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_setAuroraFlowSpe
     return JNI_TRUE;
 }
 
+// ============================================================================
+// 2026-11-02 屏幕空间降级链（SSR + SSPT）
+//
+// 两个 setter 都只写 atomic（生效时机 = 下一帧的 UBO 重写），不重建管线、
+// 不作废历史 —— 唯一的例外是下面 setSSRRange 把 1..11 钳到 12，这是用户
+// 2026-11-02 的硬性约束：SSR 只在 > 12 区块的镜面命中上出现。
+// ============================================================================
+extern "C"
+JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_setSSPTRange(
+    JNIEnv*,
+    jclass,
+    jfloat value)
+{
+    const float requested = static_cast<float>(value);
+    if(!std::isfinite(requested) || requested < 0.0f || requested > 12.0f)
+    {
+        return JNI_FALSE;
+    }
+
+    // 取整到区块（滑条步长 1）
+    g_ssptChunks.store(std::round(requested));
+    return JNI_TRUE;
+}
+
+extern "C"
+JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_setSSRRange(
+    JNIEnv*,
+    jclass,
+    jfloat value)
+{
+    const float requested = static_cast<float>(value);
+    if(!std::isfinite(requested) || requested < 0.0f || requested > 64.0f)
+    {
+        return JNI_FALSE;
+    }
+
+    float chunks = std::round(requested);
+
+    // 硬性约束：SSR 只在 > 12 区块的镜面命中上工作 ⇒ 1..11 一律抬到 12
+    if(chunks > 0.5f && chunks < 12.0f)
+    {
+        chunks = 12.0f;
+    }
+
+    g_ssrChunks.store(chunks);
+    return JNI_TRUE;
+}
+
 extern "C"
 JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_setCloudSunForwardScattering(
     JNIEnv*,

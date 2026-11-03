@@ -1,0 +1,832 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+
+// ============================================================================
+// 2026-11-02 屏幕空间降级链：SSR（镜面反射）+ SSPT（间接光路径追踪）
+//
+// 口径（对应用户 2026-11-02 需求）
+// ---------------------------------------------------------------------------
+//  · 两者都**只吃 G-buffer**，不碰 TLAS。G-buffer 由两层组成：
+//      1) 既有 DLSS-RR guide 组（rt_test.rgen 每帧无条件写）：
+//         深度(image)、法线+粗糙度(15)、漫反射反照率(13)、镜面反照率(14)、
+//         镜面命中距离(16)、运动矢量(62)、当前帧颜色(1)。
+//      2) 2026-11-02 新增的分项 G-buffer（本文件消费、rgen 写）：
+//         81 = 间接光项贡献 rgb + a = 该项对应的入射辐亮度（luma）
+//         82 = 镜面反射项贡献 rgb + a = 该像素镜面权重（luma）
+//      新增 81/82 的理由：SSR/SSPT 要**替换**RT 的对应分项而不是叠加。
+//      没有分项就只能叠加 ⇒ 镜面项和间接项各被加两遍（整屏过曝）。
+//
+//  · SSR 硬性约束：只处理「RT 镜面命中距离 > 12 区块（192 格）或未命中」
+//    的像素（判据 = rrSpecularHitDistanceImage）。这是逐像素成立的，
+//    不是 UI 上的约定。
+//  · SSPT 射程 = ssHybridParams.x（0..12 区块，0 = 关），按「相机到该像素
+//    几何的世界距离」判，超出射程的像素原样保留 RT 间接光。
+//
+// 合成口径（差分替换，不叠两遍）
+// ---------------------------------------------------------------------------
+//   SSR ： color = base - specTerm + specAlbedo * Lscreen(reflect dir)
+//   SSPT： color = base + giTerm * (Lsspt / Lrt - 1) * conf
+//          （比例式 ⇒ 未知的 brdfWeight/1.8/rtao 等因子全部约掉，
+//             Lrt == Lsspt 时结果逐位等于 base）
+//
+// 默认关闭：宿主在两条滑条都为 0 时根本不建图、不建管线、不 dispatch。
+// ============================================================================
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(rgba16f, set = 0, binding = 1)  uniform image2D sceneColor;
+layout(rgba16f, set = 0, binding = 13) uniform readonly image2D diffuseAlbedoImage;
+layout(rgba16f, set = 0, binding = 14) uniform readonly image2D specularAlbedoImage;
+layout(rgba16f, set = 0, binding = 15) uniform readonly image2D normalRoughnessImage;
+// binding 16 必须可写：SSR 替换了镜面内容之后要把**屏幕空间命中距离**写回去，
+// 否则 RR 拿旧的 RT 命中距离重投影反射内容 ⇒ 反射拖影（契约同 rgen 的
+// rrGlassReflectionHitDistance，见 rt_test.rgen:397-401）。
+layout(r32f,    set = 0, binding = 16) uniform image2D specularHitImage;
+layout(r32f,    set = 0, binding = 7)  uniform readonly image2D depthImage;
+layout(rg16f,   set = 0, binding = 62) uniform readonly image2D motionImage;
+layout(rgba16f, set = 0, binding = 81) uniform readonly image2D giTermImage;
+layout(rgba16f, set = 0, binding = 82) uniform readonly image2D specTermImage;
+layout(rgba16f, set = 0, binding = 83) uniform readonly image2D baseColorImage;
+layout(rgba16f, set = 0, binding = 84) uniform readonly image2D prevColorImage;
+
+// 2026-11-02（第二轮两项）：蓝噪声与 Hi-Z 金字塔。
+// 76 = Remix 的 128x128x64 R8 蓝噪声（Glass.cpp 上传的同一份，原作者 MIT），
+//      与 glass_alpha_blend.comp 的 glassBlueNoiseSample 同口径。
+// 85 = ss_hzb.comp 逐级 max 归约出来的深度金字塔（reversed-Z ⇒ max = 最近面）。
+layout(binding = 76, set = 0, std430) readonly buffer SSBlueNoise
+{
+    uint words[64u * 128u * 128u / 4u];
+} blueNoise;
+
+layout(binding = 85, set = 0, std430) readonly buffer SSHZBPyramid
+{
+    float cells[];
+} hzb;
+
+layout(set = 0, binding = 2) uniform CameraProperties
+{
+    #include "camera_ubo.glsl"
+} cam;
+
+// 内部渲染分辨率走 push constant（不用 UBO：UBO 在 updateCamera 里写，重尺寸
+// 那一帧会滞后一个尺寸 ⇒ imageStore 越界）
+layout(push_constant) uniform SSHybridPush
+{
+    uint width;
+    uint height;
+    uint frameIndex;
+    uint hzbLevels;   // Hi-Z 金字塔级数（0 = 本帧没建，退回固定步进）
+} pc;
+
+// ============================================================================
+// 常量
+// ============================================================================
+const float SS_CHUNK_METERS      = 16.0;
+const float SS_SSR_MIN_CHUNKS    = 12.0;      // SSR 硬性下限（>12 区块才有）
+const float SS_NO_GEOMETRY       = 1.0e30;
+const float SS_MARCH_MIN_STEP    = 0.35;
+const float SS_MARCH_STEP_GROWTH = 0.10;
+const int   SS_MARCH_STEPS       = 56;
+const int   SS_MARCH_REFINE      = 5;
+const vec3  SS_LUMA              = vec3(0.2126, 0.7152, 0.0722);
+
+// Hi-Z 空跳的单步上限（相对当前 t）。不设上限时，屏幕速度≈0 的掠射射线
+// 会一次跨掉整条射线，把命中判定变成"离散步进"。
+const float SS_HIZ_MAX_GROWTH    = 0.60;
+
+// 粗糙度剔除阈值：AMD SSSR 用 roughnessThreshold 直接"不打线、走环境回退"，
+// 我们的环境回退就是 RT 已经算好的那一份（更准），所以这里只做剔除不补色。
+const float SS_SSR_ROUGHNESS_MAX = 0.55;
+
+// 每 invocation 只求一次的矩阵（GLSL 允许非 const 全局，按 invocation 独立）
+mat4 ssWorldToView;
+mat4 ssViewToClip;
+vec3 ssCameraPosition;
+ivec2 ssExtent;
+uvec2 ssPixel;
+
+// ============================================================================
+// 小工具
+// ============================================================================
+// ============================================================================
+// 蓝噪声（2026-11-02 第二轮，替换掉原来的 hash）
+//
+// 直接复用仓库里已有的 Remix 128x128x64 R8 蓝噪声（binding 76，Glass.cpp
+// 上传，来源 _ref/dxvk-remix 的 util_blueNoise_128x128x64，MIT）。函数体与
+// glass_alpha_blend.comp 的 glassBlueNoiseSample / glassBlueNoiseR2 **逐字同源**
+// —— 同一个缓冲区、同一层索引、同一像素偏移，改一处必须改两处。
+//
+// 为什么必须换：RR 是唯一的降噪器，它的时域累积假设"每帧噪声是低差异序列"。
+// 白噪声 hash 在同一像素上逐帧不相关、且没有空间低差异性质，RR 收敛慢且
+// 容易出现残留颗粒；蓝噪声是官方（AMD SSSR：每帧重生成 128x128 blue noise
+// 给 GGX 抖动，seed 来自 blue noise 纹理）推荐的做法。
+// ============================================================================
+vec2 ssBlueNoiseR2(uint index)
+{
+    const float g = 1.32471795724474602596;
+    return fract(vec2(float(index) / g, float(index) / (g * g)));
+}
+
+float ssBlueNoiseSample(uvec2 pixelIdx, uint temporalIdx, uint seedIndex)
+{
+    const uvec2 seedOffset =
+        uvec2(ssBlueNoiseR2(seedIndex) * vec2(128.0));
+    const uint x = (pixelIdx.x + seedOffset.x) & 127u;
+    const uint y = (pixelIdx.y + seedOffset.y) & 127u;
+    const uint layer = temporalIdx & 63u;
+    const uint byteIndex = 16384u * layer + 128u * y + x;
+    const uint word = blueNoise.words[byteIndex >> 2u];
+    const uint raw = (word >> ((byteIndex & 3u) * 8u)) & 0xFFu;
+    return min(float(raw) * (1.0 / 255.0), 1.0 - 1.0 / 255.0);
+}
+
+// 每次调用取蓝噪声的下一个通道（seedIndex 决定像素偏移 ⇒ 通道之间去相关）。
+// 取代原来的 hash RNG：白噪声在同一像素上逐帧不相关，RR 的时域累积收敛更差。
+uint ssNoiseCursor = 0u;
+
+float ssRandom()
+{
+    return ssBlueNoiseSample(ssPixel, cam.frameCount, ssNoiseCursor++);
+}
+
+bool ssInside(ivec2 pixel)
+{
+    return pixel.x >= 0 && pixel.y >= 0 &&
+           pixel.x < ssExtent.x && pixel.y < ssExtent.y;
+}
+
+// 像素中心的 NDC。**y 必须翻一次**：本工程 UV 的 y 向下、NDC 的 y 向上，
+// 与 volumetric_clouds_v3.comp:96-97 / vol_restir_composite.comp:81-83 /
+// rr_guide_relax.comp:118-119 完全同口径（这几处是已在跑的、验证过的重建）。
+vec2 ssPixelNdc(vec2 uv)
+{
+    vec2 ndc = uv * 2.0 - 1.0;
+    ndc.y = -ndc.y;
+    return ndc;
+}
+
+// 由 (ndc, 深度) 还原「相机到该像素几何的欧氏距离」（米）。
+// 深度约定：Minecraft 26.2 reversed-Z，0 = miss/far。
+float ssSceneDistance(vec2 uv, float depthValue)
+{
+    if(depthValue <= 1.0e-5)
+    {
+        return SS_NO_GEOMETRY;
+    }
+
+    vec4 viewPosition = cam.projInverse * vec4(ssPixelNdc(uv), depthValue, 1.0);
+
+    if(abs(viewPosition.w) <= 1.0e-6)
+    {
+        return SS_NO_GEOMETRY;
+    }
+
+    return length(viewPosition.xyz / viewPosition.w);
+}
+
+// 像素中心的世界方向（单位向量）
+vec3 ssPixelWorldDirection(vec2 uv)
+{
+    vec4 viewPosition = cam.projInverse * vec4(ssPixelNdc(uv), 1.0, 1.0);
+    vec3 viewDirection =
+        normalize(viewPosition.xyz / max(abs(viewPosition.w), 1.0e-6));
+    return normalize((cam.viewInverse * vec4(viewDirection, 0.0)).xyz);
+}
+
+// 世界点 → 屏幕 uv + 相机到该点的欧氏距离 + 该点的 reversed-Z 深度值。
+// clipDepth 与深度图/金字塔里的值同量纲，可直接比较（越大 = 越近）。
+bool ssProjectPoint(
+    vec3 worldPosition,
+    out vec2 uv,
+    out float distanceMeters,
+    out float clipDepth)
+{
+    uv = vec2(0.0);
+    distanceMeters = 0.0;
+    clipDepth = 0.0;
+
+    vec4 viewPosition = ssWorldToView * vec4(worldPosition, 1.0);
+
+    if(viewPosition.z >= -1.0e-3)
+    {
+        return false;
+    }
+
+    vec4 clipPosition = ssViewToClip * viewPosition;
+
+    if(abs(clipPosition.w) <= 1.0e-6)
+    {
+        return false;
+    }
+
+    vec2 ndc = clipPosition.xy / clipPosition.w;
+    uv = ndc * vec2(0.5, -0.5) + 0.5;
+    distanceMeters = length(viewPosition.xyz);
+    clipDepth = clipPosition.z / clipPosition.w;
+    return true;
+}
+
+// ============================================================================
+// Hi-Z 深度金字塔（2026-11-02 第二轮）
+//
+// 布局与 ss_hzb.comp / 宿主 ScreenSpace.cpp **三方同源**：
+//   levelWidth(k)  = ceil(width  / 2^k)
+//   levelHeight(k) = ceil(height / 2^k)
+//   offset(1) = 0, offset(k) = offset(k-1) + levelWidth(k-1) * levelHeight(k-1)
+// 归约取 max（reversed-Z：max = 该块内最近的那个面）。
+// ============================================================================
+uint ssHzbLevelWidth(uint level)
+{
+    return (pc.width + (1u << level) - 1u) >> level;
+}
+
+uint ssHzbLevelHeight(uint level)
+{
+    return (pc.height + (1u << level) - 1u) >> level;
+}
+
+uint ssHzbOffset(uint level)
+{
+    uint offset = 0u;
+
+    for(uint k = 1u; k < level; ++k)
+    {
+        offset += ssHzbLevelWidth(k) * ssHzbLevelHeight(k);
+    }
+
+    return offset;
+}
+
+// 取某级某格的 max 深度值（0 = 该格内没有几何）。越界返回 0 等价于"无几何"，
+// 与"屏幕边缘射线本来就要失败"一致。
+float ssHzbCellMax(ivec2 cell, int level)
+{
+    if(level < 1)
+    {
+        return 0.0;
+    }
+
+    const uint clampedLevel = uint(min(level, int(pc.hzbLevels)));
+
+    if(clampedLevel < 1u)
+    {
+        return 0.0;
+    }
+
+    const uint width = ssHzbLevelWidth(clampedLevel);
+    const uint height = ssHzbLevelHeight(clampedLevel);
+
+    if(cell.x < 0 || cell.y < 0 ||
+       uint(cell.x) >= width || uint(cell.y) >= height)
+    {
+        return 0.0;
+    }
+
+    return hzb.cells[
+        ssHzbOffset(clampedLevel) + uint(cell.y) * width + uint(cell.x)];
+}
+
+// 深度图在给定 uv 处的几何距离（最近邻，避免 4 次 imageLoad）。
+// uv 对齐到像素中心再反投影 —— 用连续 uv 会与取到的那个 texel 的深度错位，
+// 掠射角上会把几格外的深度当成射线自己的深度。
+float ssSceneDistanceAt(vec2 uv)
+{
+    ivec2 pixel = ivec2(
+        clamp(uv * vec2(ssExtent), vec2(0.0),
+              vec2(ssExtent - ivec2(1))));
+
+    vec2 centerUv = (vec2(pixel) + 0.5) / vec2(ssExtent);
+
+    return ssSceneDistance(centerUv, imageLoad(depthImage, pixel).r);
+}
+
+// 双线性采样上一帧最终色（storage image 没有 sampler，手写 4 tap）
+vec3 ssSamplePrevColor(vec2 uv)
+{
+    vec2 texel = uv * vec2(ssExtent) - 0.5;
+    ivec2 base = ivec2(floor(texel));
+    vec2 fraction = texel - vec2(base);
+    ivec2 hi = ssExtent - ivec2(1);
+
+    vec3 c00 = imageLoad(prevColorImage, clamp(base, ivec2(0), hi)).rgb;
+    vec3 c10 = imageLoad(prevColorImage, clamp(base + ivec2(1, 0), ivec2(0), hi)).rgb;
+    vec3 c01 = imageLoad(prevColorImage, clamp(base + ivec2(0, 1), ivec2(0), hi)).rgb;
+    vec3 c11 = imageLoad(prevColorImage, clamp(base + ivec2(1, 1), ivec2(0), hi)).rgb;
+
+    return mix(mix(c00, c10, fraction.x), mix(c01, c11, fraction.x), fraction.y);
+}
+
+// 上一帧像素坐标 = 当前像素 + 运动矢量（MV 口径：prevUV - curUV）
+vec2 ssReproject(vec2 uv, ivec2 pixel)
+{
+    if(!ssInside(pixel))
+    {
+        return uv;
+    }
+
+    return uv + imageLoad(motionImage, pixel).rg;
+}
+
+// ============================================================================
+// 屏幕空间射线步进（Hi-Z 加速 + 命中后二分细化）
+//
+// 2026-11-02 第二轮：加了 Hi-Z 保守跳过。口径取自 AMD FidelityFX SSSR 手册：
+// 它在层级上"采样当前 mip → 生成安全区域 → 撞 xy 边界换更粗 mip / 跨 z 边界
+// 退回更细 mip"。我们这里落地的是同一思想的简化形式：
+//
+//   · 每一采样点用**与当前步长匹配的那一级**金字塔（level ≈ log2(像素步长)）
+//     查一次该块的 max 深度（reversed-Z ⇒ max = 块内最近的几何面）；
+//   · 若 `射线在该处的深度值 > 块 max 深度值` ⇒ 射线比块内**所有**几何都近
+//     ⇒ 整块可以安全跳过（保守，不会漏检）；
+//   · 跳过时前进的距离以"射线离开该屏幕块"为上界（离开后结论不再成立），
+//     用上一采样点的屏幕速度换算。这条上界是它比"固定 10% 增长"快的原因：
+//     沿视线方向、屏幕位移很慢的射线一次可以跨过很远的世界距离。
+//
+// 命中确认仍是逐像素的：块的结论只用来"证明空"，任何可疑块都退回逐像素
+// 深度比较 + 二分细化，所以跳过的加速不会引入漏检。
+// ============================================================================
+bool ssMarchRay(
+    vec3 origin,
+    vec3 direction,
+    float maxDistance,
+    out vec2 hitUv,
+    out float hitDistance)
+{
+    hitUv = vec2(0.0);
+    hitDistance = 0.0;
+
+    float previousT = 0.0;
+    float t = SS_MARCH_MIN_STEP;
+
+    vec2 previousUv = vec2(-1.0);
+    bool hasPrevious = false;
+
+    for(int step = 0; step < SS_MARCH_STEPS; ++step)
+    {
+        if(t > maxDistance)
+        {
+            return false;
+        }
+
+        vec2 uv = vec2(0.0);
+        float rayDistance = 0.0;
+        float rayDepthValue = 0.0;
+
+        if(!ssProjectPoint(
+               origin + direction * t,
+               uv,
+               rayDistance,
+               rayDepthValue))
+        {
+            return false;
+        }
+
+        if(any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0))))
+        {
+            return false;
+        }
+
+        // ---- Hi-Z：块级空跳 ----
+        if(hasPrevious && pc.hzbLevels >= 1u)
+        {
+            const float pixelStep =
+                length((uv - previousUv) * vec2(ssExtent));
+
+            const int level = int(clamp(
+                floor(log2(max(pixelStep, 1.0))),
+                0.0,
+                float(pc.hzbLevels)));
+
+            if(level >= 1)
+            {
+                const float levelWidth = float(ssHzbLevelWidth(uint(level)));
+                const float levelHeight = float(ssHzbLevelHeight(uint(level)));
+                const ivec2 cell = ivec2(floor(uv * vec2(levelWidth, levelHeight)));
+
+                if(rayDepthValue > ssHzbCellMax(cell, level))
+                {
+                    // 该块内所有几何都比射线远 ⇒ 整块跳过。前进距离以"离开该块"
+                    // 为上界，再夹一个上限防病态情况（屏幕速度≈0 时）。
+                    const float pixelsPerMeter =
+                        pixelStep / max(t - previousT, 1.0e-4);
+                    const float blockPixels = float(1 << level);
+                    const float metersToLeave =
+                        (0.5 * blockPixels) / max(pixelsPerMeter, 1.0e-6);
+
+                    previousT = t;
+                    previousUv = uv;
+                    t += clamp(
+                        metersToLeave,
+                        SS_MARCH_MIN_STEP,
+                        max(t * SS_HIZ_MAX_GROWTH, SS_MARCH_MIN_STEP));
+                    continue;
+                }
+            }
+        }
+
+        float sceneDistance = ssSceneDistanceAt(uv);
+
+        if(sceneDistance < SS_NO_GEOMETRY * 0.5)
+        {
+            float delta = rayDistance - sceneDistance;
+
+            // 命中厚度（**自创**：GPUOpen 的 SSSR 手册里没有 thickness 参数，
+            // 官方只有"安全区域 + z 边界跨越 + confidence"）。这里按"一个像素
+            // 在眼空间覆盖的世界深度跨度"缩放，上下夹紧防止薄墙漏光。
+            float thickness = clamp(
+                0.06 * sceneDistance +
+                    0.0008 * sceneDistance * sceneDistance,
+                0.20,
+                8.0);
+
+            if(delta > 0.0 && delta < thickness)
+            {
+                // 二分细化：在 [previousT, t] 内逼近真实交点
+                float lowT = previousT;
+                float highT = t;
+
+                for(int refine = 0; refine < SS_MARCH_REFINE; ++refine)
+                {
+                    float midT = 0.5 * (lowT + highT);
+                    vec2 midUv = vec2(0.0);
+                    float midDistance = 0.0;
+                    float midDepthValue = 0.0;
+
+                    if(!ssProjectPoint(
+                           origin + direction * midT,
+                           midUv,
+                           midDistance,
+                           midDepthValue))
+                    {
+                        break;
+                    }
+
+                    if(midDistance > ssSceneDistanceAt(midUv))
+                    {
+                        highT = midT;
+                        uv = midUv;
+                        rayDistance = midDistance;
+                    }
+                    else
+                    {
+                        lowT = midT;
+                    }
+                }
+
+                hitUv = uv;
+                hitDistance = rayDistance;
+                return true;
+            }
+
+            // 已经穿到后面却超出厚度 = 穿过了遮挡边界，按未命中处理（防漏光）
+            if(delta > 0.0)
+            {
+                return false;
+            }
+        }
+
+        previousT = t;
+        previousUv = uv;
+        hasPrevious = true;
+        t += max(SS_MARCH_MIN_STEP, t * SS_MARCH_STEP_GROWTH);
+    }
+
+    return false;
+}
+
+// ============================================================================
+// SSR
+//
+// 只处理「RT 镜面命中距离 > 12 区块（192 格）或未命中」的像素 —— 用户
+// 2026-11-02 的硬性约束。
+// ============================================================================
+bool ssShouldRunSsr(ivec2 pixel, float specularHitDistance)
+{
+    if(cam.ssHybridParams.y <= 0.0)
+    {
+        return false;
+    }
+
+    // 未命中（天空）= 65504，视作远场，需要屏幕空间补；
+    // 命中距离 <= 192 的像素 RT 已经有正确答案，SSR 不接手。
+    return specularHitDistance > SS_SSR_MIN_CHUNKS * SS_CHUNK_METERS;
+}
+
+// 锥形抖动：roughness 越大，采样方向越散（0 粗糙 = 纯镜面）
+vec3 ssPerturbReflection(vec3 mirrorDirection, float roughness)
+{
+    float spread = roughness * roughness * 0.75;
+
+    if(spread <= 1.0e-5)
+    {
+        return mirrorDirection;
+    }
+
+    vec3 helper =
+        abs(mirrorDirection.y) < 0.99 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+    vec3 tangent = normalize(cross(helper, mirrorDirection));
+    vec3 bitangent = cross(mirrorDirection, tangent);
+
+    float angle = 6.28318530718 * ssRandom();
+    float radius = sqrt(ssRandom()) * tan(min(spread, 1.2));
+
+    return normalize(
+        mirrorDirection +
+        (tangent * cos(angle) + bitangent * sin(angle)) * radius);
+}
+
+// ============================================================================
+// SSPT：屏幕空间路径追踪（第一跳命中 + 第二跳一次续弹）
+//
+// 返回「余弦加权平均入射辐亮度」L（单位与 giTerm.a 相同 ⇒ 可直接做比例替换）。
+// ============================================================================
+vec3 ssptTrace(vec3 surfacePosition, vec3 surfaceNormal, float maxDistance,
+               out float confidence)
+{
+    confidence = 0.0;
+
+    vec3 origin = surfacePosition + surfaceNormal * 0.02;
+    vec3 direction = surfaceNormal;
+
+    {
+        // 余弦加权半球采样
+        float u1 = ssRandom();
+        float u2 = ssRandom();
+        float radius = sqrt(u1);
+        float theta = 6.28318530718 * u2;
+        vec3 helper =
+            abs(surfaceNormal.y) < 0.99 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+        vec3 tangent = normalize(cross(helper, surfaceNormal));
+        vec3 bitangent = cross(surfaceNormal, tangent);
+        direction = normalize(
+            tangent * (radius * cos(theta)) +
+            bitangent * (radius * sin(theta)) +
+            surfaceNormal * sqrt(max(1.0 - u1, 0.0)));
+    }
+
+    vec2 uv = vec2(0.0);
+    float distanceMeters = 0.0;
+
+    if(!ssMarchRay(origin, direction, maxDistance, uv, distanceMeters))
+    {
+        return vec3(0.0);
+    }
+
+    ivec2 hitPixel = ivec2(clamp(uv * vec2(ssExtent), vec2(0.0),
+                                 vec2(ssExtent - ivec2(1))));
+
+    vec3 radiance = ssSamplePrevColor(ssReproject(uv, hitPixel));
+
+    // 第二跳：用命中像素自己的法线/反照率做一次续弹（只有 1 spp，交给 NRD）
+    vec4 hitNormalRoughness = imageLoad(normalRoughnessImage, hitPixel);
+    vec3 hitNormal = normalize(hitNormalRoughness.xyz);
+    vec3 hitAlbedo = clamp(imageLoad(diffuseAlbedoImage, hitPixel).rgb, 0.0, 1.0);
+
+    if(dot(hitNormal, hitNormal) > 0.5 && dot(hitAlbedo, SS_LUMA) > 0.02)
+    {
+        vec3 secondOrigin = origin + direction * distanceMeters + hitNormal * 0.02;
+        vec3 secondDirection;
+
+        {
+            float u1 = ssRandom();
+            float u2 = ssRandom();
+            float radius = sqrt(u1);
+            float theta = 6.28318530718 * u2;
+            vec3 helper =
+                abs(hitNormal.y) < 0.99 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+            vec3 tangent = normalize(cross(helper, hitNormal));
+            vec3 bitangent = cross(hitNormal, tangent);
+            secondDirection = normalize(
+                tangent * (radius * cos(theta)) +
+                bitangent * (radius * sin(theta)) +
+                hitNormal * sqrt(max(1.0 - u1, 0.0)));
+        }
+
+        vec2 secondUv = vec2(0.0);
+        float secondDistance = 0.0;
+
+        if(ssMarchRay(secondOrigin, secondDirection, maxDistance,
+                      secondUv, secondDistance))
+        {
+            ivec2 secondPixel = ivec2(clamp(secondUv * vec2(ssExtent), vec2(0.0),
+                                            vec2(ssExtent - ivec2(1))));
+            radiance +=
+                hitAlbedo *
+                ssSamplePrevColor(ssReproject(secondUv, secondPixel));
+        }
+    }
+
+    // 靠近屏幕边缘的命中不可信（射线随时会出屏），按距离衰减置信度
+    float edgeFade =
+        smoothstep(0.0, 0.06, uv.x) * smoothstep(0.0, 0.06, 1.0 - uv.x) *
+        smoothstep(0.0, 0.06, uv.y) * smoothstep(0.0, 0.06, 1.0 - uv.y);
+
+    confidence = edgeFade;
+    return max(radiance, vec3(0.0)) * edgeFade;
+}
+
+// ============================================================================
+void main()
+{
+    ssExtent = ivec2(int(pc.width), int(pc.height));
+    ssPixel = uvec2(gl_GlobalInvocationID.xy);
+
+    if(ssExtent.x <= 0 || ssExtent.y <= 0)
+    {
+        return;
+    }
+
+    ivec2 pixel = ivec2(ssPixel);
+    if(!ssInside(pixel))
+    {
+        return;
+    }
+
+    // 两条滑条都是 0 ⇒ 宿主本来就不会 dispatch，这里再兜一次底
+    const bool ssrEnabled  = cam.ssHybridParams.y > 0.0;
+    const bool ssptEnabled = cam.ssHybridParams.x > 0.0;
+
+    if(!ssrEnabled && !ssptEnabled)
+    {
+        return;
+    }
+
+    vec3 color = imageLoad(baseColorImage, pixel).rgb;
+
+    const float depthValue = imageLoad(depthImage, pixel).r;
+    if(depthValue <= 1.0e-5)
+    {
+        // 天空像素：没有 G-buffer 表面，原样写回
+        imageStore(sceneColor, pixel, vec4(max(color, vec3(0.0)), 1.0));
+        return;
+    }
+
+    ssWorldToView = inverse(cam.viewInverse);
+    ssViewToClip = inverse(cam.projInverse);
+    ssCameraPosition = cam.viewInverse[3].xyz;
+
+    const vec2 uv = (vec2(pixel) + 0.5) / vec2(ssExtent);
+    const vec3 worldDirection = ssPixelWorldDirection(uv);
+    const float surfaceDistance = ssSceneDistance(uv, depthValue);
+
+    if(surfaceDistance >= SS_NO_GEOMETRY * 0.5)
+    {
+        imageStore(sceneColor, pixel, vec4(max(color, vec3(0.0)), 1.0));
+        return;
+    }
+
+    const vec3 surfacePosition = ssCameraPosition + worldDirection * surfaceDistance;
+
+    const vec4 normalRoughness = imageLoad(normalRoughnessImage, pixel);
+    vec3 surfaceNormal = normalRoughness.xyz;
+    const float surfaceRoughness = clamp(normalRoughness.w, 0.0, 1.0);
+
+    if(dot(surfaceNormal, surfaceNormal) < 0.5)
+    {
+        surfaceNormal = -worldDirection;
+    }
+    surfaceNormal = normalize(surfaceNormal);
+
+    // 法线必须朝向相机半球：reflect(-V, N) 与余弦半球采样都依赖这一点。
+    // guide 里的法线来自 rchit 的几何法线，双面材质（树叶/玻璃接收面）可能反向。
+    {
+        vec3 toCamera = normalize(ssCameraPosition - surfacePosition);
+        if(dot(surfaceNormal, toCamera) < 0.0)
+        {
+            surfaceNormal = -surfaceNormal;
+        }
+    }
+
+    const vec3 diffuseAlbedo =
+        clamp(imageLoad(diffuseAlbedoImage, pixel).rgb, 0.0, 1.0);
+    const vec3 specularAlbedo =
+        max(imageLoad(specularAlbedoImage, pixel).rgb, vec3(0.0));
+
+    // 采样抖动全部来自蓝噪声（ssRandom()），这里不再需要 hash 状态
+
+    // ========================================================================
+    // SSR：替换镜面分项
+    // ========================================================================
+    if(ssrEnabled)
+    {
+        const float specularHitDistance = imageLoad(specularHitImage, pixel).r;
+
+        // 纯漫反射面（镜面反照率 ≈ 0）不参与替换：否则会减掉 specTerm 却
+        // 补回 ~0，表现为远处粗糙表面被压黑。
+        const bool specularLobePresent =
+            dot(specularAlbedo, vec3(1.0 / 3.0)) > 0.01;
+
+        // 粗糙度剔除（AMD SSSR 的 roughnessThreshold 同口径：粗糙面不打线）。
+        // 差别只在回退：它的回退是环境贴图，我们的回退是 RT 已经算好的那一份
+        // （等价但更准），所以这里剔除只省算力、不改画面。
+        const bool roughnessAccepted =
+            surfaceRoughness <= SS_SSR_ROUGHNESS_MAX;
+
+        // 12 区块硬性门槛的软化：硬切会在 192 格处留下"RT 反射 ↔ SSR 反射"的
+        // 接缝（两者内容来源不同）。官方做法是命中后按 confidence 在 SSR 与
+        // 环境回退之间插值；我们的等价做法是把门槛做成 32 格的 smoothstep。
+        const float ssrGate = smoothstep(
+            SS_SSR_MIN_CHUNKS * SS_CHUNK_METERS,
+            SS_SSR_MIN_CHUNKS * SS_CHUNK_METERS + 32.0,
+            specularHitDistance);
+
+        if(specularLobePresent && roughnessAccepted &&
+           ssShouldRunSsr(pixel, specularHitDistance))
+        {
+            const vec3 viewDirection = normalize(ssCameraPosition - surfacePosition);
+            const vec3 mirrorDirection =
+                reflect(-viewDirection, surfaceNormal);
+            const vec3 sampledDirection =
+                ssPerturbReflection(mirrorDirection, surfaceRoughness);
+
+            const float maxDistance =
+                cam.ssHybridParams.y * SS_CHUNK_METERS;
+
+            vec2 hitUv = vec2(0.0);
+            float hitDistance = 0.0;
+
+            if(ssMarchRay(surfacePosition + surfaceNormal * 0.02, sampledDirection,
+                          maxDistance, hitUv, hitDistance))
+            {
+                ivec2 hitPixel = ivec2(clamp(hitUv * vec2(ssExtent), vec2(0.0),
+                                             vec2(ssExtent - ivec2(1))));
+
+                const vec3 radiance =
+                    ssSamplePrevColor(ssReproject(hitUv, hitPixel));
+
+                // 命中点法线与反射面法线的相似度：不一致说明打在掠射/背面
+                vec3 hitNormal = normalize(imageLoad(normalRoughnessImage, hitPixel).xyz);
+                float alignment =
+                    smoothstep(0.0, 0.35, dot(hitNormal, -sampledDirection));
+
+                float edgeFade =
+                    smoothstep(0.0, 0.05, hitUv.x) * smoothstep(0.0, 0.05, 1.0 - hitUv.x) *
+                    smoothstep(0.0, 0.05, hitUv.y) * smoothstep(0.0, 0.05, 1.0 - hitUv.y);
+
+                const float confidence = alignment * edgeFade * ssrGate;
+
+                if(confidence > 0.0)
+                {
+                    const vec3 specularTerm = imageLoad(specTermImage, pixel).rgb;
+                    const vec3 replacement = specularAlbedo * radiance;
+
+                    color = color - specularTerm * confidence +
+                            replacement * confidence;
+
+                    // 2026-11-02：把屏幕空间的命中距离写回 RR 的镜面命中距离 guide。
+                    // DLSS-RR 是这个工程唯一的降噪器（kNrdLocalDiEnabled 编译期
+                    // false），它按"镜面命中距离"把反射内容重投影到上一帧；内容换成了
+                    // 屏幕空间射线却留着 RT 的那个距离 ⇒ 历史采样落在错的深度上 ⇒
+                    // 反射整体糊 / 拖影。同址读写（本 invocation 只碰自己这一格），
+                    // 与相邻 invocation 无交叉。
+                    imageStore(
+                        specularHitImage,
+                        pixel,
+                        vec4(hitDistance, 0.0, 0.0, 0.0));
+                }
+            }
+        }
+    }
+
+    // ========================================================================
+    // SSPT：替换间接光分项（只在射程内，比例式差分）
+    // ========================================================================
+    if(ssptEnabled)
+    {
+        const float rangeMeters = cam.ssHybridParams.x * SS_CHUNK_METERS;
+
+        if(surfaceDistance <= rangeMeters)
+        {
+            float confidence = 0.0;
+            const vec3 traced =
+                ssptTrace(surfacePosition, surfaceNormal, rangeMeters,
+                          confidence);
+
+            if(confidence > 0.0)
+            {
+                const vec4 giTerm = imageLoad(giTermImage, pixel);
+                const float referenceRadiance = giTerm.a;
+
+                if(referenceRadiance > 1.0e-3)
+                {
+                    // 比例替换：未知的 brdfWeight / 1.8 / rtaoFactor 全部约掉。
+                    // 归一化口径必须与 rgen 写 giTerm.a 时一致（那里是
+                    // dot(indirectLight, 1/3)，不是亮度加权）。
+                    const float tracedRadiance =
+                        dot(traced, vec3(1.0 / 3.0));
+                    const float ratio =
+                        clamp(tracedRadiance / referenceRadiance, 0.0, 4.0);
+
+                    color += giTerm.rgb * (ratio - 1.0) * confidence;
+                }
+                else
+                {
+                    // RT 这里没有间接光可言（全遮蔽）⇒ 直接补，没有双计风险
+                    color += diffuseAlbedo * traced * confidence;
+                }
+            }
+        }
+    }
+
+    imageStore(sceneColor, pixel, vec4(max(color, vec3(0.0)), 1.0));
+}

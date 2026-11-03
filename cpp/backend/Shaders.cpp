@@ -155,6 +155,15 @@ std::vector<uint8_t> loadSpv(const char* path)
     }
 
 
+    // 2026-11-02 P0（冷编分解）：登记 SPV 内容哈希 -> 请求路径。之后管线创建日志
+    // 经 module -> 哈希 -> 路径 反查，就能把每条 ms 对到具体 .spv 文件。
+    // 只做观测，不改变加载/校验行为。
+    OrionPipelineRegisterSpvName(
+        OrionPipelineSpvHash(data.data(), data.size()),
+        (path != nullptr) ? path : "<null>"
+    );
+
+
     return data;
 }
 VkShaderModule createShaderModule(VkDevice d,const std::vector<uint8_t>& code){

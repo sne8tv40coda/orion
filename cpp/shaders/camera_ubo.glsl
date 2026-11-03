@@ -135,3 +135,11 @@
     //       留这个旋钮做 A/B 对齐，不必重编）
     //   z/w = 保留（写 0）
     vec4 skyModelParams;
+
+    // ── ssHybridParams ──（2026-11-02 追加在末尾，理由同上：中间插入会平移）
+    //   x = SSPT 射程（区块，0 = 关；UI 滑条 0..12）
+    //   y = SSR 射程上限（区块，0 = 关；UI 硬性下限 12 ⇒ 只要 >0 就按 12 起算）
+    //   z/w = 保留（写 0；内部渲染分辨率走 ss_hybrid 自己的 push constant，
+    //         不用 UBO 是因为 UBO 在 updateCamera 里写，重尺寸那一帧会滞后）
+    // 消费方：cpp/shaders/ss_hybrid.comp
+    vec4 ssHybridParams;

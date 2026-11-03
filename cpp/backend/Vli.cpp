@@ -218,6 +218,20 @@ void destroyVPTDirectHistoryBuffers()
     g_vptDirectHistoryHeight = 0u;
     g_vptDirectHistoryBytes = 0;
     g_vptDirectHistoryNeedsClear = false;
+
+    if(g_vptBestLightBuffer != VK_NULL_HANDLE)
+    {
+        vkDestroyBuffer(g_device, g_vptBestLightBuffer, nullptr);
+        g_vptBestLightBuffer = VK_NULL_HANDLE;
+    }
+    if(g_vptBestLightMemory != VK_NULL_HANDLE)
+    {
+        vkFreeMemory(g_device, g_vptBestLightMemory, nullptr);
+        g_vptBestLightMemory = VK_NULL_HANDLE;
+    }
+    g_vptBestLightBytes = 0;
+    g_vptBestLightTileColumns = 0u;
+    g_vptBestLightTileRows = 0u;
 }
 
 
@@ -232,8 +246,8 @@ void updateVPTDirectHistoryDescriptors()
         return;
     }
 
-    VkDescriptorBufferInfo infos[2]{};
-    VkWriteDescriptorSet writes[2]{};
+    VkDescriptorBufferInfo infos[3]{};
+    VkWriteDescriptorSet writes[3]{};
     for(uint32_t i = 0u; i < 2u; ++i)
     {
         infos[i].buffer = g_vptDirectHistoryBuffers[i];
@@ -247,7 +261,22 @@ void updateVPTDirectHistoryDescriptors()
         writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         writes[i].pBufferInfo = &infos[i];
     }
-    vkUpdateDescriptorSets(g_device, 2u, writes, 0u, nullptr);
+    uint32_t writeCount = 2u;
+    if(g_vptBestLightBuffer != VK_NULL_HANDLE)
+    {
+        infos[2].buffer = g_vptBestLightBuffer;
+        infos[2].offset = 0;
+        infos[2].range = VK_WHOLE_SIZE;
+
+        writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[2].dstSet = g_rayTracingDescriptorSet;
+        writes[2].dstBinding = 80u;
+        writes[2].descriptorCount = 1;
+        writes[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[2].pBufferInfo = &infos[2];
+        writeCount = 3u;
+    }
+    vkUpdateDescriptorSets(g_device, writeCount, writes, 0u, nullptr);
 }
 
 
@@ -310,6 +339,36 @@ void createVPTDirectHistoryBuffers(uint32_t width, uint32_t height)
     g_vptDirectHistoryHeight = height;
     g_vptDirectHistoryBytes = historyBytes;
     g_vptDirectHistoryNeedsClear = true;
+
+    // 2026-11-02：per-tile best-light。一块 buffer 分两半（按
+    // cam.historyReadIndex ping-pong），每 tile 一个 r32ui 打包键。
+    // 必须在 updateVPTDirectHistoryDescriptors() 之前建好，否则 binding 80 不会被写。
+    {
+        const uint32_t bestLightTileSize = 8u;
+        g_vptBestLightTileColumns =
+            (width + bestLightTileSize - 1u) / bestLightTileSize;
+        g_vptBestLightTileRows =
+            (height + bestLightTileSize - 1u) / bestLightTileSize;
+        const uint64_t bestLightTileCount =
+            static_cast<uint64_t>(g_vptBestLightTileColumns) *
+            static_cast<uint64_t>(g_vptBestLightTileRows);
+        g_vptBestLightBytes =
+            static_cast<VkDeviceSize>(bestLightTileCount * 2ull * 4ull);
+        if(g_vptBestLightBytes == 0)
+        {
+            g_vptBestLightBytes = 8u;
+        }
+        createBuffer(
+            g_device,
+            g_physicalDevice,
+            g_vptBestLightBytes,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+            g_vptBestLightBuffer,
+            g_vptBestLightMemory
+        );
+    }
+
     updateVPTDirectHistoryDescriptors();
 
     std::stringstream ss;
@@ -318,7 +377,9 @@ void createVPTDirectHistoryBuffers(uint32_t width, uint32_t height)
        << " bytesPerBuffer="
        << static_cast<unsigned long long>(historyBytes)
        << " (48 B/px 单半区；本地光 DI EMA 后半已随 rt_restir_final 删除而回收)"
-       << " bindings=26,27";
+       << " bindings=26,27,80(best-light tiles="
+       << g_vptBestLightTileColumns << "x" << g_vptBestLightTileRows
+       << ", " << static_cast<unsigned long long>(g_vptBestLightBytes) << " B)";
     RTLog(ss.str());
 }
 
@@ -335,7 +396,8 @@ void prepareVPTDirectHistoryBuffers(VkCommandBuffer cmd)
         return;
     }
 
-    VkBufferMemoryBarrier barriers[2]{};
+    VkBufferMemoryBarrier barriers[3]{};
+    uint32_t barrierCount = 2u;
     for(uint32_t i = 0u; i < 2u; ++i)
     {
         if(g_vptDirectHistoryNeedsClear)
@@ -361,6 +423,34 @@ void prepareVPTDirectHistoryBuffers(VkCommandBuffer cmd)
         barriers[i].dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
     }
 
+    // best-light 只在重建时清零：之后的失效靠 rgen 里写入的帧奇偶位（代际校验），
+    // 因此不需要每帧 fill —— 清了反而会把上一帧刚写的那半擦掉。
+    if(g_vptBestLightBuffer != VK_NULL_HANDLE && g_vptBestLightBytes > 0)
+    {
+        if(g_vptDirectHistoryNeedsClear)
+        {
+            vkCmdFillBuffer(
+                cmd,
+                g_vptBestLightBuffer,
+                0,
+                g_vptBestLightBytes,
+                0u
+            );
+        }
+
+        barriers[2].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        barriers[2].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barriers[2].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barriers[2].buffer = g_vptBestLightBuffer;
+        barriers[2].offset = 0;
+        barriers[2].size = g_vptBestLightBytes;
+        barriers[2].srcAccessMask = g_vptDirectHistoryNeedsClear
+            ? VK_ACCESS_TRANSFER_WRITE_BIT
+            : VK_ACCESS_SHADER_WRITE_BIT;
+        barriers[2].dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        barrierCount = 3u;
+    }
+
     vkCmdPipelineBarrier(
         cmd,
         g_vptDirectHistoryNeedsClear
@@ -372,7 +462,7 @@ void prepareVPTDirectHistoryBuffers(VkCommandBuffer cmd)
         0,
         0,
         nullptr,
-        2,
+        barrierCount,
         barriers,
         0,
         nullptr

@@ -1,0 +1,97 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+
+// ============================================================================
+// 2026-11-02 Hi-Z 深度金字塔（SSR 的加速结构）
+//
+// 参考口径：AMD FidelityFX SSSR 用 SPD 生成 **7 级 R32F 深度金字塔**，
+// 之后在层级上做 screen-space traversal（"采样当前 mip 的深度 → 生成安全区域
+// → 撞 xy 边界换更粗 mip、跨 z 边界退回更细 mip"）。这里是同一件事的最小实现：
+// 只做"金字塔本身"，遍历逻辑在 ss_hybrid.comp 里（那边要同时做命中确认）。
+//
+// 归约口径为什么取 **max**：本工程深度是 reversed-Z，**数值越大 = 越近**。
+// 一个块里"最近的那个面"就是数值最大的那个 ⇒ max 归约后，任一射线只要满足
+//   射线在该处的深度值 > 该块的 max 深度值
+// 就说明"射线比块内所有几何都近"，整块可以安全跳过（保守、无漏检）。
+// 天空（miss）的深度是 0 ⇒ 不参与 max，等价于"无穷远"。
+//
+// 存储：storage buffer 里的扁平数组，每级起始下标由宿主与着色器**用同一条
+// 公式**算出（levelWidth(k) = ceil(W / 2^k)，逐级累加），所以不需要 push
+// 传偏移表，也不需要 6 个 mip view / 6 个 binding。
+//
+// 调用方式：宿主按 k = 1..6 逐级 dispatch（每级之间一条 buffer 屏障），
+// k = 1 的源是深度图，k >= 2 的源是上一级。
+// ============================================================================
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// 第 0 级（原分辨率）直接用 rgen 写出的深度图
+layout(r32f, set = 0, binding = 7) uniform readonly image2D depthImage;
+
+// 与 ss_hybrid.comp 共享的同一条缓冲（读上一级 + 写本机）
+layout(std430, set = 0, binding = 85) buffer SSHZBPyramid
+{
+    float cells[];
+} hzb;
+
+layout(push_constant) uniform SSHZBPush
+{
+    uint sourceIsDepth;      // 1 = 源是深度图（建第 1 级），0 = 源是金字塔上一级
+    uint sourceOffset;       // 源在 cells[] 里的起始下标（sourceIsDepth=1 时忽略）
+    uint destinationOffset;  // 目标起始下标
+    uint destinationWidth;
+    uint destinationHeight;
+    uint sourceWidth;
+    uint sourceHeight;
+    uint reserved;
+} pc;
+
+void main()
+{
+    const ivec2 destination = ivec2(gl_GlobalInvocationID.xy);
+
+    if(destination.x >= int(pc.destinationWidth) ||
+       destination.y >= int(pc.destinationHeight))
+    {
+        return;
+    }
+
+    const ivec2 sourceExtent =
+        ivec2(int(pc.sourceWidth), int(pc.sourceHeight));
+
+    float maximum = 0.0;
+
+    for(int dy = 0; dy < 2; ++dy)
+    {
+        for(int dx = 0; dx < 2; ++dx)
+        {
+            const ivec2 source =
+                ivec2(destination.x * 2 + dx, destination.y * 2 + dy);
+
+            float value = 0.0;
+
+            if(pc.sourceIsDepth != 0u)
+            {
+                const ivec2 depthExtent = imageSize(depthImage);
+
+                if(source.x < depthExtent.x && source.y < depthExtent.y)
+                {
+                    value = imageLoad(depthImage, source).r;
+                }
+            }
+            else if(source.x < sourceExtent.x && source.y < sourceExtent.y)
+            {
+                value =
+                    hzb.cells[pc.sourceOffset +
+                              uint(source.y) * pc.sourceWidth +
+                              uint(source.x)];
+            }
+
+            maximum = max(maximum, value);
+        }
+    }
+
+    hzb.cells[pc.destinationOffset +
+              uint(destination.y) * pc.destinationWidth +
+              uint(destination.x)] = maximum;
+}

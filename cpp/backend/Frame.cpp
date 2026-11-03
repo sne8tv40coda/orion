@@ -357,6 +357,13 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_updateCamera(
     ubo->giHalfParams[2] = giNoPomEnabled() ? 1.0f : 0.0f;
     ubo->giHalfParams[3] = glossyRoughLodEnabled() ? 1.0f : 0.0f;
 
+    // 2026-11-02 屏幕空间降级链。x = SSPT 射程（0..12 区块，0 = 关），
+    // y = SSR 射程上限（0 = 关；硬性下限 12 由 ss_hybrid.comp 逐像素判）。
+    ubo->ssHybridParams[0] = std::clamp(g_ssptChunks.load(), 0.0f, 12.0f);
+    ubo->ssHybridParams[1] = std::clamp(g_ssrChunks.load(), 0.0f, 64.0f);
+    ubo->ssHybridParams[2] = 0.0f;
+    ubo->ssHybridParams[3] = 0.0f;
+
     ubo->giRayParams[0] = static_cast<float>(giNearRateLevel());
     ubo->giRayParams[1] = 0.0f;
     ubo->giRayParams[2] = 0.0f;
@@ -384,6 +391,22 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_updateCamera(
 
     ubo->sparseParams[1] = sparseRateForMask * 100.0f;
     ubo->sparseParams[2] = static_cast<float>(rtxdiReuseInactiveEnabled());
+
+    // 2026-11-02：诊断。稀疏 A/B 需要先确认三件事有没有真的传进来 ——
+    // 请求率、折算后的有效率、以及非活跃像素是否进 reservoir tail（sparseParams.z）。
+    // 不能用 static 打一次：第一帧时 RTLog 到 Java logger 的通道还没接好，那条会丢；
+    // 改成每 300 帧（约 5 秒）刷一条，用 Flushed 保证落盘。只读 env / 已缓存开关。
+    if((static_cast<uint32_t>(nextFrame) % 300u) == 0u)
+    {
+        RTLogFlushed(std::string("[SPARSE-DIAG] frame=") +
+            std::to_string(nextFrame) +
+            " request=" + std::to_string(sparseRatePercent()) +
+            "% effective=" + std::to_string(sparseRateForMask) +
+            " inactiveReuse=" + std::to_string(rtxdiReuseInactiveEnabled()) +
+            " perfTs=" + std::to_string(perfTimestampsEnabled() ? 1 : 0) +
+            " dlssRR=" + std::to_string(g_dlssRRReady ? 1 : 0) +
+            " directLightMode=" + std::to_string(directLightModeCurrent));
+    }
     ubo->sparseParams[3] =
         g_sparseHistoryValid.load(std::memory_order_relaxed) ? 1.0f : 0.0f;
 
@@ -642,6 +665,11 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_recordFrameCommand(
     perfL10CpuPhaseBeginFrame();
 
     maybePersistSharedPipelineCache();
+
+    // 2026-11-02 P1：SPV 热重载（默认关，ORION_RT_PIPE_HOT_RELOAD=1 开启）。
+    // 放在帧首、任何 RT pass 录制之前：重建会 vkDeviceWaitIdle 并重建 SBT，
+    // 必须发生在这一帧的 command buffer 开始录制之前，否则 SBT 会在帧中途被换掉。
+    pollRtPipelineHotReload();
 
     ensurePbrAtlasSampler();
 
@@ -2171,6 +2199,14 @@ if(!g_dlssGFeatureInitialized)
     }
 
 
+    // 2026-11-02 屏幕空间降级链（SSR + SSPT）：两条滑条都为 0 时此调用
+    // 立刻返回，不建任何图 / 管线（默认关闭 ⇒ 零代价）。
+    createSSHybridResources(
+        renderWidth,
+        renderHeight
+    );
+
+
     createGiHalfImage(
         renderWidth,
         renderHeight
@@ -2718,6 +2754,17 @@ recordSharcUpdate(cmd, renderWidth, renderHeight);
     recordSharcResolve(cmd);
     rtSpikeSharcResolve = rtMark();
 
+    // 2026-11-02 屏幕空间降级链（SSR + SSPT）。挂点在这里的理由：
+    //   · 本帧 rgen 已写完颜色 / 深度 / guide / 分项 G-buffer；
+    //   · 玻璃 alpha-blend 已在本帧颜色上合成（2716）⇒ 拷贝的基准色是最终色；
+    //   · 还没进 NRD / DLSS ⇒ 屏幕空间的偏差仍能被降噪与 RR 吃掉。
+    // 默认关闭时本调用立刻返回，不录任何命令。
+    recordSSHybridPass(
+        cmd,
+        renderWidth,
+        renderHeight
+    );
+
     {
         const auto rtPhaseEnd = std::chrono::steady_clock::now();
         const double rtPhaseTotal =
@@ -2903,6 +2950,12 @@ recordSharcUpdate(cmd, renderWidth, renderHeight);
             );
         }
     }
+
+    // 2026-11-02：屏幕空间降级链的"上一帧最终色"快照。放在 NRD composite
+    // 之后 ⇒ 下一帧 SSR/SSPT 拿到的辐射源是降噪过的色，不是 1spp 噪声。
+    // 体积云在 2915 之后才合成，所以历史色里不含云（已知、可接受：
+    // 云的贡献在反射里本来就被 RR 当低置信度处理）。
+    recordSSHybridHistoryCopy(cmd);
 
     // 2026-11-01：ReSTIR 屏幕积分必须在本帧 recordVolumetricClouds 里的
     // god_ray_composite **之前**写 g_godRayTargetImage。原来它排在 RR evaluate

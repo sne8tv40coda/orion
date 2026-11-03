@@ -169,7 +169,15 @@ bool rebuildWorldGeometry(
                     ? static_cast<const CameraUBO*>(g_cameraUboMapped)
                     : nullptr;
 
-            const float rehydrateRadius = vramEvictKeepRadius();
+            // 2026-11-03：补回半径必须**严格小于**驱逐半径（Hysteresis 的本意）。
+            // 超预算时驱逐用的是 keepRadius = 96×(1-0.25) = 72，驱逐半径
+            // = 72×1.25 = 90（见下面 VRAM_EVICT_SHRINK_RADIUS）；而这里原来用
+            // 未 shrink 的 96 ⇒ 补回 96 > 驱逐 90，落在 90~96 格之间的 Section
+            // 每一帧"补回 → 下一帧又被驱逐"，永久乒乓：那圈几何反复进出 TLAS，
+            // 表现为太阳阴影/远景色块逐帧抖。这里按同一 shrink 计算，
+            // 补回 72 < 驱逐 90，留 18 格带宽（> 一个 Section 的 16 格）。
+            const float rehydrateRadius = vramEvictKeepRadius() *
+                (g_vramGovernor.over ? (1.0f - 0.25f) : 1.0f);
             const float rehydrateRadiusSq = rehydrateRadius * rehydrateRadius;
 
             const size_t rehydrateQuota = vramRehydratePerPass();
@@ -1899,7 +1907,12 @@ bool rebuildWorldGeometry(
        !orderedSections.empty())
     {
         constexpr float VRAM_EVICT_SHRINK_RADIUS = 0.25f;
-        constexpr float VRAM_EVICT_SHRINK_SHADOW = 0.40f;
+        // 2026-11-03：0.40 → 0.25。这个系数只缩**太阳阴影保留盒**，而 rgen 的
+        // 太阳可见性射线（shadowRayCap = 160 格，rt_test.rgen:23947）长度不变。
+        // 0.40 ⇒ 盒只剩 ±96 格：96~160 格内本该挡住太阳的墙/山被驱逐出 TLAS，
+        // 射线一律 miss ⇒ 低太阳角时长影整段消失、墙面被判受光（"阳光穿墙"）。
+        // 0.25 ⇒ ±120 格，漏光带从 64 格缩到 40 格，且只多保留一圈 Section。
+        constexpr float VRAM_EVICT_SHRINK_SHADOW = 0.25f;
 
         const double overRatio =
             g_vramGovernor.budgetMb > 0.0

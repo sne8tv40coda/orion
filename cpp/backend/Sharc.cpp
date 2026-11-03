@@ -1635,15 +1635,14 @@ void ensureSharcUpdatePipeline()
             pci.flags |= VK_PIPELINE_CREATE_RAY_TRACING_OPACITY_MICROMAP_BIT_EXT;
         }
 
-        auto createPipe =
-            reinterpret_cast<PFN_vkCreateRayTracingPipelinesKHR>(
-                vkGetDeviceProcAddr(g_device, "vkCreateRayTracingPipelinesKHR"));
-        if(!createPipe)
-        {
-            throw std::runtime_error("vkCreateRayTracingPipelinesKHR unavailable");
-        }
-        check(createPipe(g_device, VK_NULL_HANDLE, getSharedPipelineCache(), 1u,
-                         &pci, nullptr, &g_sharcUpdatePipeline),
+        // 2026-11-02 P0（冷编分解）：走计时包装，cache / deferredOperation / 1 条
+        // createInfo 与原调用逐位一致，只多一条 [PERF PIPE] kind=rt 日志。
+        check(OrionCreateRayTracingPipelineTimed(
+                  "sharc-update",
+                  1u,
+                  &pci,
+                  getSharedPipelineCache(),
+                  &g_sharcUpdatePipeline),
               "Failed to create SHaRC update RT pipeline");
 
         for(uint32_t i = 0u; i < 6u; ++i)
@@ -1942,15 +1941,13 @@ void ensureGiHalfPipeline()
             pci.flags |= VK_PIPELINE_CREATE_RAY_TRACING_OPACITY_MICROMAP_BIT_EXT;
         }
 
-        auto createPipe =
-            reinterpret_cast<PFN_vkCreateRayTracingPipelinesKHR>(
-                vkGetDeviceProcAddr(g_device, "vkCreateRayTracingPipelinesKHR"));
-        if(!createPipe)
-        {
-            throw std::runtime_error("vkCreateRayTracingPipelinesKHR unavailable");
-        }
-        check(createPipe(g_device, VK_NULL_HANDLE, getSharedPipelineCache(), 1u,
-                         &pci, nullptr, &g_giHalfPipeline),
+        // 2026-11-02 P0（冷编分解）：同 sharc-update，只加计时不改参数。
+        check(OrionCreateRayTracingPipelineTimed(
+                  "gi-half",
+                  1u,
+                  &pci,
+                  getSharedPipelineCache(),
+                  &g_giHalfPipeline),
               "Failed to create GI half RT pipeline");
 
         for(uint32_t i = 0u; i < 6u; ++i)

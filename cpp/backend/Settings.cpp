@@ -292,6 +292,22 @@ float sparseSamplingRateEffective()
         return 0.0f;
     }
 
+    // 2026-11-02：A/B 专用直通开关。Remix 的 calculateSamplingRate 会按
+    // (参考像素数 / 实际 RT 输出像素数)^0.69 折算，小窗口/低内部分辨率下这个
+    // 系数能到十几倍 —— ORION_SPARSE_RATE=50 会被折成 >0.75 然后被下面的
+    // "rate > kMaxSamplingRate ⇒ 归 0" 直接关掉（实测 285x160 时 effective=0）。
+    // 做 A/B 时需要两臂拿到同一个确定的有效率，所以给一条跳过折算的路。
+    static const bool rawRate = []() {
+        const char* raw = std::getenv("ORION_SPARSE_RATE_RAW");
+        return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
+    }();
+    if(rawRate)
+    {
+        return std::min(
+            std::max(static_cast<float>(percent) * 0.01f, 1.0f / 16.0f),
+            0.75f);
+    }
+
     constexpr float kReferencePixelCount = 2227.0f * 1238.0f;
     constexpr float kSamplingRateResolutionExponent = 0.69f;
     constexpr float kMinSamplingRate = 1.0f / 16.0f;

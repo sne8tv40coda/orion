@@ -887,9 +887,15 @@ public final class EntityRtCapture {
             ActiveBatch proxyBatch = acquireBatch(textureSlot, true, false);
             activeBatch.set(proxyBatch);
             resolveBatchMotion(proxyBatch, submit);
+            handDiagLog("PROXY-PATH", submit, texture, textureSlot);
             return;
         }
         int textureSlot = slotFor(texture);
+        // 第一人称手部（手臂 + 手持物）的 state 是 Unit.INSTANCE，不是 AvatarRenderState，
+        // 所以这里不能按 state 类型过滤，只能按"第一人称"这个相机状态判断。
+        if (Minecraft.getInstance().options.getCameraType().isFirstPerson()) {
+            handDiagLog("SLOT-PATH", submit, texture, textureSlot);
+        }
         if (isDiagnosticFrame()
                 && submit.state() instanceof AvatarRenderState avatarState) {
             var player = Minecraft.getInstance().player;
@@ -976,6 +982,36 @@ public final class EntityRtCapture {
     private static boolean handBatchLogged;
     private static boolean vertexColorLogged;
     private static boolean handTextureSubstituted;
+
+    // 2026-11-03 手部诊断：第一人称手臂 / 手持物到底走哪条上传路径。
+    // 目的：区分"手臂走 proxy 路径（slot=128 皮肤纹理，mask 0x02 主射线不可见）"
+    // 与"手持物走 slotFor 普通路径（自己的贴图，mask 0xff 可见）"。
+    // 每 64 帧（isDiagnosticFrame）打印一次，一次运行就能定性。
+    private static long handDiagFrame = -1L;
+    private static int handDiagCount;
+
+    private static void handDiagLog(
+            String where,
+            ModelFeatureRenderer.Submit<?> submit,
+            Identifier texture,
+            int slot) {
+        if (!isDiagnosticFrame()) return;
+        if (handDiagFrame != captureFrameSerial) {
+            handDiagFrame = captureFrameSerial;
+            handDiagCount = 0;
+        }
+        // 一帧最多打 12 条，够看清手部由哪几个批次组成，又不会刷屏。
+        if (handDiagCount >= 12) return;
+        ++handDiagCount;
+        final Object state = submit.state();
+        System.err.println("[RTX-HANDDIAG] " + where
+                + " state=" + (state == null ? "null" : state.getClass().getSimpleName())
+                + " texture=" + texture
+                + " slot=" + slot
+                + " renderType=" + submit.renderType()
+                + " firstPerson="
+                + Minecraft.getInstance().options.getCameraType().isFirstPerson());
+    }
 
     /** 取小数部分并夹到 [0,1)：末地门合成 UV 用（顶点在整数角点上，见 captureVertex）。 */
     private static float fract01(float value) {

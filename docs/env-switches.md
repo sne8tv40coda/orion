@@ -89,7 +89,7 @@ Java 的 `-D` 传不进去（`build.gradle` 里的 `vmArg` 也到不了游戏 JV
 | `ORION_SHARC_PROBE` | 跟随 `ORION_SHARC` | 寻址探针（3 帧后回读判定，不改变可见像素） |
 | `ORION_SHARC_AB` | 关 | 同局内交替开/关 query，每 120 帧换臂，日志打 `[SHARC AB] arm=A/B` |
 | `ORION_SER_LADDER` | 关 | 同局内轮换 SER 档位（0/1/4/5/6），每 60 帧一档、300 帧一周期 |
-| `ORION_PERF_ABLATION` | 关 | 消融级联（`alt:3` / `alt:1,2,3,6,10,12` …），逐级关掉 GI / 光泽 / POM 采价格表。**档 17-31 是 2026-10-30 加的材质/非材质拆解档，语义与实测值见 `docs/decisions/rt-cost-attribution.md` §6；加新档必须同步 `PERF_L10_ABLATION_STAGE_COUNT`、两处 `% N`、以及 rgen 的 `perfL10Stage()` clamp 上限**（漏第三处会让新档被静默折成上限值，2026-10-30 已踩过一次） |
+| `ORION_PERF_ABLATION` | 关 | 消融级联（`alt:3` / `alt:1,2,3,6,10,12` …），逐级关掉 GI / 光泽 / POM 采价格表。**档 17-31 是 2026-10-30 加的材质/非材质拆解档，语义与实测值见 `docs/decisions/rt-cost-attribution.md` §6；档 34（voxelDdaGi，2026-11-01）= GI 射线强制走体素 DDA 的探针档，实测比 BVH 慢、体素化方向已终止（同文档 §7）**；加新档必须同步 `PERF_L10_ABLATION_STAGE_COUNT`、`Perf.cpp` 的 alt:/pin: 两处取模（现已改按 COUNT 取模）、以及 rgen 的 `perfL10Stage()` clamp 上限（漏第三处会让新档被静默折成上限值，2026-10-30 已踩过一次） |
 | `ORION_SECONDARY_MIP_BIAS` | `0`（**opt-in**） | 次级命中（非 `PRIMARY_SKY`）的 mip 偏移，写进 `CameraUBO.historyPadding0`，shader 侧 `pbrLod = min(pbrLod + bias, pbrMaxLod)`（不跨 sprite、不串色）。收益实测（`alt:0,27`，143 窗口）base 21.31 → 19.88，**Δ = 1.43 ms（6.7%）**。**但 2026-10-30 试过默认 2.0 后已撤回**：mip 是下采样平均，方块贴图的平均色亮于其暗部像素 ⇒ **室内/无光环境整体被抬亮**（法线同样被平均，光照响应也变），实机不可接受。需要这 1.43 ms 时自行设 `=1~3` |
 | `ORION_PERF_TIMESTAMPS` | 关 | GPU pass 时间戳 + CPU 帧间隔（`[PERF L10 GPU]` / `[PERF L10 CPU]`） |
 | `ORION_GI_NEAR_RATE` | `0` | 近场 GI 降速级：`0` 全速 / `1` 半速 / `2` 四分之一。跳过的是 GI **信号**（独立位 + 权重补偿，无偏时间估计量），像素照常每帧全写 ⇒ 不出锯齿；代价是 GI 方差按 2×/4× 放大，靠 DLSS-RR 抹平。距离 LOD（64 格以外）在此之前已经生效，两项相乘 |

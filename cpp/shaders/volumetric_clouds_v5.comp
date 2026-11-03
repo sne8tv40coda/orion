@@ -47,6 +47,11 @@ float hgPhase(float cosine, float g)
 #define SUN_SHADOW_CONSUMER 1
 #define SUN_SHADOW_PCF_TAPS_4 1
 #define SUN_SHADOW_FOG_UNION 1
+// 2026-11-03：与 rt_test.rgen:1221 同一处修复 —— sunShadowJitter() 默认用
+// cam.frameCount 做种子，于是雾里每个 march 步的阴影图采样偏移**逐帧随机**。
+// 体积雾没有自己的时域累积，日落/日出时 god ray 最强，表现为"雾里的暗带/
+// 光柱每帧抖"。改成只按 sampleIndex（= march 步）哈希：偏移恒定，不再逐帧变。
+#define SUN_SHADOW_FRAME_SEED 0
 #include "sun_shadow.glsl"
 
 #include "volumetric_fog.glsl"

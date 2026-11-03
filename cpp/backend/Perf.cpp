@@ -33,7 +33,7 @@ uint32_t perfL10AblationRequestedStage()
                 if(value >= 0)
                 {
                     g_perfL10AblationAltStages.push_back(
-                        static_cast<uint32_t>(value % 34));
+                        static_cast<uint32_t>(value % PERF_L10_ABLATION_STAGE_COUNT));
                 }
                 if(comma == std::string::npos)
                 {
@@ -53,7 +53,7 @@ uint32_t perfL10AblationRequestedStage()
         {
             return PERF_L10_ABLATION_SWEEP;
         }
-        return static_cast<uint32_t>(value % 34);
+        return static_cast<uint32_t>(value % PERF_L10_ABLATION_STAGE_COUNT);
     }();
     return request;
 }

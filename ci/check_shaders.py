@@ -45,6 +45,9 @@ VARIANTS = {
     'rt_test_ser.rmiss.spv': ('rt_test.rmiss', ['-DRT_ENABLE_SER']),
     'rt_test_sharc_update.rgen.spv': ('rt_test.rgen', ['-DSHARC_UPDATE=1']),
     'rt_test_pomdeferred.rchit.spv': ('rt_test.rchit', ['-DPOM_DEFERRED_ONLY=1']),
+    # 2026-11-02：玻璃解析半侧的加回与 rt_test.rgen 的拆分必须同一个宏值。
+    'rr_sdr_post.comp.spv': ('rr_sdr_post.comp', ['-DRR_STABLE_GLASS_RADIANCE=1']),
+    'rr_hdr_encode.comp.spv': ('rr_hdr_encode.comp', ['-DRR_STABLE_GLASS_RADIANCE=1']),
 }
 
 TARGET_ENVS = ('vulkan1.2', 'vulkan1.4')
