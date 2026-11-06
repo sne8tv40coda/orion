@@ -392,7 +392,8 @@ void createCameraUBO() {
     // 2026-11-02 屏幕空间降级链（SSR + SSPT）：出厂关闭
     ubo->ssHybridParams[0] = 0.0f;
     ubo->ssHybridParams[1] = 0.0f;
-    ubo->ssHybridParams[2] = 0.0f;
+    // z = RT 光泽射线开关，出厂**开**（1），与 g_ssRtGlossy 的初值一致
+    ubo->ssHybridParams[2] = 1.0f;
     ubo->ssHybridParams[3] = 0.0f;
 
     ubo->giRayParams[0] = 0.0f;

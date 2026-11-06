@@ -140,6 +140,25 @@ int giNearRateLevel()
     return cached;
 }
 
+// ORION_GI_TEMPORAL：GI 第一反弹时域重投影（A1）。2026-11-05 默认改**关**：
+// K1/K2 拆分实测下它是噪点源（开=静止不收敛+运动扭曲，关=干净，A/B 定案），
+// 且用户当前不需要任何时域复用。1 = 开（rgen 走 EMA 历史路径）。
+// 关 = rgen 走逐位旧路径：交错补偿 + 跳过帧 indirectLight=0。
+bool giTemporalEnabled()
+{
+    static const bool cached = []()
+    {
+        const char* raw = std::getenv("ORION_GI_TEMPORAL");
+        if(raw == nullptr || raw[0] == '\0')
+        {
+            return false;
+        }
+        return raw[0] != '0';
+    }();
+
+    return cached;
+}
+
 // ORION_GLOSSY_ROUGH_LOD：光泽反射按粗糙度降速（半速/四分之一），见
 // rt_test.rgen 的 glossySampleLevel 处注释。默认关 = 逐位旧行为。
 bool glossyRoughLodEnabled()
@@ -265,6 +284,34 @@ bool giHalfEnabled()
     {
         const char* raw = std::getenv("ORION_GI_HALF");
         return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
+    }();
+
+    return cached;
+}
+
+// 2026-11-05 B：K1(主视线)/K2(传输) 两发拆分。
+// 2026-11-06 落盘为默认开（实测 trace 7.74→6.12ms，视觉验证通过）；
+// ORION_K1_K2=0 仅作紧急回退口，正常启动无需任何 env。
+bool k1k2SplitEnabled()
+{
+    static const bool cached = []()
+    {
+        const char* raw = std::getenv("ORION_K1_K2");
+        return raw == nullptr || raw[0] == '\0' || raw[0] != '0';
+    }();
+
+    return cached;
+}
+
+// ③ K2 传输段再拆分：K1→K2D(直射级)→K2I(间接级) 三发。
+// 2026-11-06 落盘为默认开（叠加 SER 恢复后 trace 稳态 5.62ms，GPU 帧 8.41ms）；
+// ORION_K2_SPLIT=0 仅作紧急回退口，正常启动无需任何 env。
+bool k2DirectIndirectSplitEnabled()
+{
+    static const bool cached = []()
+    {
+        const char* raw = std::getenv("ORION_K2_SPLIT");
+        return raw == nullptr || raw[0] == '\0' || raw[0] != '0';
     }();
 
     return cached;
@@ -577,7 +624,8 @@ void populateGalaxyParams(float* params)
 //   [1]   临时太阳遮挡调试视图（2026-10-14，靠 godray_debug_vis.flag 开启）
 //   [2]   保留，写 0（2026-10-06 前的雾内自阴影步数，随设置删除）
 //   [3]   强度 g_godRayIntensity（设置界面「体积光强度」，默认 1.0 = 标定档）
-//   [4..7] 由 populateGroundMistParams() 写（旧档贴地薄雾，已退役，无消费者）
+//   [4..7] 由 populateGroundMistParams() 写（贴地薄雾，2026-11-04 shader 侧复活，
+//          消费方 volumetric_fog.glsl；出厂值 enabled/1.0/0.15/48.0）
 //   [8]   视线 march 步数 g_godRaySteps
 //   [9]   云影 march 采样数 g_godRayOcclusionSamples
 //   [10]  保留，写 0（2026-10-06 前的雾内自阴影标定，随设置删除）
@@ -924,13 +972,23 @@ float vramEvictKeepRadius()
 
         if(raw == nullptr || raw[0] == '\0')
         {
-            return 96.0f;
+            // 2026-11-06p?96 -> 288?
+            //
+            // ???16 ???? = 256 ???over ? keep = 96*0.75 = 72?
+            // ???? = 72*1.25 = 90????? = 72???? 90~256 ?????
+            // Section ???? BLAS???????? 72 -> ??????
+            // ???nonResident=2665 / secEvicted=3004 / secRehydrated=230?
+            // meshSec=6682 ? blas=4447?? 2235?= "??????????"?
+            //
+            // 288 ? over ? keep=216???=270???=216??? 54 ?????
+            // ????????????????????????
+            return 288.0f;
         }
 
         const double parsed = std::atof(raw);
         return (parsed >= 16.0 && parsed <= 512.0)
             ? static_cast<float>(parsed)
-            : 96.0f;
+            : 288.0f;
     }();
 
     return cached;
@@ -965,13 +1023,15 @@ size_t vramRehydratePerPass()
 
         if(raw == nullptr || raw[0] == '\0')
         {
-            return 16u;
+            // 2026-11-06p?16 -> 64???????????16/? ????????
+            // ????"?????"?64/? ??????????? BLAS??
+            return 64u;
         }
 
         const long parsed = std::atol(raw);
         return (parsed > 0 && parsed <= 4096)
             ? static_cast<size_t>(parsed)
-            : 16u;
+            : 64u;
     }();
 
     return cached;

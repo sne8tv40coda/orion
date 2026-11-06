@@ -169,6 +169,30 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_cleanup(JNIEnv*,jcla
         g_giHalfNeedsClear = false;
         destroyGiHalfPipeline();
 
+        // ③ K2-D→K2-I 直射级交接图（binding 89）
+        destroyK2DirectImage();
+
+        // 2026-11-04 A1：GI 时域历史。
+        for(uint32_t i = 0u; i < 2u; ++i)
+        {
+            if(g_giTemporalHistoryImages[i] != VK_NULL_HANDLE)
+            {
+                destroyHistoryImage(
+                    g_giTemporalHistoryImages[i],
+                    g_giTemporalHistoryMemories[i],
+                    g_giTemporalHistoryViews[i],
+                    g_giTemporalHistoryLayouts[i]
+                );
+            }
+        }
+        g_giTemporalHistoryWidth = 0u;
+        g_giTemporalHistoryHeight = 0u;
+        g_giTemporalHistoryNeedsClear = false;
+
+        // 2026-11-05 B：K1/K2 拆分资源
+        destroyK1LandingBuffer();
+        destroyK1K2Pipeline();
+
 
         if(g_rrStableRadianceSampler != VK_NULL_HANDLE)
         {

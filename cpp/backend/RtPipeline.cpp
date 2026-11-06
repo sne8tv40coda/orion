@@ -202,7 +202,7 @@ PERF_L10_TIME_STALL("tlasQueueIdle", check(
 << "[RT INIT] TLAS BUILD COMPLETE\n";
 }
 VkDescriptorSetLayout createRTDescriptorSetLayout(){
-    VkDescriptorSetLayoutBinding b[86]{};
+    VkDescriptorSetLayoutBinding b[90]{};
 
     b[0].binding=0; b[0].descriptorType=VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR; b[0].descriptorCount=1; b[0].stageFlags=VK_SHADER_STAGE_RAYGEN_BIT_KHR|VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
     b[1].binding=1; b[1].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; b[1].descriptorCount=1; b[1].stageFlags=VK_SHADER_STAGE_RAYGEN_BIT_KHR|VK_SHADER_STAGE_COMPUTE_BIT;
@@ -731,9 +731,41 @@ VkDescriptorSetLayout createRTDescriptorSetLayout(){
     b[85].descriptorCount = 1;
     b[85].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
+    // 2026-11-04 A1：GI 第一反弹时域重投影历史 ping-pong（rgen_gi_temporal.glsl）。
+    b[86].binding = 86;
+    b[86].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    b[86].descriptorCount = 1;
+    b[86].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+
+    b[87].binding = 87;
+    b[87].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    b[87].descriptorCount = 1;
+    b[87].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+
+    // 2026-11-05 B：K1/K2 landing 平面（rgen_k1_landing.glsl）。
+    // 主变体不着色器访问它，但共享 pipeline layout 必须声明；K1 写 / K2 读。
+    b[88].binding = 88;
+    b[88].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    b[88].descriptorCount = 1;
+    b[88].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+
+    // ③ K2-D/K2-I 直射级交接图（rgba32f）。仅拆分变体的 spv 声明它；K1/主变体
+    // 不访问，但共享 pipeline layout 必须声明（描述符未绑定时拆分管线不会用它）。
+    b[89].binding = 89;
+    b[89].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    b[89].descriptorCount = 1;
+    b[89].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+
+    // D1：材质 callable 也读这套描述符（landing 槽位回传）。stageFlags 不参与
+    // 管线布局兼容性判定，全量放行不影响既有管线（spv 无 callable 阶段照常工作）。
+    for(auto& entry : b)
+    {
+        entry.stageFlags |= VK_SHADER_STAGE_CALLABLE_BIT_KHR;
+    }
+
     VkDescriptorSetLayoutCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     static_assert(
-        sizeof(b) / sizeof(b[0]) == 86u,
+        sizeof(b) / sizeof(b[0]) == 90u,
         "RT descriptor set layout: update this assert together with b[]"
     );
     ci.bindingCount = static_cast<uint32_t>(sizeof(b) / sizeof(b[0]));

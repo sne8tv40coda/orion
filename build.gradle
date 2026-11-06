@@ -41,6 +41,15 @@ loom {
 			//   rtxSectionFastFill → 全空气段跳过逐体素分类，直接发全 0
 			vmArg "-Drtx.diag.sectionPalette=${project.findProperty('rtxDiagPalette') ?: 'false'}"
 			vmArg "-Drtx.sectionFastFill=${project.findProperty('rtxSectionFastFill') ?: 'false'}"
+			// 2026-11-04：确定性抓帧（ci/capture_regression.py）靠固定相机路径复现输入，
+			// 而 CameraPathDriver 读的是 JVM 系统属性 —— gradlew 的 -D 只到 daemon，
+			// 到不了 fork 出去的游戏进程。这里把 Gradle 项目属性（-P）桥接进去：
+			//   gradlew runClient -PcampathPlay=bench1 -PcampathHz=60
+			// 不传时为空串/0，CameraPathDriver 判定为未启用，行为与之前一致。
+			vmArg "-Dorion.campath.play=${project.findProperty('campathPlay') ?: ''}"
+			vmArg "-Dorion.campath.record=${project.findProperty('campathRecord') ?: ''}"
+			vmArg "-Dorion.campath.record.frames=${project.findProperty('campathRecordFrames') ?: '0'}"
+			vmArg "-Dorion.campath.fixedStepHz=${project.findProperty('campathHz') ?: '0'}"
 			// 2026-10-22 审查 ② 的 A/B 档位由**环境变量**控制（原生侧用 getenv 读，
 			// 不是系统属性；Loom 的 RunConfigSettings 也没有 environment() 方法）。
 			//   1（默认）→ 邻域查找走 g_vliPageDirect 指针表 + 脏键全量最近优先

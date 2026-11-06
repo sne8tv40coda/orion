@@ -81,7 +81,8 @@ public abstract class VulkanCommandEncoderMixin {
             RenderPassDescriptor descriptor,
             CallbackInfoReturnable<RenderPassBackend> cir
     ) {
-        if (!NativeVulkan.guiRtPending ||
+        if (!NativeVulkan.rtActive ||
+                !NativeVulkan.guiRtPending ||
                 NativeVulkan.rtInjectedToMainTarget ||
                 currentCommandBuffer == null) {
 

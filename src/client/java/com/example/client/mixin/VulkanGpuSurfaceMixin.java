@@ -315,7 +315,9 @@ public abstract class VulkanGpuSurfaceMixin {
             long commandBuffer =
                     NativeVulkan.currentCommandBuffer;
 
-            if (commandBuffer == 0 || swapchainImage == 0) {
+            if (!NativeVulkan.rtActive
+                    || commandBuffer == 0
+                    || swapchainImage == 0) {
                 return;
             }
 

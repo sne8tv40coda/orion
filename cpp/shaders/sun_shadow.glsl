@@ -137,7 +137,14 @@ float sunShadowTraceDepth(vec3 origin, vec3 sunDirection, float maxDistance)
 }
 #endif
 #ifndef SUN_SHADOW_FRAME_SEED
-#define SUN_SHADOW_FRAME_SEED cam.frameCount
+// 兜底默认值：逐帧相位会让阴影终止线的可见性每帧在 0/0.25/0.5… 之间跳，
+// RR 在高对比处会 clamp 掉历史 ⇒ 静止时噪带累积。定成 0 后偏移只按 sampleIndex
+// 哈希，是固定的几个方向。
+// 注意：真正生效的是**消费端**在 include 之前写的定义 ——
+// rt_test.rgen:1233 已经 `#define SUN_SHADOW_FRAME_SEED 0`，所以这个兜底对
+// 主射线那条路不参与编译（改它不会改变 rt_test.rgen 的产物字节）。
+// A/B：-DSUN_SHADOW_FRAME_SEED=cam.frameCount 回到逐帧抖动（需两端一致）。
+#define SUN_SHADOW_FRAME_SEED 0
 #endif
 vec2 sunShadowJitter(int sampleIndex)
 {

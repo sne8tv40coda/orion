@@ -150,6 +150,13 @@ public final class NativeVulkan {
      * 抬到 12（判据本身在 ss_hybrid.comp 里逐像素成立）。
      */
     public static native boolean setSSRRange(float chunks);
+    /**
+     * 2026-11-03 RT 光泽射线总开关，写进 CameraUBO.ssHybridParams.z。
+     * false = rgen 整段跳过 GGX 反射射线，镜面交给 SSR（>12 区块）/ SSPT（射程内）
+     * ⇒ 省下一条逐像素反射射线；代价是屏幕外/射程外的镜面只剩环境底。
+     * 出厂 true（旧行为）。
+     */
+    public static native boolean setRTGlossyEnabled(boolean enabled);
     public static native boolean uploadVoxyLodAtlas(byte[] pixels, int size, int mipLevels);
 
     public static native void updateAtlas(long imageView, long sampler);
@@ -657,6 +664,13 @@ public final class NativeVulkan {
      * 那三项自 2026-10-19 体积雾重做后已无着色器消费者）。JNI 符号与数组长度不变。
      */
     public static native boolean setFogExtrasParams(float[] params);
+
+    /**
+     * 2026-11-04：贴地薄雾四车道（CameraUBO.godRayParams[4..7]）。
+     * params = {enabled(0/1), 层厚标尺, 浓度, 距相机淡出半径(格)}。
+     * 消费方 volumetric_fog.glsl：层厚 ×6 = e 折叠格数，浓度 ×0.05 = 每格消光。
+     */
+    public static native boolean setFogGroundMistParams(float[] params);
 
     /**
  * 2026-10-10 **#3 天光自遮挡 / #4 时域速度抑制**
@@ -1228,6 +1242,14 @@ public final class NativeVulkan {
         );
     }
 
+    /**
+     * RT 后端是否激活。由 VulkanBackendMixin 在 createDevice 期间探测写入：
+     * 设备缺少 acceleration structure / ray tracing pipeline / buffer device
+     * address 任一项时为 false，此时所有 native 入口都必须早退，让宿主按
+     * 原版 Vulkan 渲染。默认 true 保持"未探测时行为不变"。
+     */
+    public static volatile boolean rtActive = true;
+
     public static long currentSwapchainImage = 0;
     public static long currentCommandBuffer = 0;
 
@@ -1533,6 +1555,15 @@ public final class NativeVulkan {
             int queueFamily
     )
     {
+        if (!rtActive) {
+            System.err.println(
+                    "[NativeVulkan] RT backend inactive on this device — "
+                            + "native handle init skipped (vanilla Vulkan path)."
+            );
+
+            return;
+        }
+
         if (!deviceInitEnabled()) {
             System.err.println(
                     "[NativeVulkan] device init DISABLED by "
@@ -1543,13 +1574,7 @@ public final class NativeVulkan {
             return;
         }
 
-        System.err.println(
-                "[JAVA TEST] initDeviceHandles ENTER"
-        );
 
-        System.err.println(
-                "[JAVA TEST] Calling initDeviceHandlesNative"
-        );
 
         setSerEnabledNative(
                 RTXSettingsConfig.isSerEnabled()
@@ -1850,6 +1875,11 @@ public final class NativeVulkan {
         )) {
             System.err.println("[RTX CONFIG] Failed to restore SSR range");
         }
+        if(!setRTGlossyEnabled(
+                RTXSettingsConfig.isRTGlossyEnabled()
+        )) {
+            System.err.println("[RTX CONFIG] Failed to restore RT glossy switch");
+        }
         if(!setCloudSunReddening(
                 RTXSettingsConfig.getCloudSunReddening()
         )) {
@@ -2072,6 +2102,10 @@ public final class NativeVulkan {
         RTXSettingsConfig.FogExtrasSettings fogExtras = RTXSettingsConfig.getFogExtrasSettings();
         if(!setFogExtrasParams(fogExtras.toParamArray()))
             System.err.println("[RTX CONFIG] Failed to restore fog extras settings");
+        RTXSettingsConfig.FogGroundMistSettings fogGroundMist =
+                RTXSettingsConfig.getFogGroundMistSettings();
+        if(!setFogGroundMistParams(fogGroundMist.toParamArray()))
+            System.err.println("[RTX CONFIG] Failed to restore fog ground mist settings");
         RTXSettingsConfig.CloudAerialSettings cloudAerial =
                 RTXSettingsConfig.getCloudAerialSettings();
         if(!setCloudAerialParams(cloudAerial.toParamArray()))

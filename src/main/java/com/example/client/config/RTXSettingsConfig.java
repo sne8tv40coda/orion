@@ -204,6 +204,12 @@ public final class RTXSettingsConfig {
     private static float ssptRange = 0.0f;
     private static float ssrRange = 0.0f;
 
+    // 2026-11-03：RT 光泽射线总开关（出厂 true = 保持旧行为）。
+    // 关掉后 rgen 整段跳过 GGX 反射射线，镜面完全交给 SSR（>12 区块）/
+    // SSPT（射程内）—— 这是"仅 SSPT + RTAO"配置的入口，也是唯一能真正
+    // 省下镜面射线成本的开关。
+    private static boolean rtGlossyEnabled = true;
+
 
     private static float cloudSunReddening =
             0.0f;
@@ -982,6 +988,41 @@ public final class RTXSettingsConfig {
     // 2026-10-31：「雨天地面雾浪」（FogWispSettings / setFogWispParams）整链删除。
     // 用户实测该效果基本不可见，着色器侧（volumetric_fog.glsl）与 JNI 入口已同步移除；
     // UBO 车道 cloudParams4.y/.z/.w + cloudParams9.w 保留为 0，布局不动。
+
+    // 2026-11-04：贴地薄雾设置链复活（godRayParams1 四车道，消费方 volumetric_fog.glsl）。
+    //   height     = 层厚标尺（shader ×6 = e 折叠格数）
+    //   extinction = 浓度（shader ×0.05 = 每格消光；0.15 ≈ 满雨雾的 2 倍）
+    //   distance   = 距相机淡出半径（格）
+    // 拂晓/黄昏触发曲线在 shader 内硬编码（太阳仰角 [-0.12, 0.30] 钟形）。
+    public record FogGroundMistSettings(
+            boolean enabled,
+            float height,
+            float extinction,
+            float distance) {
+        public FogGroundMistSettings {
+            if(!Float.isFinite(height) || height < 0.25f || height > 8.0f ||
+               !Float.isFinite(extinction) || extinction < 0.0f || extinction > 1.0f ||
+               !Float.isFinite(distance) || distance < 8.0f || distance > 96.0f)
+                throw new IllegalArgumentException("Invalid fog ground mist settings");
+        }
+
+        public float[] toParamArray() {
+            return new float[] {
+                    enabled ? 1.0f : 0.0f,
+                    height,
+                    extinction,
+                    distance };
+        }
+    }
+    private static FogGroundMistSettings fogGroundMistSettings = new FogGroundMistSettings(
+            true, 1.0f, 0.15f, 48.0f);
+    public static synchronized FogGroundMistSettings getFogGroundMistSettings() {
+        return fogGroundMistSettings;
+    }
+    public static synchronized void setFogGroundMistSettings(FogGroundMistSettings settings) {
+        fogGroundMistSettings = java.util.Objects.requireNonNull(settings);
+        markDirty();
+    }
 
  // 2026-10-10 **#3 天光自遮挡 / #4 时域速度抑制**
     //（CameraUBO.cloudTemporalParams，偏移 1392）。三项**出厂 0 = 关 ⇒ 逐位旧档**。
@@ -2475,6 +2516,18 @@ public final class RTXSettingsConfig {
         }
     }
 
+    public static synchronized boolean isRTGlossyEnabled() {
+        return rtGlossyEnabled;
+    }
+
+    /** RT 光泽射线总开关。false = 镜面交给 SSR（远场）/ SSPT（射程内）。 */
+    public static synchronized void setRTGlossyEnabled(boolean value) {
+        if(rtGlossyEnabled != value) {
+            rtGlossyEnabled = value;
+            markDirty();
+        }
+    }
+
     public static synchronized float getAuroraFlowSpeed() {
         return auroraFlowSpeed;
     }
@@ -3229,6 +3282,13 @@ public final class RTXSettingsConfig {
                 ssrRange = 12.0f;
             }
 
+            // 2026-11-03：RT 光泽射线开关，缺省 = 开（旧行为）
+            if(data.rtGlossyEnabled != null) {
+                rtGlossyEnabled = data.rtGlossyEnabled;
+            } else {
+                rtGlossyEnabled = true;
+            }
+
             cloudSunForwardScattering =
                     validCloudSetting(data.cloudSunForwardScattering, 1.0f, 0.0f, 1.0f, 0.05f);
 
@@ -3310,6 +3370,14 @@ public final class RTXSettingsConfig {
                         validCloudSetting(data.fogGroundAnchorStrength, 1.0f, 0, 1, 0.05f),
                         validCloudSetting(data.fogSkyAmbientStrength, 1.0f, 0, 1, 0.05f),
                         validCloudSetting(data.fogTemporalJitterStrength, 1.0f, 0, 1, 0.05f));
+                fogGroundMistSettings = new FogGroundMistSettings(
+                        data.fogGroundMistEnabled == null || data.fogGroundMistEnabled,
+                        validCloudSetting(data.fogGroundMistHeight,
+                                fogGroundMistSettings.height(), 0.25f, 8.0f, 0.25f),
+                        validCloudSetting(data.fogGroundMistExtinction,
+                                fogGroundMistSettings.extinction(), 0.0f, 1.0f, 0.05f),
+                        validCloudSetting(data.fogGroundMistDistance,
+                                fogGroundMistSettings.distance(), 8.0f, 96.0f, 2.0f));
                 cloudTemporalSettings = new CloudTemporalSettings(
                         validCloudSetting(data.cloudSkyVisibilityStrength, 0.0f, 0, 1, 0.05f),
                         validCloudSetting(data.cloudSkyVisibilitySteps, 0.0f, 0, 32, 1.0f),
@@ -3877,6 +3945,7 @@ public final class RTXSettingsConfig {
             data.auroraFlowSpeed = auroraFlowSpeed;
             data.ssptRange = ssptRange;
             data.ssrRange = ssrRange;
+            data.rtGlossyEnabled = rtGlossyEnabled;
 
             data.cloudModelVersion = CLOUD_MODEL_VERSION;
             data.waterWaveVersion = WATER_WAVE_VERSION;
@@ -3941,6 +4010,10 @@ public final class RTXSettingsConfig {
             data.fogGroundAnchorStrength = fogExtrasSettings.groundAnchorStrength();
             data.fogSkyAmbientStrength = fogExtrasSettings.skyAmbientStrength();
             data.fogTemporalJitterStrength = fogExtrasSettings.temporalJitterStrength();
+            data.fogGroundMistEnabled = fogGroundMistSettings.enabled();
+            data.fogGroundMistHeight = fogGroundMistSettings.height();
+            data.fogGroundMistExtinction = fogGroundMistSettings.extinction();
+            data.fogGroundMistDistance = fogGroundMistSettings.distance();
             data.cloudSkyVisibilityStrength = cloudTemporalSettings.skyVisibilityStrength();
             data.cloudSkyVisibilitySteps = cloudTemporalSettings.skyVisibilitySteps();
             data.cloudTemporalDampStrength = cloudTemporalSettings.temporalDampStrength();
@@ -4267,6 +4340,8 @@ public final class RTXSettingsConfig {
         // 2026-11-02 屏幕空间降级链（区块；0 = 关）
         Float ssptRange;
         Float ssrRange;
+        // 2026-11-03 RT 光泽射线总开关（null = 缺省开）
+        Boolean rtGlossyEnabled;
 
         Integer cloudModelVersion;
         Integer waterWaveVersion;

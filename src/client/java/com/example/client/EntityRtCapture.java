@@ -885,6 +885,9 @@ public final class EntityRtCapture {
             int textureSlot = MAX_TEXTURE_SLOTS;
             publishTexture(textureSlot, texture);
             ActiveBatch proxyBatch = acquireBatch(textureSlot, true, false);
+            proxyBatch.diagHand = false;
+            // 2026-11-04：Submit 这个 record 自带 uvMapping（ModelPart 0..1 → 图集矩形）。
+            proxyBatch.uvMapping = submit.uvMapping();
             activeBatch.set(proxyBatch);
             resolveBatchMotion(proxyBatch, submit);
             handDiagLog("PROXY-PATH", submit, texture, textureSlot);
@@ -893,7 +896,8 @@ public final class EntityRtCapture {
         int textureSlot = slotFor(texture);
         // 第一人称手部（手臂 + 手持物）的 state 是 Unit.INSTANCE，不是 AvatarRenderState，
         // 所以这里不能按 state 类型过滤，只能按"第一人称"这个相机状态判断。
-        if (Minecraft.getInstance().options.getCameraType().isFirstPerson()) {
+        final boolean handBatch = isFirstPersonHandState(submit);
+        if (handBatch) {
             handDiagLog("SLOT-PATH", submit, texture, textureSlot);
         }
         if (isDiagnosticFrame()
@@ -907,6 +911,19 @@ public final class EntityRtCapture {
         }
         if (textureSlot != 0) {
             ActiveBatch batch = acquireBatch(textureSlot, localPlayerProxy, false);
+            batch.diagHand = handBatch;
+            // 2026-11-04：见 ActivaBatch.uvMapping 处的说明。
+            batch.uvMapping = submit.uvMapping();
+            // 2026-11-04：旗帜图案层沿法线外移固定两步。
+            // 依据实测（[RTX-BANNER]）：batch 内 hits=0 ⇒ 没有重复质心，
+            // 所以 rank 就等于这里给的 boost，不会被 seenBefore 干扰。
+            final boolean bannerBoost = isBannerPattern(submit.renderType());
+            batch.coplanarLayerBoost = bannerBoost ? 2 : 0;
+            if (bannerBoost) {
+                customDiagLog("banner_boost2",
+                        renderTypeName(submit.renderType()), texture);
+            }
+            // 旗帜图案层整体外移一个 rank（见 bannerLayerBoost）。
             activeBatch.set(batch);
             resolveBatchMotion(batch, submit);
         }
@@ -1013,6 +1030,17 @@ public final class EntityRtCapture {
                 + Minecraft.getInstance().options.getCameraType().isFirstPerson());
     }
 
+    /**
+     * 2026-11-03：第一人称手部批次的判据。26.3 的手臂/手持物走
+     * {@code submitModelPart}，state 是 {@code Unit.INSTANCE}（不是 AvatarRenderState），
+     * 所以只能按类名判。
+     */
+    private static boolean isFirstPersonHandState(ModelFeatureRenderer.Submit<?> submit) {
+        if (!Minecraft.getInstance().options.getCameraType().isFirstPerson()) return false;
+        final Object state = submit.state();
+        return state != null && "Unit".equals(state.getClass().getSimpleName());
+    }
+
     /** 取小数部分并夹到 [0,1)：末地门合成 UV 用（顶点在整数角点上，见 captureVertex）。 */
     private static float fract01(float value) {
         final float f = value - (float) Math.floor(value);
@@ -1035,9 +1063,65 @@ public final class EntityRtCapture {
             0.0f, 0.0f, 0.0f, 1.0f
     };
 
+    // =====================================================
+    // 2026-11-03 手部 MV：上一帧的相机状态。
+    //
+    // 手部几何是"相机相对"的（GameRenderer.renderItemInHand 已把
+    // viewRotationMatrix.invert() 乘进 PoseStack），所以它每帧的世界位置变化
+    // 完全由相机状态决定：
+    //     p_prev = R_prev·R_cur⁻¹·p_cur + (pos_prev − R_prev·R_cur⁻¹·pos_cur)
+    // 这两个 setter 每帧各调一次（VulkanCameraMixin:300-303），所以在写入本帧值
+    // 之前把旧值存下来，就得到干净的上一帧。
+    // =====================================================
+    private static final float[] prevHandRotation = new float[] {
+            1.0f, 0.0f, 0.0f, 0.0f,
+            0.0f, 1.0f, 0.0f, 0.0f,
+            0.0f, 0.0f, 1.0f, 0.0f,
+            0.0f, 0.0f, 0.0f, 1.0f
+    };
+    private static final float[] handMotionMatrix = new float[9];
+    private static float prevCameraWorldX;
+    private static float prevCameraWorldY;
+    private static float prevCameraWorldZ;
+    private static boolean prevCameraRotationValid;
+    private static boolean cameraRotationSeen;
+
+    /** A/B 开关：-DORION_HAND_CAMERA_MV=0 关掉手部相机相对 MV。 */
+    private static final boolean HAND_CAMERA_MV = resolveHandCameraMv();
+
+    private static boolean resolveHandCameraMv() {
+        String raw = System.getProperty("orion.handCameraMv");
+        if (raw == null) raw = System.getenv("ORION_HAND_CAMERA_MV");
+        return raw == null || !"0".equalsIgnoreCase(raw.trim());
+    }
+
+    /**
+     * 2026-11-04：UV 重映射**默认开启**（结论修正）。
+     *
+     * 实测三种状态的差别正好卡在"映射几次"上：
+     *   关闭   ⇒ UV = ModelPart 0..1 ⇒ 落在图集透明区 ⇒ cutout 整片丢弃 ⇒ **完全没有图案**
+     *             （用户观察：底色对、图案消失）
+     *   一次   ⇒ 落在图案 sprite 上 ⇒ 正确
+     *   两次   ⇒ 压到 sprite 一角 ⇒ 错乱
+     * 所以 captureVertex 里那一次是**必要的**，上一轮"双重映射"的判断是错的。
+     *
+     * A/B：-DORION_ENTITY_UV_REMAP=0 关闭（复现"没有图案"）。
+     */
+    private static final boolean UV_REMAP_ENABLED = resolveUvRemapEnabled();
+
+    private static boolean resolveUvRemapEnabled() {
+        String raw = System.getProperty("orion.entityUvRemap");
+        if (raw == null) raw = System.getenv("ORION_ENTITY_UV_REMAP");
+        if (raw == null) return true;
+        return !"0".equalsIgnoreCase(raw.trim());
+    }
+
     public static void setHandRotation(float[] columnMajor) {
         if (columnMajor == null || columnMajor.length < 16) return;
+        System.arraycopy(handRotation, 0, prevHandRotation, 0, 16);
         System.arraycopy(columnMajor, 0, handRotation, 0, 16);
+        prevCameraRotationValid = cameraRotationSeen;
+        cameraRotationSeen = true;
     }
 
     
@@ -1047,6 +1131,9 @@ public final class EntityRtCapture {
     private static float cameraWorldZ;
 
     public static void setCameraOrigin(float x, float y, float z) {
+        prevCameraWorldX = cameraWorldX;
+        prevCameraWorldY = cameraWorldY;
+        prevCameraWorldZ = cameraWorldZ;
         cameraWorldX = x;
         cameraWorldY = y;
         cameraWorldZ = z;
@@ -1065,6 +1152,58 @@ public final class EntityRtCapture {
                         + " label=" + endPortalLabel);
             }
         }
+        // =====================================================
+        // 2026-11-03：第一人称手部（手臂 + 手持物）的运动矢量。
+        //
+        // resolveBatchMotion 对手臂直接 return（它的 state 是 Unit，不是
+        // EntityRenderState），手持物走 custom 路径压根不调那个函数 ⇒ 两条路径
+        // 都拿不到 motion ⇒ MV 恒为 0。
+        //
+        // 而手部是"相机相对"的：转视角/走动时它的世界位置每帧都在变。MV=0 等于告诉
+        // DLSS"这个表面相对世界静止"，DLSS 于是按相机运动去重投影它 —— 但手明明
+        // 没跟着动，重投影落到错误位置，表现为闪动 + 鬼影。
+        //
+        // 这里用相机矩阵直接构造 poseDelta（3×4 行主序，p_prev = M·p_cur + t）：
+        //     M = R_prev·R_cur⁻¹      t = pos_prev − M·pos_cur
+        // handRotation 存的是相机旋转的**逆**（column-major），所以 R = (R⁻¹)ᵀ，
+        // 即 R_ij = inv[i*4+j]。
+        // A/B：-DORION_HAND_CAMERA_MV=0 关闭。
+        // =====================================================
+        if (HAND_CAMERA_MV && batch.diagHand && !batch.hasPoseDelta
+                && prevCameraRotationValid) {
+            final float[] hp = prevHandRotation;
+            final float[] hc = handRotation;
+            final float[] m = handMotionMatrix;
+            for (int i = 0; i < 3; ++i) {
+                for (int j = 0; j < 3; ++j) {
+                    float sum = 0.0f;
+                    for (int k = 0; k < 3; ++k) {
+                        sum += hp[i * 4 + k] * hc[j * 4 + k];
+                    }
+                    m[i * 3 + j] = sum;
+                }
+            }
+            final float tx = prevCameraWorldX
+                    - (m[0] * cameraWorldX + m[1] * cameraWorldY + m[2] * cameraWorldZ);
+            final float ty = prevCameraWorldY
+                    - (m[3] * cameraWorldX + m[4] * cameraWorldY + m[5] * cameraWorldZ);
+            final float tz = prevCameraWorldZ
+                    - (m[6] * cameraWorldX + m[7] * cameraWorldY + m[8] * cameraWorldZ);
+            batch.poseDelta[0] = m[0];
+            batch.poseDelta[1] = m[1];
+            batch.poseDelta[2] = m[2];
+            batch.poseDelta[3] = tx;
+            batch.poseDelta[4] = m[3];
+            batch.poseDelta[5] = m[4];
+            batch.poseDelta[6] = m[5];
+            batch.poseDelta[7] = ty;
+            batch.poseDelta[8] = m[6];
+            batch.poseDelta[9] = m[7];
+            batch.poseDelta[10] = m[8];
+            batch.poseDelta[11] = tz;
+            batch.hasPoseDelta = true;
+        }
+
         long motionPointer = 0L;
         if (batch.vertexCount > 0) {
             final int motionFloats = batch.vertexCount * 3;
@@ -1115,6 +1254,76 @@ public final class EntityRtCapture {
             }
         }
 
+        // 2026-11-04 诊断：旗帜批次的几何事实。
+        // 要回答三个问题：
+        //   1) 底布与图案层各自的顶点数（能否对上"同一面旗帜的几层"）；
+        //   2) applyCoplanarLayerOffset 到底有没有命中（coplanarHits=0 ⇒ 共面判定从未触发）；
+        //   3) 一次都没触发的话，说明各层质心并不重合 ⇒ 沿法线外移这条路从一开始就不成立。
+        if (isDiagnosticFrame() && batch.textureSlot >= 1
+                && batch.textureSlot <= MAX_TEXTURE_SLOTS) {
+            final String bannerLabel = frameTextureLabels[batch.textureSlot - 1];
+            if (bannerLabel != null && bannerLabel.contains("banner") && batch.vertexCount > 0) {
+                // 2026-11-04：打印**整批的 UV 范围**（不是首顶点）。
+                // 原版某个图案 PNG 是 64×64，图集由 entity/banner/ 下约 40 张拼成，
+                // 所以一个格子的 UV 跨度应该是 64/图集宽（512 → 0.125）。
+                // 如果实测跨度远小于这个值，就是 UV 被压缩（映射叠了两次）；
+                // 如果约等于，说明 UV 是对的，问题在 alpha/材质通道。
+                float uMin = Float.MAX_VALUE;
+                float uMax = -Float.MAX_VALUE;
+                float vMin = Float.MAX_VALUE;
+                float vMax = -Float.MAX_VALUE;
+                for (int vertex = 0; vertex < batch.vertexCount; ++vertex) {
+                    final int base = vertex * BYTES_PER_VERTEX;
+                    final float u = batch.buffer.getFloat(base + 3 * Float.BYTES);
+                    final float v = batch.buffer.getFloat(base + 4 * Float.BYTES);
+                    if (u < uMin) uMin = u;
+                    if (u > uMax) uMax = u;
+                    if (v < vMin) vMin = v;
+                    if (v > vMax) vMax = v;
+                }
+                final float c0 = batch.buffer.getFloat(5 * Float.BYTES);
+                final float c1 = batch.buffer.getFloat(6 * Float.BYTES);
+                final float c2 = batch.buffer.getFloat(7 * Float.BYTES);
+                final float c3 = batch.buffer.getFloat(8 * Float.BYTES);
+                customDiagLog("banner_geom verts=" + batch.vertexCount
+                        + " hits=" + batch.coplanarHits
+                        + String.format(" u=[%.4f,%.4f](d=%.4f) v=[%.4f,%.4f](d=%.4f) rgba=%.3f,%.3f,%.3f,%.3f",
+                                uMin, uMax, uMax - uMin, vMin, vMax, vMax - vMin, c0, c1, c2, c3),
+                        bannerLabel, null);
+            }
+        }
+
+        // 2026-11-03 诊断：第一人称手部批次的 UV 范围。用来判定这批几何到底是
+        // "皮肤 UV 空间"（手臂，0..1 且贴合皮肤布局）还是"item/方块图集空间"
+        // （手持物，UV 会带图集偏移），从而确认手持物是否被并进了皮肤纹理批次。
+        if (batch.diagHand && isDiagnosticFrame() && batch.vertexCount > 0) {
+            final ByteBuffer source = batch.buffer;
+            float uMin = Float.MAX_VALUE;
+            float uMax = -Float.MAX_VALUE;
+            float vMin = Float.MAX_VALUE;
+            float vMax = -Float.MAX_VALUE;
+            for (int vertex = 0; vertex < batch.vertexCount; ++vertex) {
+                final int base = vertex * BYTES_PER_VERTEX + 3 * Float.BYTES;
+                final float u = source.getFloat(base);
+                final float v = source.getFloat(base + Float.BYTES);
+                if (u < uMin) uMin = u;
+                if (u > uMax) uMax = u;
+                if (v < vMin) vMin = v;
+                if (v > vMax) vMax = v;
+            }
+            System.err.println("[RTX-HANDUV] slot=" + batch.textureSlot
+                    + " vertices=" + batch.vertexCount
+                    + " u=[" + uMin + "," + uMax + "]"
+                    + " v=[" + vMin + "," + vMax + "]"
+                    + " texture=" + frameTextureLabels[
+                        Math.min(Math.max(batch.textureSlot - 1, 0), MAX_TEXTURE_SLOTS - 1)]);
+        }
+
+        // 2026-11-03 回退：曾把第一人称手部批次打到独立的 RT 层（pad1 = 2.0），
+        // 由 native 建 SECTION_AS_CLASS_HAND + mask 0x04，目的是让手不投世界阴影。
+        // 实测第一视角贴图错乱 —— 该层的顶点上传路径没有接通，instance 指向无效的
+        // 顶点地址，读到的贴图槽是垃圾。整项已回退（rgen 的 cullMask 也已还原为
+        // 0xff / 0x01）；native 侧新增的 HAND 层定义保留为死代码，不影响运行。
         NativeVulkan.uploadEntityBatch(batch.textureSlot, MemoryUtil.memAddress(batch.buffer), batch.vertexCount, BYTES_PER_VERTEX, motionPointer);
     }
 
@@ -1170,6 +1379,23 @@ public final class EntityRtCapture {
                     + " -> forced white; hand=" + handPhase
                     + " portal=" + batch.projectiveUv
                     + " slot=" + batch.textureSlot);
+        }
+        // =====================================================
+        // 2026-11-04：UV 重映射**默认关闭**（曾经的"双重映射"事故）。
+        //
+        // ModelFeatureRenderer.renderModel 内部已经用 Submit.uvMapping 去 wrap 过
+        // VertexConsumer 了（那个接口专门提供 wrap() 就是给这一步用的）。而我们抓的
+        // 是**渲染阶段**的顶点 —— getVertexBuilder 返回的那个 consumer —— 拿到的 u/v
+        // 已经是映射后的最终值。这里再乘一次 getU/getV 就是压两遍：
+        //   · 箱子/告示牌只采到 sprite 内部一小块，颜色相近，看起来"好像正常"；
+        //   · 旗帜图案有精细花纹，被压两遍后只剩图案一角 ⇒ 错乱。
+        // 直接证据：旗帜实测 u 跨度 0.0027（≈1/370），而一个 sprite 正常应是 0.015 量级。
+        //
+        // A/B：-DORION_ENTITY_UV_REMAP=1 打开（回到双重映射那版，仅用于对比）。
+        // =====================================================
+        if (UV_REMAP_ENABLED && batch.uvMapping != null && !batch.projectiveUv) {
+            u = batch.uvMapping.getU(u);
+            v = batch.uvMapping.getV(v);
         }
         batch.capture(x, y, z, color, u, v);
     }
@@ -1694,6 +1920,13 @@ public final class EntityRtCapture {
         if (view instanceof VulkanGpuTextureView vulkanView
                 && sampler instanceof VulkanGpuSampler vulkanSampler) {
             publishTextureHandle(slot, vulkanView.vkImageView(), vulkanSampler.vkSampler());
+        } else if (isDiagnosticFrame()) {
+            // 2026-11-04 诊断：纹理槽绑定失败 ⇒ shader 采样返回 0 ⇒
+            // cutout 把每个纹素都当透明丢掉 ⇒ 几何"消失"（旗帜图案正是这种表现：
+            // 底色在、图案完全不见，也不遮挡）。只打印失败，不刷屏。
+            System.err.println("[RTX-TEX] publish failed slot=" + slot
+                    + " texture=" + textureId
+                    + " view=" + view + " sampler=" + sampler);
         }
         publishEntityPbrTexture(slot, textureId);
     }
@@ -1826,9 +2059,11 @@ public final class EntityRtCapture {
         }
         final String typeName = renderTypeName(renderType);
         if (typeName != null && typeName.contains("shadow")) {
+            customDiagLog("drop:shadow", typeName, null);
             return;
         }
         if (isScreenOverlayRenderType(typeName)) {
+            customDiagLog("drop:screen_overlay", typeName, null);
             return;
         }
         final boolean endPortal = typeName != null && typeName.contains("end_portal");
@@ -1837,15 +2072,25 @@ public final class EntityRtCapture {
             texture = resolveSampler(renderType, "Sampler0");
         }
         if (texture == null) {
+            customDiagLog("drop:no_texture", typeName, null);
             return;
         }
         int textureSlot = slotFor(texture);
         if (textureSlot == 0) {
+            customDiagLog("drop:no_slot", typeName, texture);
             return;
         }
+        customDiagLog("captured", typeName, texture);
         ActiveBatch customBatch = acquireBatch(textureSlot, false,
                 endPortal || isEmissiveGeometry(texture));
         customBatch.projectiveUv = endPortal;
+        // 2026-11-04：旗帜图案层沿法线外移固定两步（理由见 beginModel 处）。
+        customBatch.coplanarLayerBoost = isBannerPattern(renderType) ? 2 : 0;
+        // 2026-11-04：旗帜图案层整体外移一个 rank（见 bannerLayerBoost）。
+        // 2026-11-03 诊断：第一人称下这条 custom 路径就是"手持物品"（RenderTypeFeatureRendererMixin
+        // 的注释第 28 行：Item → 物品展示框里的物品、掉落物、第一人称手持物品）。
+        // 打上标记后 uploadBatch 会顺带打印它的 vertexCount 与 UV 范围。
+        customBatch.diagHand = Minecraft.getInstance().options.getCameraType().isFirstPerson();
         if (endPortal && !endPortalLogged) {
             endPortalLogged = true;
             System.out.println("[RTX-ENTITY] end portal geometry captured, slot="
@@ -1859,6 +2104,32 @@ public final class EntityRtCapture {
     /** 由 {@code RenderTypeFeatureRendererMixin} 在 prepareGroup 收尾时调用。 */
     public static void endCustomGroup() {
         flushCustomBatch();
+    }
+
+    // =====================================================
+    // 2026-11-04 诊断：custom 路径（物品展示框里的物品、掉落物、第一人称手持物、
+    // 地图、末地传送门……）到底有没有被捕获。
+    // 物品展示框里的**地图**不显形，需要先分清是"根本没进这条路径"（被某个 return
+    // 挡了）还是"进来了但没画对"。每 64 帧打一组，每组最多 14 条。
+    // =====================================================
+    private static long customDiagFrame = -1L;
+    private static int customDiagCount;
+
+    private static void customDiagLog(String reason, String typeName, Identifier texture) {
+        if (!isDiagnosticFrame()) {
+            return;
+        }
+        if (customDiagFrame != captureFrameSerial) {
+            customDiagFrame = captureFrameSerial;
+            customDiagCount = 0;
+        }
+        if (customDiagCount >= 14) {
+            return;
+        }
+        ++customDiagCount;
+        System.err.println("[RTX-CUSTOM] " + reason
+                + " type=" + typeName
+                + " texture=" + texture);
     }
 
     private static void flushCustomBatch() {
@@ -1904,6 +2175,64 @@ public final class EntityRtCapture {
         return resolveSampler(renderType, "Sampler0");
     }
 
+    /**
+     * 2026-11-04：这是不是旗帜的**图案层**。
+     *
+     * <p>旗帜 = 底布 + 逐层图案，几何完全共面。原版给 base-colour pass 的 order 是 0，
+     * 但它其实画在"无色的、同样共面的底布"之后 —— 两者在 BVH 里完全打平，命中哪个
+     * 是随机的，于是旗帜会随机显示成白布或缺失图案。</p>
+     *
+     * <p>判据与 Caustica 的 {@code RtEntityCollector#isBannerPattern} 一致：
+     * 看 RenderPipeline 的 location。命中后本批次整体外移一个 rank
+     * （见 {@link ActiveBatch#coplanarLayerBoost}）。</p>
+     */
+    /**
+     * 2026-11-04：这批几何是不是旗帜（底布或图案层）。
+     *
+     * <p>旗帜的 6 个 quad 是"3 个方向 × 正反两面"，**正反两面顶点位置完全相同**，
+     * 于是 {@code applyCoplanarLayerOffset} 的质心键必然重复、会把正反两面互相推开，
+     * 每帧都在破坏几何（实测 coplanarHits 累计到十万级）。所以对旗帜整批禁用该机制，
+     * 层序交给 alpha cutout 的 any-hit 穿透（图案的透明纹素被丢弃后自然落到下层）。</p>
+     */
+    private static boolean isBannerTexture(Identifier texture) {
+        return texture != null && texture.getPath().contains("banner");
+    }
+
+    private static boolean isBannerPattern(RenderType renderType) {
+        if (renderType == null) {
+            return false;
+        }
+        final RenderSetup setup = ((RenderTypeAccessor) (Object) renderType).rtx$getState();
+        if (setup == null) {
+            return false;
+        }
+        final var pipeline = ((RenderSetupAccessor) (Object) setup).rtx$getPipeline();
+        if (pipeline == null) {
+            return false;
+        }
+        return "minecraft:pipeline/banner_pattern".equals(pipeline.getLocation().toString());
+    }
+
+    /**
+     * 2026-11-04：旗帜图案层的层序提升量。
+     *
+     * <p>两条判据取或：</p>
+     * <ol>
+     *   <li>{@link #isBannerPattern}：看 RenderPipeline 的 location（与 Caustica 同口径）；</li>
+     *   <li><b>纹理名兜底</b>：{@code banner_patterns.png}。实测日志里图案层就是这个纹理，
+     *       而 pipeline 的 location 字符串一旦命名不同，第一条会静默返回 false ⇒
+     *       boost 恒 0 ⇒ 图案层与底布完全重合 ⇒ BVH 随机挑，图案时有时无。</li>
+     * </ol>
+     * <p>底布走的是方块图集里的白布（不同纹理槽），这里不动它，所以相对偏移正好一层。</p>
+     */
+    // 2026-11-04：旗帜层序的多次尝试（固定 rank、按质心分组、全局递增）**全部无效**，
+    // 相关代码已删除，回到共面层序的原始实现（applyCoplanarLayerOffset 只用提交顺序）。
+    // 结论记录：问题不在"层序 rank"这一层，需要先拿到以下事实再动手 ——
+    //   · 同一面旗帜的底布与图案层，各自批次的 vertexCount / quad 数
+    //   · applyCoplanarLayerOffset 在那两个批次里是否真的被调用（duplicates 是否 > 0）
+    //   · 图案层相对底布的偏移方向（几何法线朝向是否与"朝观察者"一致）
+    // 这三个只要有一个不成立，"沿法线外移"就永远推不出去。
+
     private static Identifier resolveSampler(RenderType renderType, String samplerName) {
         RenderSetup setup = ((RenderTypeAccessor) (Object) renderType).rtx$getState();
         Object binding = ((RenderSetupAccessor) (Object) setup).rtx$getTextures().get(samplerName);
@@ -1921,6 +2250,22 @@ public final class EntityRtCapture {
         private int textureSlot;
         private boolean localPlayerProxy;
         private boolean emissive;
+        // 2026-11-03 诊断：这批是不是第一人称手部（state=Unit）。每次 beginModel 重设，
+        // 不需要在 reset() 里清（避免漏一条路径就串味）。
+        private boolean diagHand;
+        // 2026-11-04：旗帜图案层的额外层序偏移。
+        // ⚠ 多次尝试（固定 rank / 按质心分组 / 全局递增）全部无效，现恒为 0。
+        // 保留字段只为将来有证据后再启用。
+        private int coplanarLayerBoost;
+        // 2026-11-04 诊断：本批次里 applyCoplanarLayerOffset 真正命中重复质心的次数。
+        // 0 ⇒ 共面判定从未触发（那才是旗帜修不好的根因）；>0 ⇒ 偏移发生了但没起作用（方向问题）。
+        private int coplanarHits;
+        // 2026-11-04：本批次的 UV 映射（来自 ModelFeatureRenderer.Submit 的 record 字段）。
+        //   null  ⇒ 整张贴图，UV 原样（mob 皮肤、items atlas 都是这种）
+        //   非 null ⇒ ModelPart 的 0..1 UV 需要按 sprite 在图集里的矩形重映射
+        //            （箱子 / 告示牌 / 床 / 旗帜 等方块实体走这条）
+        // 不重映射的后果：采样落到图集左上角，贴图整片错乱。
+        private net.minecraft.client.renderer.texture.UvMapping uvMapping;
         
 
         private boolean projectiveUv;
@@ -1956,6 +2301,7 @@ public final class EntityRtCapture {
             this.emissive = emissive;
             this.projectiveUv = false;
             this.coplanarLayering = false;
+            this.coplanarHits = 0;
             this.minX = this.minY = this.minZ = Float.MAX_VALUE;
             this.maxX = this.maxY = this.maxZ = -Float.MAX_VALUE;
             buffer.clear();
@@ -1963,6 +2309,8 @@ public final class EntityRtCapture {
             vertexCount = 0;
             coplanarQuadCounts.clear();
             hasPoseDelta = false;
+            uvMapping = null;
+            coplanarLayerBoost = 0;
             java.util.Arrays.fill(poseDelta, 0.0F);
             motionX = motionY = motionZ = 0.0F;
             vertexHistory = null;
@@ -2077,17 +2425,46 @@ public final class EntityRtCapture {
                     (ay + by + cy + dy) * 0.25f,
                     (az + bz + cz + dz) * 0.25f);
             final Integer previous = coplanarQuadCounts.get(key);
-            final int duplicates = previous == null ? 0 : previous;
-            coplanarQuadCounts.put(key, duplicates + 1);
-            if (duplicates == 0 || length < 1.0e-6f) {
+            final int seenBefore = previous == null ? 0 : previous;
+            coplanarQuadCounts.put(key, seenBefore + 1);
+            if (seenBefore > 0) {
+                ++coplanarHits;
+            }
+
+            // 2026-11-04：rank = 提交顺序 + 旗帜图案层的提升量。
+            // 提升量由 bannerLayerBoost 给出（本帧第几个 banner 图案层）。
+            // 注意：多面旗帜会共享这个计数器而累加，所以 ENTITY_COPLANAR_LAYER_MAX
+            // 必须够大 —— 0.02 在 rank ≥ 10 时会把各层压到同一点（实测 14 层），
+            // 表现为"前几面旗帜正确、后面全错"。
+            final int rank = seenBefore + coplanarLayerBoost;
+            if (rank == 0 || length < 1.0e-6f) {
                 return;
             }
 
             final float offset = Math.min(
-                    duplicates * ENTITY_COPLANAR_LAYER_STEP, ENTITY_COPLANAR_LAYER_MAX);
-            nx = nx / length * offset;
-            ny = ny / length * offset;
-            nz = nz / length * offset;
+                    rank * ENTITY_COPLANAR_LAYER_STEP, ENTITY_COPLANAR_LAYER_MAX);
+            if (coplanarLayerBoost > 0) {
+                // 2026-11-04：旗帜图案层**直接朝相机推**，不用几何法线。
+                // 旗帜是双面渲染，顶点绕序不保证"法线朝外"；实测几何法线可能朝内，
+                // 那样偏移会把图案推到底布**后面** ⇒ 表现正是"只有底色、没有图案"，
+                // 而且因为被遮挡得干净，连错乱都看不到。
+                // 顶点是相机相对坐标（native 侧才加 cameraWorld），所以相机在原点。
+                final float centerX = (ax + bx + cx + dx) * 0.25f;
+                final float centerY = (ay + by + cy + dy) * 0.25f;
+                final float centerZ = (az + bz + cz + dz) * 0.25f;
+                final float toCamera = (float) Math.sqrt(
+                        centerX * centerX + centerY * centerY + centerZ * centerZ);
+                if (toCamera <= 1.0e-4f) {
+                    return;
+                }
+                nx = -centerX / toCamera * offset;
+                ny = -centerY / toCamera * offset;
+                nz = -centerZ / toCamera * offset;
+            } else {
+                nx = nx / length * offset;
+                ny = ny / length * offset;
+                nz = nz / length * offset;
+            }
             for (int vertex = 0; vertex < 4; ++vertex) {
                 final int slot = vertex * PENDING_VERTEX_FLOATS;
                 pendingQuadVertices[slot] += nx;

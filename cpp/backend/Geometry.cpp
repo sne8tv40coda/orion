@@ -1076,6 +1076,75 @@ void geometryCaptureSectionLocked(
     }
 }
 
+// ---------------------------------------------------------------------------
+// 2026-11-06r：split 缓冲池（见 OrionInternal.h 的说明）。
+// 池本身用一把独立的小锁：生产者在捕获线程、消费者在渲染线程，
+// 都不持有 g_chunkMutex 之外的东西，不会与区块锁形成嵌套。
+// ---------------------------------------------------------------------------
+namespace
+{
+std::mutex g_sectionSplitPoolMutex;
+std::vector<SectionGeometrySplit> g_sectionSplitPool;
+constexpr size_t SECTION_SPLIT_POOL_LIMIT = 24u;
+}
+
+SectionGeometrySplit takeSectionSplitFromPool()
+{
+    std::lock_guard<std::mutex> lock(g_sectionSplitPoolMutex);
+
+    if(g_sectionSplitPool.empty())
+    {
+        return SectionGeometrySplit{};
+    }
+
+    SectionGeometrySplit split = std::move(g_sectionSplitPool.back());
+    g_sectionSplitPool.pop_back();
+    return split;
+}
+void returnSectionSplitToPool(SectionGeometrySplit&& split)
+{
+    // 只回收还有容量的：move 之后留下的空壳进池没有意义，反而挤掉有用的。
+    const bool hasCapacity =
+        split.opaque.capacity() != 0u ||
+        split.ommCutout.capacity() != 0u ||
+        split.alpha.capacity() != 0u ||
+        split.water.capacity() != 0u ||
+        split.entity.capacity() != 0u ||
+        split.localPlayer.capacity() != 0u ||
+        split.particle.capacity() != 0u;
+
+    if(!hasCapacity)
+    {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(g_sectionSplitPoolMutex);
+
+    if(g_sectionSplitPool.size() >= SECTION_SPLIT_POOL_LIMIT)
+    {
+        return;
+    }
+
+    split.opaque.clear();
+    split.ommCutout.clear();
+    split.alpha.clear();
+    split.water.clear();
+    split.entity.clear();
+    split.localPlayer.clear();
+    split.particle.clear();
+    split.entityMotion.clear();
+    split.localPlayerMotion.clear();
+    split.particleMotion.clear();
+    split.opaquePacked.clear();
+    split.ommCutoutPacked.clear();
+    split.alphaPacked.clear();
+    split.waterPacked.clear();
+    split.hasOmmInput = false;
+    split.ommInput = OmmCutoutInput{};
+
+    g_sectionSplitPool.push_back(std::move(split));
+}
+
 // 2026-10-31：脏 Section 的全局取序开关。
 //   nearest（默认）：在全量脏集合里挑最近的候选；
 //   hash：回退到旧行为（只对迭代器顺序的前 16 个排序），用于 A/B。
@@ -1334,6 +1403,8 @@ void geometryCaptureWorkerLoop()
                         candidates[candidateIndex].key;
                     CapturedSectionUpdate update;
                     update.spatialKey = spatialKey;
+                    // 2026-11-06r：从池里取热 buffer，避免每段新建 vector 的缺页。
+                    update.split = takeSectionSplitFromPool();
                     const auto sectionCaptureStart =
                         std::chrono::steady_clock::now();
                     ULONG64 sectionCaptureCyclesStart = 0ull;

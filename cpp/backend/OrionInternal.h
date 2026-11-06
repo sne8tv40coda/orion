@@ -1595,6 +1595,15 @@ struct SectionGeometrySplit
     std::vector<SectionVertex> waterPacked;
 };
 
+// 2026-11-06r：SectionGeometrySplit 的缓冲池。
+//
+// 捕获线程持 g_chunkMutex 填 split（最多 16K 顶点 / 几百 KB），每段都新建
+// 十几个 vector ⇒ 首次触碰缺页，实测墙钟是 CPU 周期的 14~25 倍，
+// capHoldMs 单段就到 8.4~9.4ms。
+// split 在消费端只被读，所以用完可以连同容量回收复用。
+SectionGeometrySplit takeSectionSplitFromPool();
+void returnSectionSplitToPool(SectionGeometrySplit&& split);
+
 // =======================================================================
 // 2026-10-08 几何捕获线程（BLAS 异步化·第一步）。
 //

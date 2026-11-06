@@ -242,5 +242,49 @@ VkResult OrionCreateRayTracingPipelineTimed(
         result
     );
 
+    // 2026-11-06 SER -3 定案：INITIALIZATION_FAILED 不是 shader/SER 本身，而是
+    // 同会话背靠背多次十分钟级冷编译时驱动编译器资源耗尽（对照实验：同一
+    // spv/缓存，main+k1 冷编后 k2d 失败；main+k1 缓存命中时 k2d 冷编成功）。
+    // 失败即释放了本次编译的内存 ⇒ 稍候重试一次通常能过。
+    if(result != VK_SUCCESS &&
+       result != VK_PIPELINE_COMPILE_REQUIRED &&
+       result != VK_ERROR_OUT_OF_DEVICE_MEMORY &&
+       result != VK_ERROR_OUT_OF_HOST_MEMORY)
+    {
+        std::this_thread::sleep_for(std::chrono::seconds(3));
+
+        const auto retryStart = std::chrono::steady_clock::now();
+        const VkResult retry = createPipe(
+            g_device,
+            VK_NULL_HANDLE,
+            pipelineCache,
+            createInfoCount,
+            pCreateInfos,
+            nullptr,
+            pPipelines
+        );
+        const double retryMs =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - retryStart
+            ).count();
+
+        char retryText[256] = {};
+
+        std::snprintf(
+            retryText,
+            sizeof(retryText),
+            "[PERF PIPE] kind=rt-retry spv=rt:%s firstResult=%d retryResult=%d "
+            "ms=%.1f",
+            (label != nullptr) ? label : "?",
+            static_cast<int>(result),
+            static_cast<int>(retry),
+            retryMs
+        );
+
+        orionPipelineDiagEmit(retryText);
+
+        return retry;
+    }
+
     return result;
 }

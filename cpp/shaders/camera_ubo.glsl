@@ -42,6 +42,8 @@
     vec4 skyParams0;
     vec4 skyParams1;
 
+    // godRayParams1 = 贴地薄雾四车道（2026-11-04 复活，消费方 volumetric_fog.glsl）：
+    // x=总开关 y=高度标尺(×6=e 折叠格数) z=消光(×0.05=每格) w=距相机淡出半径(格)
     vec4 godRayParams0;
     vec4 godRayParams1;
     vec4 godRayParams2;

@@ -361,11 +361,15 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_updateCamera(
     // y = SSR 射程上限（0 = 关；硬性下限 12 由 ss_hybrid.comp 逐像素判）。
     ubo->ssHybridParams[0] = std::clamp(g_ssptChunks.load(), 0.0f, 12.0f);
     ubo->ssHybridParams[1] = std::clamp(g_ssrChunks.load(), 0.0f, 64.0f);
-    ubo->ssHybridParams[2] = 0.0f;
+    // z = RT 光泽射线开关（1 = 开）。rgen 读到 < 0.5 就整段跳过那条 GGX
+    // 反射射线，镜面交给 SSR/SSPT —— 见 rt_test.rgen 的对应门控。
+    ubo->ssHybridParams[2] = g_ssRtGlossy.load() > 0.5f ? 1.0f : 0.0f;
     ubo->ssHybridParams[3] = 0.0f;
 
     ubo->giRayParams[0] = static_cast<float>(giNearRateLevel());
-    ubo->giRayParams[1] = 0.0f;
+    // 2026-11-04 A1：y = GI 时域重投影开关（rgen_gi_temporal.glsl 读 >0.5）。
+    // y/z/w 此前恒 0，借 y 不动 UBO 布局；ORION_GI_TEMPORAL=0 回旧路径。
+    ubo->giRayParams[1] = giTemporalEnabled() ? 1.0f : 0.0f;
     ubo->giRayParams[2] = 0.0f;
     ubo->giRayParams[3] = 0.0f;
 
@@ -635,6 +639,246 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_updateCamera(
     g_sparseHistoryValid.store(true, std::memory_order_relaxed);
 }
 
+// ============================================================
+// 2026-11-04 阶段 0：确定性抓帧哈希（重构回归安全网）
+//
+// 为什么需要：现有 benchmark 只记帧时间，回答不了"画面有没有变"。
+// 拆 rgen / 折叠 traceRay 这类重构必须能判定行为是否逐位一致，否则
+// 一旦画面出问题，无法区分"重构引入的 bug"和噪声。
+//
+// 读哪张图：g_rtOutputImage —— 它是 DLSS-RR 的**输入**、渲染分辨率的
+// HDR 结果（rgba16f）。因此不受超分、补帧、swapchain/present 路径影响，
+// 正是重构最直接的作用对象。
+//
+// 用法：ORION_CAPTURE_HASH=<帧号> 启动客户端。到达该帧时读回图像，
+// 对原始字节算 FNV-1a 64，写一行到 rt_debug.log：
+//   [CAPTURE] frame=N hash=0x... w=.. h=.. nonzero=..
+// 改前/改后各跑一次，比对同一帧号的 hash 即可判定逐位一致。
+//
+// 为什么在帧首读：主 command buffer 此刻还在录制、未提交，直接往里插
+// copy 会读到半成品。帧首单独提交一个 cb 并 waitIdle，拿到的是上一帧
+// 已完成的最终结果 —— 固定帧号下同样可复现。
+// ============================================================
+static void orionCaptureDeterministicFrameHash()
+{
+    static bool parseDone = false;
+    static long targetFrame = -1;
+
+    if(!parseDone)
+    {
+        parseDone = true;
+
+        const char* env =
+            std::getenv(
+                "ORION_CAPTURE_HASH"
+            );
+
+        if(env != nullptr && env[0] != '\0')
+        {
+            targetFrame =
+                std::atol(env);
+        }
+    }
+
+    if(targetFrame < 0) return;
+
+    if(static_cast<long>(g_perfL10FrameSerial) != targetFrame) return;
+
+    if(g_rtOutputImage == VK_NULL_HANDLE) return;
+
+    if(g_rtOutputWidth == 0u || g_rtOutputHeight == 0u) return;
+
+    if(g_rtOutputLayout == VK_IMAGE_LAYOUT_UNDEFINED) return;
+
+    // rgba16f = 8 字节/像素
+    const VkDeviceSize imageBytes =
+        static_cast<VkDeviceSize>(g_rtOutputWidth) *
+        static_cast<VkDeviceSize>(g_rtOutputHeight) *
+        8ull;
+
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+
+    VkBufferCreateInfo bufferInfo{};
+    bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bufferInfo.size = imageBytes;
+    bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    if(vkCreateBuffer(g_device, &bufferInfo, nullptr, &buffer) != VK_SUCCESS)
+    {
+        RTLogFlushed("[CAPTURE] buffer create failed");
+
+        return;
+    }
+
+    VkMemoryRequirements req{};
+    vkGetBufferMemoryRequirements(g_device, buffer, &req);
+
+    VkMemoryAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocInfo.allocationSize = req.size;
+    allocInfo.memoryTypeIndex =
+        findMemoryType(
+            g_physicalDevice,
+            req.memoryTypeBits,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
+        );
+
+    if(allocInfo.memoryTypeIndex == 0xFFFFFFFFu ||
+       vkAllocateMemory(g_device, &allocInfo, nullptr, &memory) != VK_SUCCESS)
+    {
+        vkDestroyBuffer(g_device, buffer, nullptr);
+
+        RTLogFlushed("[CAPTURE] memory allocate failed");
+
+        return;
+    }
+
+    vkBindBufferMemory(g_device, buffer, memory, 0u);
+
+    VkCommandBufferAllocateInfo cmdAlloc{};
+    cmdAlloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cmdAlloc.commandPool = g_rtCommandPool;
+    cmdAlloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cmdAlloc.commandBufferCount = 1u;
+
+    if(vkAllocateCommandBuffers(g_device, &cmdAlloc, &cmd) != VK_SUCCESS)
+    {
+        vkFreeMemory(g_device, memory, nullptr);
+        vkDestroyBuffer(g_device, buffer, nullptr);
+
+        RTLogFlushed("[CAPTURE] command buffer allocate failed");
+
+        return;
+    }
+
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+
+    vkBeginCommandBuffer(cmd, &beginInfo);
+
+    VkImageMemoryBarrier toTransfer{};
+    toTransfer.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    toTransfer.oldLayout = g_rtOutputLayout;
+    toTransfer.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    toTransfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toTransfer.image = g_rtOutputImage;
+    toTransfer.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    toTransfer.subresourceRange.levelCount = 1u;
+    toTransfer.subresourceRange.layerCount = 1u;
+    toTransfer.srcAccessMask =
+        VK_ACCESS_SHADER_READ_BIT |
+        VK_ACCESS_SHADER_WRITE_BIT;
+    toTransfer.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+
+    vkCmdPipelineBarrier(
+        cmd,
+        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0u, 0u, nullptr, 0u, nullptr, 1u, &toTransfer
+    );
+
+    VkBufferImageCopy region{};
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.imageSubresource.layerCount = 1u;
+    region.imageExtent.width = g_rtOutputWidth;
+    region.imageExtent.height = g_rtOutputHeight;
+    region.imageExtent.depth = 1u;
+
+    vkCmdCopyImageToBuffer(
+        cmd,
+        g_rtOutputImage,
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        buffer,
+        1u,
+        &region
+    );
+
+    VkImageMemoryBarrier toRead = toTransfer;
+    toRead.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    toRead.newLayout = g_rtOutputLayout;
+    toRead.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    toRead.dstAccessMask =
+        VK_ACCESS_SHADER_READ_BIT |
+        VK_ACCESS_SHADER_WRITE_BIT;
+
+    vkCmdPipelineBarrier(
+        cmd,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        0u, 0u, nullptr, 0u, nullptr, 1u, &toRead
+    );
+
+    vkEndCommandBuffer(cmd);
+
+    VkSubmitInfo submit{};
+    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit.commandBufferCount = 1u;
+    submit.pCommandBuffers = &cmd;
+
+    if(vkQueueSubmit(g_queue, 1u, &submit, VK_NULL_HANDLE) == VK_SUCCESS)
+    {
+        vkQueueWaitIdle(g_queue);
+
+        void* mapped = nullptr;
+
+        if(vkMapMemory(
+               g_device,
+               memory,
+               0u,
+               VK_WHOLE_SIZE,
+               0u,
+               &mapped) == VK_SUCCESS)
+        {
+            const uint8_t* bytes =
+                static_cast<const uint8_t*>(mapped);
+
+            uint64_t hash = 14695981039346656037ull;
+            size_t nonZero = 0u;
+
+            for(VkDeviceSize i = 0u; i < imageBytes; ++i)
+            {
+                const uint8_t byte = bytes[i];
+
+                if(byte != 0u) ++nonZero;
+
+                hash ^= byte;
+                hash *= 1099511628211ull;
+            }
+
+            char line[256];
+
+            std::snprintf(
+                line,
+                sizeof(line),
+                "[CAPTURE] frame=%ld hash=0x%016llx w=%u h=%u "
+                "nonzero=%zu bytes=%llu",
+                targetFrame,
+                static_cast<unsigned long long>(hash),
+                g_rtOutputWidth,
+                g_rtOutputHeight,
+                nonZero,
+                static_cast<unsigned long long>(imageBytes)
+            );
+
+            RTLogFlushed(
+                std::string(line)
+            );
+
+            vkUnmapMemory(g_device, memory);
+        }
+    }
+
+    vkFreeCommandBuffers(g_device, g_rtCommandPool, 1u, &cmd);
+    vkFreeMemory(g_device, memory, nullptr);
+    vkDestroyBuffer(g_device, buffer, nullptr);
+}
+
 extern "C"
 JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_recordFrameCommand(
     JNIEnv* env,
@@ -652,26 +896,25 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_recordFrameCommand(
     RTXHeartbeatTick();
 
     applyRenderThreadPriorityOnce();
+    RTXMarkPhase("frame:prio");
 
-    if(g_perfL10FrameSerial == 120u &&
-       std::getenv("ORION_TEST_CRASH") != nullptr)
-    {
-        RTLogFlushed("[CRASH TEST] deliberate null write (ORION_TEST_CRASH=1)");
-
-        *static_cast<volatile int*>(nullptr) = 1;
-    }
-
+    orionCaptureDeterministicFrameHash();
+    RTXMarkPhase("frame:hash");
 
     perfL10CpuPhaseBeginFrame();
+    RTXMarkPhase("frame:phaseCpu");
 
     maybePersistSharedPipelineCache();
+    RTXMarkPhase("frame:persist");
 
     // 2026-11-02 P1：SPV 热重载（默认关，ORION_RT_PIPE_HOT_RELOAD=1 开启）。
     // 放在帧首、任何 RT pass 录制之前：重建会 vkDeviceWaitIdle 并重建 SBT，
     // 必须发生在这一帧的 command buffer 开始录制之前，否则 SBT 会在帧中途被换掉。
     pollRtPipelineHotReload();
+    RTXMarkPhase("frame:hotreload");
 
     ensurePbrAtlasSampler();
+    RTXMarkPhase("frame:atlas");
 
     const bool publishPbrAtlases =
         g_pbrAtlasesDirty &&
@@ -2213,6 +2456,14 @@ if(!g_dlssGFeatureInitialized)
     );
 
 
+    // 2026-11-04 A1：GI 时域重投影历史（binding 86/87）。始终创建：
+    // rgen 描述符布局含 86/87，且关断走 giRayParams.y，资源很小可忽略。
+    createGiTemporalImages(
+        renderWidth,
+        renderHeight
+    );
+
+
     createGlassAlphaBlendImages(
         renderWidth,
         renderHeight
@@ -2583,6 +2834,9 @@ if(rrGuideBarrierCount > 0)
 
     prepareVPTDirectHistoryBuffers(cmd);
 
+    // 2026-11-04 A1：GI 时域历史 clear + 帧内屏障（needsClear 只在重建帧为真）。
+    prepareGiTemporalHistoryImages(cmd);
+
     writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_SETUP);
 
     perfL10CpuPhaseAdvance(PERF_L10_CPU_P_WATER);
@@ -2736,16 +2990,25 @@ recordSharcUpdate(cmd, renderWidth, renderHeight);
 
     recordGlassAlphaBlendPrepare(cmd);
 
-    trace(
-        cmd,
-        &g_raygenRegion,
-        &g_missRegion,
-        &g_hitRegion,
-        &g_callableRegion,
-        renderWidth,
-        renderHeight,
-        1
-    );
+    // 2026-11-05 B：K1(主视线)→landing→K2(传输) 两发（2026-11-06 起默认开，ORION_K1_K2=0 回退）；
+    // 未启用/管线失败时回退单发主管线，路径与旧版逐位一致。
+    if(!traceK1K2(
+           cmd,
+           renderWidth,
+           renderHeight
+       ))
+    {
+        trace(
+            cmd,
+            &g_raygenRegion,
+            &g_missRegion,
+            &g_hitRegion,
+            &g_callableRegion,
+            renderWidth,
+            renderHeight,
+            1
+        );
+    }
     rtSpikeTrace = rtMark();
     writePerfL10GpuBoundary(cmd, PERF_L10_GPU_B_TRACE);
 

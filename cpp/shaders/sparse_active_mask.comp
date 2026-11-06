@@ -13,6 +13,50 @@ layout(binding = 1, std430) readonly buffer BlueNoiseTable
     uint words[64u * 128u * 128u / 4u];
 } blueNoise;
 
+#ifndef SPARSE_EDGE_AWARE
+// 1 = 用上一帧的深度/亮度对比把高对比块抬到全速率（需要宿主补 binding 2/3）。
+// 0 = 关闭（**默认**：宿主还没补描述符，打开会因缺绑定导致管线创建失败）。
+#define SPARSE_EDGE_AWARE 0
+#endif
+
+#if SPARSE_EDGE_AWARE
+layout(binding = 2, set = 0) uniform sampler2D prevDepthTex;   // 上一帧深度（rgen 的 depthImage）
+layout(binding = 3, set = 0) uniform sampler2D prevColorTex;   // 上一帧颜色（rtOutput）
+
+// 深度/亮度高对比检测：阴影边界、几何轮廓都会在这里被判出来。
+bool sparseEdgeActive(uvec2 pixelCoord, uvec2 extent)
+{
+    const vec2 uv = (vec2(pixelCoord) + vec2(0.5)) / vec2(max(extent, uvec2(1u)));
+
+    float d0 = textureLod(prevDepthTex, uv, 0.0).r;
+    vec3  c0 = textureLod(prevColorTex, uv, 0.0).rgb;
+    float l0 = dot(c0, vec3(0.2126, 0.7152, 0.0722));
+
+    float bestDepth = 0.0;
+    float bestLuma = 0.0;
+
+    for(int i = 0; i < 4; ++i)
+    {
+        const vec2 offset = (i == 0) ? vec2( 1.0,  0.0)
+                          : (i == 1) ? vec2(-1.0,  0.0)
+                          : (i == 2) ? vec2( 0.0,  1.0)
+                                     : vec2( 0.0, -1.0);
+        const vec2 uvN = uv + offset / vec2(max(extent, uvec2(1u)));
+
+        const float d1 = textureLod(prevDepthTex, uvN, 0.0).r;
+        const vec3  c1 = textureLod(prevColorTex, uvN, 0.0).rgb;
+        const float l1 = dot(c1, vec3(0.2126, 0.7152, 0.0722));
+
+        bestDepth = max(bestDepth, abs(d1 - d0));
+        bestLuma = max(bestLuma, abs(l1 - l0) / max(max(l1, l0), 1.0e-3));
+    }
+
+    // 经验阈值：深度 0.15（相对量级，reverse-Z 下相邻面差远大于此）；
+    // 亮度 35%（相对）。命中任一 ⇒ 这一块按全速率处理。
+    return bestDepth > 0.15 || bestLuma > 0.35;
+}
+#endif
+
 layout(push_constant) uniform SparseMaskPush
 {
     uint width;
@@ -106,6 +150,54 @@ bool sparseLayeredActive(uvec2 pixelCoord, uint frameIdx, float samplingRate)
         (kLayeredSlotCount - 1u)) < slotCount;
 }
 
+#ifndef SPARSE_ORDERED_BAYER
+// 1 = 有序抖动（**默认**，空间/时域都均匀）；0 = 蓝噪声独立抽签（旧行为）。
+#define SPARSE_ORDERED_BAYER 1
+#endif
+
+// Bayer 4x4（0..15）。任意 k 下，相邻的 k 个阈值在 4x4 块内尽量散开：
+// 既没有蓝噪声的时域空档，也没有 bit-reverse 那种竖条纹退化。
+const uint kSparseBayer4x4[16] =
+{
+    0u,  8u,  2u, 10u,
+    12u, 4u, 14u,  6u,
+    3u, 11u,  1u,  9u,
+    15u, 7u, 13u,  5u
+};
+
+bool sparseOrderedActive(uvec2 pixelCoord, uint frameIdx, float samplingRate)
+{
+    const uint slots = 16u;
+    const uint activeSlots =
+        uint(clamp(samplingRate, 0.0, 1.0) * float(slots) + 0.5);
+
+    if(activeSlots == 0u)
+    {
+        return false;
+    }
+    if(activeSlots >= slots)
+    {
+        return true;
+    }
+
+    const uint bayer =
+        kSparseBayer4x4[(pixelCoord.y & 3u) * 4u + (pixelCoord.x & 3u)];
+
+    // 逐帧旋转相位：同一像素 16 帧内恰好命中 activeSlots 次，间隔规则。
+    //
+    // 2026-11-05：再按 **tile（4x4 像素）再旋转一次**。
+    // 只用帧号当相位时，全屏每个 tile 的活跃图案完全相同 ⇒ 阴影里看不出，
+    // 但直射光强的地方会把它显影成一张**规则网格**（用户截图）。
+    // 每个 tile 带上自己的哈希旋转后：tile 内仍活跃恰好 activeSlots 个（覆盖率不变），
+    // 但相邻 tile 图案不同 ⇒ 周期性被打散成噪点。
+    const uint tileHash =
+        ((pixelCoord.x >> 2u) * 73856093u) ^ ((pixelCoord.y >> 2u) * 19349663u);
+    const uint phase = (frameIdx + (tileHash >> 4u)) & (slots - 1u);
+    const uint shifted = (bayer + slots - phase) & (slots - 1u);
+
+    return shifted < activeSlots;
+}
+
 void main()
 {
     const uvec2 blockCoordinate = gl_GlobalInvocationID.xy;
@@ -136,10 +228,28 @@ void main()
                         pc.frameIndex,
                         pc.samplingRate);
 #else
+#if SPARSE_ORDERED_BAYER
+                isPixelActive =
+                    sparseOrderedActive(
+                        pixelCoordinate,
+                        pc.frameIndex,
+                        pc.samplingRate);
+#if SPARSE_EDGE_AWARE
+                // 高对比像素一律全速率：与 Remix 的 per-pixel rate 纹理同效。
+                if(!isPixelActive)
+                {
+                    isPixelActive =
+                        sparseEdgeActive(
+                            pixelCoordinate,
+                            uvec2(pc.width, pc.height));
+                }
+#endif
+#else
                 isPixelActive =
                     sparseBlueNoiseThreshold(
                         pixelCoordinate,
                         pc.frameIndex) <= pc.samplingRate;
+#endif
 #endif
             }
 

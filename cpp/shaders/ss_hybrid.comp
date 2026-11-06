@@ -616,13 +616,77 @@ vec3 ssptTrace(vec3 surfacePosition, vec3 surfaceNormal, float maxDistance,
         }
     }
 
-    // 靠近屏幕边缘的命中不可信（射线随时会出屏），按距离衰减置信度
+    // 靠近屏幕边缘的命中不可信（射线随时会出屏），按距离衰减置信度。
+    // ⚠ 2026-11-03：**辐射度不再乘 edgeFade，衰减全部由 confidence 承担**。
+    // 原来两边都乘，比例替换变成 L*e/L = e ⇒ 屏幕边缘的 GI 被系统性压掉
+    // （e=0.5 时 ratio=0.5，等于把边缘那一列像素的间接光砍一半，形成暗边）。
     float edgeFade =
         smoothstep(0.0, 0.06, uv.x) * smoothstep(0.0, 0.06, 1.0 - uv.x) *
         smoothstep(0.0, 0.06, uv.y) * smoothstep(0.0, 0.06, 1.0 - uv.y);
 
     confidence = edgeFade;
-    return max(radiance, vec3(0.0)) * edgeFade;
+    return max(radiance, vec3(0.0));
+}
+
+// ============================================================================
+// SSPT 的近场镜面（2026-11-03 第三项）
+//
+// 为什么要它：用户的目标配置是「仅 SSPT + RTAO」—— RT 漫反射 GI 与 RT 镜面
+// 都关掉时，只剩环境底的话金属/玻璃/水面会平得像贴纸。屏幕空间镜面追迹是
+// 唯一不额外花 RT 射线的补法。
+//
+// 与 SSR 的分工（互斥，见 main 里的 ssrOwnsPixel）：
+//   · RT 镜面命中距离 > 12 区块 ⇒ 归 SSR（它的历史/门槛调过，专门干远场）
+//   · 其余（命中 ≤ 12 区块）且表面在 SSPT 射程内 ⇒ 归这里
+// 两者都做 "color - specTerm + specAlbedo * L" 的替换式合成，所以永远不会
+// 把镜面能量加两遍。
+// ============================================================================
+vec3 ssptSpecularTrace(
+    vec3 surfacePosition,
+    vec3 surfaceNormal,
+    float roughness,
+    float maxDistance,
+    out float confidence,
+    out float hitDistanceMeters)
+{
+    confidence = 0.0;
+    hitDistanceMeters = 0.0;
+
+    const vec3 viewDirection = normalize(ssCameraPosition - surfacePosition);
+    const vec3 mirrorDirection = reflect(-viewDirection, surfaceNormal);
+    const vec3 direction = ssPerturbReflection(mirrorDirection, roughness);
+
+    vec2 uv = vec2(0.0);
+    float distanceMeters = 0.0;
+
+    if(!ssMarchRay(
+           surfacePosition + surfaceNormal * 0.02,
+           direction,
+           maxDistance,
+           uv,
+           distanceMeters))
+    {
+        return vec3(0.0);
+    }
+
+    const ivec2 hitPixel = ivec2(clamp(
+        uv * vec2(ssExtent), vec2(0.0), vec2(ssExtent - ivec2(1))));
+
+    const vec3 radiance = ssSamplePrevColor(ssReproject(uv, hitPixel));
+
+    // 命中点法线与反射面法线要"对得上"，否则是掠射/背面误命中
+    const vec3 hitNormal =
+        normalize(imageLoad(normalRoughnessImage, hitPixel).xyz);
+    const float alignment =
+        smoothstep(0.0, 0.35, dot(hitNormal, -direction));
+
+    const float edgeFade =
+        smoothstep(0.0, 0.05, uv.x) * smoothstep(0.0, 0.05, 1.0 - uv.x) *
+        smoothstep(0.0, 0.05, uv.y) * smoothstep(0.0, 0.05, 1.0 - uv.y);
+
+    confidence = alignment * edgeFade;
+    hitDistanceMeters = distanceMeters;
+    return max(radiance, vec3(0.0));
 }
 
 // ============================================================================
@@ -705,34 +769,40 @@ void main()
     // 采样抖动全部来自蓝噪声（ssRandom()），这里不再需要 hash 状态
 
     // ========================================================================
-    // SSR：替换镜面分项
+    // 镜面门控（2026-11-03 提到两个 pass 之前）
+    //
+    // SSR 与 SSPT 现在共用同一组判据。分成两份写的代价在这个仓库里已经兑过现
+    // ——"两份距离判断各写一次，改一处漏一处 ⇒ 静默变黑"（rt_test.rgen:21651）。
     // ========================================================================
-    if(ssrEnabled)
+    const float specularHitDistance = imageLoad(specularHitImage, pixel).r;
+
+    // 纯漫反射面（镜面反照率 ≈ 0）不参与替换：否则会减掉 specTerm 却补回 ~0，
+    // 表现为远处粗糙表面被压黑。
+    const bool specularLobePresent =
+        dot(specularAlbedo, vec3(1.0 / 3.0)) > 0.01;
+
+    // 粗糙度剔除（AMD SSSR 的 roughnessThreshold 同口径：粗糙面不打线）。
+    // 差别只在回退：它的回退是环境贴图，我们的回退是 RT 已经算好的那一份。
+    const bool roughnessAccepted =
+        surfaceRoughness <= SS_SSR_ROUGHNESS_MAX;
+
+    // 12 区块硬性门槛的软化：硬切会在 192 格处留下"RT 反射 ↔ SSR 反射"接缝。
+    const float ssrGate = smoothstep(
+        SS_SSR_MIN_CHUNKS * SS_CHUNK_METERS,
+        SS_SSR_MIN_CHUNKS * SS_CHUNK_METERS + 32.0,
+        specularHitDistance);
+
+    // 本像素的镜面归谁：RT 命中距离 > 12 区块 ⇒ SSR（远场）；
+    // 其余且表面在 SSPT 射程内 ⇒ SSPT 的近场镜面。**互斥**，不会双替换。
+    const bool ssrOwnsPixel =
+        ssrEnabled && specularLobePresent && roughnessAccepted &&
+        ssShouldRunSsr(pixel, specularHitDistance);
+
+    // ========================================================================
+    // SSR：替换镜面分项（远场，>12 区块）
+    // ========================================================================
+    if(ssrOwnsPixel)
     {
-        const float specularHitDistance = imageLoad(specularHitImage, pixel).r;
-
-        // 纯漫反射面（镜面反照率 ≈ 0）不参与替换：否则会减掉 specTerm 却
-        // 补回 ~0，表现为远处粗糙表面被压黑。
-        const bool specularLobePresent =
-            dot(specularAlbedo, vec3(1.0 / 3.0)) > 0.01;
-
-        // 粗糙度剔除（AMD SSSR 的 roughnessThreshold 同口径：粗糙面不打线）。
-        // 差别只在回退：它的回退是环境贴图，我们的回退是 RT 已经算好的那一份
-        // （等价但更准），所以这里剔除只省算力、不改画面。
-        const bool roughnessAccepted =
-            surfaceRoughness <= SS_SSR_ROUGHNESS_MAX;
-
-        // 12 区块硬性门槛的软化：硬切会在 192 格处留下"RT 反射 ↔ SSR 反射"的
-        // 接缝（两者内容来源不同）。官方做法是命中后按 confidence 在 SSR 与
-        // 环境回退之间插值；我们的等价做法是把门槛做成 32 格的 smoothstep。
-        const float ssrGate = smoothstep(
-            SS_SSR_MIN_CHUNKS * SS_CHUNK_METERS,
-            SS_SSR_MIN_CHUNKS * SS_CHUNK_METERS + 32.0,
-            specularHitDistance);
-
-        if(specularLobePresent && roughnessAccepted &&
-           ssShouldRunSsr(pixel, specularHitDistance))
-        {
             const vec3 viewDirection = normalize(ssCameraPosition - surfacePosition);
             const vec3 mirrorDirection =
                 reflect(-viewDirection, surfaceNormal);
@@ -785,18 +855,24 @@ void main()
                         vec4(hitDistance, 0.0, 0.0, 0.0));
                 }
             }
-        }
     }
 
     // ========================================================================
-    // SSPT：替换间接光分项（只在射程内，比例式差分）
+    // SSPT：射程内的间接光 + 近场镜面（2026-11-03 后两项）
     // ========================================================================
     if(ssptEnabled)
     {
         const float rangeMeters = cam.ssHybridParams.x * SS_CHUNK_METERS;
 
+        // 环境底辐亮度（rgen 写在 specTerm.a 里）。它是屏幕外那一半唯一
+        // "已知"的光：SSPT 的射线一出屏就什么都找不到，不退回它，室内/贴墙
+        // 就是黑洞 —— 这是屏幕空间追踪最典型的破功点。
+        // 不乘任何自造系数：环境底本身就是用户可调的物理量。
+        const float ambientFallback = imageLoad(specTermImage, pixel).a;
+
         if(surfaceDistance <= rangeMeters)
         {
+            // ---- 间接（漫反射）----
             float confidence = 0.0;
             const vec3 traced =
                 ssptTrace(surfacePosition, surfaceNormal, rangeMeters,
@@ -809,9 +885,8 @@ void main()
 
                 if(referenceRadiance > 1.0e-3)
                 {
-                    // 比例替换：未知的 brdfWeight / 1.8 / rtaoFactor 全部约掉。
-                    // 归一化口径必须与 rgen 写 giTerm.a 时一致（那里是
-                    // dot(indirectLight, 1/3)，不是亮度加权）。
+                    // RT 有间接光 ⇒ 比例替换（未知的 brdfWeight / 1.8 /
+                    // rtaoFactor 全部约掉；归一化口径与 rgen 写 giTerm.a 一致）
                     const float tracedRadiance =
                         dot(traced, vec3(1.0 / 3.0));
                     const float ratio =
@@ -821,8 +896,44 @@ void main()
                 }
                 else
                 {
-                    // RT 这里没有间接光可言（全遮蔽）⇒ 直接补，没有双计风险
-                    color += diffuseAlbedo * traced * confidence;
+                    // RT 间接光为 0（GI 跳数 = Off）⇒ SSPT 全权接管。
+                    // 必须扣掉环境底：环境底是"整个半球"的粗糙替身，而屏幕
+                    // 空间那份只是它的一部分，不扣就在 GI 关掉时把环境底
+                    // 加两遍（贴墙处双层亮）。
+                    color += diffuseAlbedo *
+                             (traced - vec3(ambientFallback)) *
+                             confidence;
+                }
+            }
+
+            // ---- 镜面（近场，与 SSR 互斥）----
+            if(specularLobePresent && roughnessAccepted && !ssrOwnsPixel)
+            {
+                float specularConfidence = 0.0;
+                float specularHitDistanceMeters = 0.0;
+
+                const vec3 specularTraced = ssptSpecularTrace(
+                    surfacePosition,
+                    surfaceNormal,
+                    surfaceRoughness,
+                    rangeMeters,
+                    specularConfidence,
+                    specularHitDistanceMeters);
+
+                if(specularConfidence > 0.0)
+                {
+                    const vec3 specularTerm =
+                        imageLoad(specTermImage, pixel).rgb;
+
+                    color = color - specularTerm * specularConfidence +
+                            specularAlbedo * specularTraced * specularConfidence;
+
+                    // 与 SSR 同一条 RR 契约：换了镜面内容就要把命中距离交回
+                    // RR，否则它按 RT 的旧距离重投影 ⇒ 反射拖影。
+                    imageStore(
+                        specularHitImage,
+                        pixel,
+                        vec4(specularHitDistanceMeters, 0.0, 0.0, 0.0));
                 }
             }
         }

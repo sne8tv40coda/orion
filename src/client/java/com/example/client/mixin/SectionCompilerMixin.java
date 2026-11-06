@@ -17,6 +17,7 @@ import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.StainedGlassBlock;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.PalettedContainer;
+import net.minecraft.util.BitStorage;
 import org.lwjgl.system.MemoryUtil;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
@@ -146,6 +147,11 @@ public class SectionCompilerMixin {
     private static volatile Object SC_DEDUP_LEVEL = null;
 
     private static final AtomicLong SC_COUNT = new AtomicLong();
+
+    // 2026-11-04：报告的时间兜底。只按"每 256 段"触发时，小场景（一局只编译
+    // 两三百段）可能刚好错过边界，整局拿不到任何分相数据。
+    private static volatile long SC_LAST_REPORT_NANOS = System.nanoTime();
+    private static final long SC_REPORT_INTERVAL_NANOS = 10_000_000_000L;
     private static final AtomicLong SC_TOTAL_NANOS = new AtomicLong();
     private static final AtomicLong SC_MAX_NANOS = new AtomicLong();
     private static final AtomicLong SC_TAG_NANOS = new AtomicLong();
@@ -159,6 +165,26 @@ public class SectionCompilerMixin {
 
     private static final boolean SECTION_FAST_FILL =
             Boolean.getBoolean("rtx.sectionFastFill");
+
+    // 2026-11-04：体素填充的两条快路径（默认开，环境变量可关，不需要重编）。
+    //   ORION_VOXEL_DIRECT_SECTION=0 -> 退回 region.getBlockState(pos)
+    //   ORION_VOXEL_SINGLE_FILL=0    -> 退回逐体素的三重循环
+    private static boolean rtx$envFlag(String name, boolean fallback) {
+        final String raw = System.getenv(name);
+        if (raw == null || raw.isEmpty()) {
+            return fallback;
+        }
+        return !(raw.charAt(0) == '0'
+                || raw.charAt(0) == 'f'
+                || raw.charAt(0) == 'F');
+    }
+
+    private static final boolean VOXEL_DIRECT_SECTION =
+            rtx$envFlag("ORION_VOXEL_DIRECT_SECTION", true);
+    private static final boolean VOXEL_SINGLE_FILL =
+            rtx$envFlag("ORION_VOXEL_SINGLE_FILL", true);
+    private static final boolean VOXEL_PALETTE_WORDS =
+            rtx$envFlag("ORION_VOXEL_PALETTE_WORDS", true);
     private static final boolean PALETTE_DIAG =
             Boolean.getBoolean("rtx.diag.sectionPalette");
 
@@ -583,7 +609,12 @@ public class SectionCompilerMixin {
         SC_CLEAR_NANOS.addAndGet(scClearNanos);
         SC_VOXEL_NANOS.addAndGet(scVoxelNanos);
 
-        if (SC_COUNT.incrementAndGet() % SC_REPORT_WINDOW == 0L) {
+        // 2026-11-04：段数窗口 或 时间兜底，二者先到先打。
+        final long scReportCount = SC_COUNT.incrementAndGet();
+        final long scReportNow = System.nanoTime();
+        if (scReportCount % SC_REPORT_WINDOW == 0L
+                || scReportNow - SC_LAST_REPORT_NANOS >= SC_REPORT_INTERVAL_NANOS) {
+            SC_LAST_REPORT_NANOS = scReportNow;
             scReport();
         }
     }
@@ -1844,6 +1875,201 @@ public class SectionCompilerMixin {
         }
     }
 
+    // 2026-11-04（#1）：取本段的 BitStorage 与调色板。
+    // 任何一步不成立都返回 null（不抛异常），调用点据此跳过快路径。
+    private static BitStorage rtx$paletteStorage(
+            PalettedContainer<BlockState> palette, int paletteSize) {
+        if (!VOXEL_PALETTE_WORDS
+                || palette == null
+                || paletteSize <= 1
+                || paletteSize > 1024) {
+            return null;
+        }
+
+        try {
+            // 2026-11-04：改为反射取 Data（@Accessor 无法匹配私有嵌套类型，
+            // 见 PalettedContainerAccessor 顶部的说明）。
+            final PalettedContainerStorageAccessor data =
+                    PalettedContainerAccessor.data(palette);
+            if (data == null) {
+                return null;
+            }
+
+            final BitStorage storage = data.orion$storage();
+
+            // 0 bit = ZeroBitStorage = 整段同一个 id，交给 #2 的单值快填。
+            if (storage == null || storage.getBits() == 0) {
+                return null;
+            }
+
+            return storage;
+        } catch (Throwable notApplied) {
+            return null;
+        }
+    }
+
+    // 2026-11-04（#1）：按调色板 id 预计算，再按下标展开 4096 个体素。
+    // 返回 false 表示这次没处理（调用点回退到逐格循环）。
+    // counters = { emissiveVoxels, maxEmission, glassBlocks }。
+    private static boolean rtx$fillVoxelsFromPalette(
+            PalettedContainer<BlockState> palette,
+            int paletteSize,
+            BitStorage storage,
+            int[] vptRed,
+            int[] vptGreen,
+            int[] vptBlue,
+            int[] vptCount,
+            ByteBuffer voxelBuffer,
+            SectionScratch scratch,
+            int[] counters) {
+        final BlockState[] stateById = scratch.stateById;
+        final int[] wordById = scratch.wordById;
+        final int[] emissionById = scratch.emissionById;
+        final int[] glassById = scratch.glassById;
+        final int[] countById = scratch.countById;
+        final boolean[] stainedById = scratch.stainedById;
+        final int[] cursor = scratch.paletteCursor;
+
+        if (paletteSize > stateById.length) {
+            return false;
+        }
+
+        // forEachInPalette 就是 0..palette.getSize()-1 顺序（PalettedContainer:283），
+        // 与 storage 里的 id 一一对应。
+        cursor[0] = 0;
+        palette.forEachInPalette(state -> {
+            final int slot = cursor[0]++;
+            if (slot < stateById.length) {
+                stateById[slot] = state;
+            }
+        });
+
+        java.util.Arrays.fill(countById, 0, paletteSize, 0);
+
+        for (int id = 0; id < paletteSize; ++id) {
+            final BlockState state = stateById[id];
+            if (state == null) {
+                return false;
+            }
+
+            final int emission = Math.max(0, Math.min(15, state.getLightEmission()));
+            final int glassMarker = getTrackedGlassMarker(state);
+
+            // 复用 #2 的单值布局函数：它给出的就是"无 VPT 颜色贡献"时的完整字。
+            wordById[id] = rtx$singleStateVoxelWord(state, emission, glassMarker);
+            emissionById[id] = emission;
+            glassById[id] = glassMarker;
+            stainedById[id] = glassMarker >= 3 && glassMarker <= 18;
+        }
+
+        final int voxelCount = SECTION_EDGE * SECTION_EDGE * SECTION_EDGE;
+
+        for (int voxel = 0; voxel < voxelCount; ++voxel) {
+            final int id = storage.get(voxel);
+            ++countById[id];
+
+            int word = wordById[id];
+
+            // 染色玻璃固定用染料色（与循环体一致）；其余才叠加 VPT 颜色。
+            if (!stainedById[id]) {
+                final int contribution = vptCount[voxel];
+                if (contribution != 0) {
+                    final int denominator = contribution * 255;
+                    final int bias = contribution * 127;
+                    word |= (Math.min(31, (vptRed[voxel] * 31 + bias) / denominator) << 11)
+                            | (Math.min(31, (vptGreen[voxel] * 31 + bias) / denominator) << 16)
+                            | (Math.min(31, (vptBlue[voxel] * 31 + bias) / denominator) << 21);
+                }
+            }
+
+            voxelBuffer.putInt(word);
+        }
+
+        for (int id = 0; id < paletteSize; ++id) {
+            final int count = countById[id];
+            if (count == 0) {
+                continue;
+            }
+            if (emissionById[id] > 0) {
+                counters[0] += count;
+            }
+            if (glassById[id] >= 2) {
+                counters[2] += count;
+            }
+            if (emissionById[id] > counters[1]) {
+                counters[1] = emissionById[id];
+            }
+        }
+
+        return true;
+    }
+
+    // 2026-11-04（#2）：整段同值时的体素字。
+    //
+    // 必须与 uploadSectionVoxelLight 的循环体逐位一致 —— 唯一差别是 VPT 颜色项：
+    // 循环体里 r5/g5/b5 来自 (vptRed*31 + vptCount*127)/(vptCount*255)，而调用本函数
+    // 的前提是 vptCount 全为 0，此时那三项都退化成 0（染色玻璃除外，颜色固定）。
+    // 若将来改了循环体的位布局，这里必须一起改。
+    private static int rtx$singleStateVoxelWord(
+            BlockState state, int emissionClamped, int glassMarker) {
+        final int voxelClass;
+        int partialTransmission = 0;
+
+        if (glassMarker >= 2) {
+            voxelClass = VLI_VOXEL_TRANSLUCENT;
+        } else if (state.canOcclude()) {
+            if (state.isSolidRender()) {
+                voxelClass = VLI_VOXEL_OPAQUE;
+            } else {
+                final int fillPermille = occlusionFillPermille(state);
+                if (fillPermille <= 0) {
+                    voxelClass = VLI_VOXEL_TRANSLUCENT;
+                } else if (fillPermille >= 1000) {
+                    voxelClass = VLI_VOXEL_OPAQUE;
+                } else {
+                    voxelClass = VLI_VOXEL_PARTIAL;
+                    partialTransmission = Math.max(
+                            1,
+                            Math.min(
+                                    VLI_PARTIAL_MAX,
+                                    (VLI_PARTIAL_MAX * (1000 - fillPermille) + 500) / 1000
+                            )
+                    );
+                }
+            }
+        } else {
+            voxelClass = VLI_VOXEL_TRANSLUCENT;
+        }
+
+        final boolean stainedGlass = glassMarker >= 3 && glassMarker <= 18;
+
+        int r5 = 0;
+        int g5 = 0;
+        int b5 = 0;
+
+        if (stainedGlass) {
+            final int rgb = net.minecraft.world.item.DyeColor
+                    .byId(glassMarker - 3)
+                    .getFireworkColor();
+            r5 = (((rgb >> 16) & 0xFF) * 31 + 127) / 255;
+            g5 = (((rgb >> 8) & 0xFF) * 31 + 127) / 255;
+            b5 = ((rgb & 0xFF) * 31 + 127) / 255;
+        }
+
+        final int typeCode = emissionClamped > 0
+                ? classifyLocalLightType(state)
+                : 0;
+
+        return voxelClass
+                | (emissionClamped << 2)
+                | (typeCode << 6)
+                | (r5 << 11)
+                | (g5 << 16)
+                | (b5 << 21)
+                | (stainedGlass ? VLI_STAINED_GLASS_BIT : 0)
+                | (partialTransmission << VLI_PARTIAL_SHIFT);
+    }
+
     private static int uploadSectionVoxelLight(
             SectionPos sectionPos,
             net.minecraft.client.renderer.chunk.RenderSectionRegion region,
@@ -1921,9 +2147,78 @@ public class SectionCompilerMixin {
             }
         }
 
-        final int scanEdge = (SECTION_FAST_FILL && allAir) ? 0 : SECTION_EDGE;
+        // 2026-11-04（#1）：拿本段调色板容器的位存储。
+        // 拿到就用"按 id 预计算 + 线性下标展开"的快路径；拿不到返回 null，
+        // 整条快路径跳过，行为与 #2/#3 之后完全一致。
+        final BitStorage sectionStorage = rtx$paletteStorage(palette, paletteSize);
+
+        int scanEdge = (SECTION_FAST_FILL && allAir) ? 0 : SECTION_EDGE;
         if (scanEdge == 0) {
             MemoryUtil.memSet(MemoryUtil.memAddress(voxelBuffer, 0), 0, SECTION_VOXEL_BYTES);
+        } else if (VOXEL_SINGLE_FILL
+                && paletteSize == 1
+                && !scratch.vptAny
+                && probe.first != null
+                && !probe.first.isAir()) {
+            // 2026-11-04（#2）：整段同值快填。
+            //
+            // 条件：本段只有一个调色板表项（整段同一种方块），且本段没有任何 VPT
+            // 颜色贡献（clearVoxelAccumulators 在每个 section 开始时把 vptAny 清 0，
+            // 所以 vptAny==false ⇒ 4096 个 vptCount 全是 0 ⇒ 逐体素的 r5/g5/b5
+            // 恒为 0）。此时 4096 个体素字完全相同，三重循环可以整体跳过。
+            // 地下实心段、整段水、整段石头都属于这一类。
+            //
+            // 把 scanEdge 置 0（而不是复制一份循环体）是让下面那段**未改动**的
+            // 三重循环自然空转，把"两处逻辑必须同步"的风险降到零。
+            final BlockState onlyState = probe.first;
+            final int onlyEmission =
+                    Math.max(0, Math.min(15, onlyState.getLightEmission()));
+            final int onlyGlassMarker = getTrackedGlassMarker(onlyState);
+
+            if (onlyGlassMarker >= 2) {
+                trackedGlassBlocks += SECTION_VOXEL_COUNT;
+            }
+            if (onlyEmission > 0) {
+                emissiveVoxelCount += SECTION_VOXEL_COUNT;
+                maxEmission = Math.max(maxEmission, onlyEmission);
+            }
+
+            final int onlyWord = rtx$singleStateVoxelWord(
+                    onlyState, onlyEmission, onlyGlassMarker);
+
+            for (int voxel = 0; voxel < SECTION_VOXEL_COUNT; ++voxel) {
+                voxelBuffer.putInt(onlyWord);
+            }
+
+            scanEdge = 0;
+        } else if (VOXEL_PALETTE_WORDS
+                && sectionStorage != null
+                && palette != null
+                && paletteSize > 1) {
+            // 2026-11-04（#1）：整段按下标展开。
+            // 每个调色板表项只分类一次，4096 次循环里只剩
+            //   storage.get(i) + 查表 + （有 VPT 时）颜色混合 + putInt
+            final int[] voxelCounters = scratch.voxelCounters;
+            voxelCounters[0] = 0;
+            voxelCounters[1] = 0;
+            voxelCounters[2] = 0;
+
+            if (rtx$fillVoxelsFromPalette(
+                    palette,
+                    paletteSize,
+                    sectionStorage,
+                    vptRed,
+                    vptGreen,
+                    vptBlue,
+                    vptCount,
+                    voxelBuffer,
+                    scratch,
+                    voxelCounters)) {
+                emissiveVoxelCount += voxelCounters[0];
+                maxEmission = Math.max(maxEmission, voxelCounters[1]);
+                trackedGlassBlocks += voxelCounters[2];
+                scanEdge = 0;
+            }
         }
 
         final long scTLoop = System.nanoTime();
@@ -1940,16 +2235,32 @@ public class SectionCompilerMixin {
                         final int worldX =
                                 minX + localX;
 
-                        pos.set(
-                                worldX,
-                                worldY,
-                                worldZ
-                        );
-
+                        // 2026-11-04（#3）：直接读本段的 PalettedContainer，绕开
+                        // RenderSectionRegion / SectionCopy 的三层包装。
+                        //
+                        // 原路径（MC 26.3 反编译源码，见 .tmp/mcsrc）：
+                        //   region.getBlockState(pos)              RenderSectionRegion:36
+                        //     -> blockToSectionCoord ×3 + sections[index(..)]
+                        //     -> SectionCopy.getBlockState(pos)    SectionCopy:47
+                        //        （debug 分支 + try/catch + x&15,y&15,z&15）
+                        //     -> PalettedContainer.get(x,y,z)      PalettedContainer:136
+                        //        -> strategy.getIndex + palette.valueFor(storage.get(id))
+                        // 4096 个方块每个都要重做这些坐标换算与 section 定位，而本段
+                        // 自己的 palette 就在上面（sectionCopyAt 已经取到）。
+                        //
+                        // 快路径只在 palette 已知且非空时启用 —— 此时"本段"就是缓存
+                        // 的那一个 section，坐标用 localX/localY/localZ 等价于原来的
+                        // x&15/y&15/z&15。其余情况（空段、快照缺失）仍走原路径。
+                        //
+                        // ⚠ 已知差异：DebugWorld（y=60 屏障 / y=70 调试图案）在
+                        // SectionCopy 里有合成分支，本快路径会读到真实方块。RT 路径
+                        // 不用于调试世界；需要时 ORION_VOXEL_DIRECT_SECTION=0 关掉。
                         final BlockState blockState =
-                                region.getBlockState(
-                                        pos
-                                );
+                                palette != null && VOXEL_DIRECT_SECTION
+                                        ? palette.get(localX, localY, localZ)
+                                        : region.getBlockState(
+                                                pos.set(worldX, worldY, worldZ)
+                                        );
 
                         if (blockState.isAir()) {
                             voxelBuffer.putInt(0);
@@ -2107,6 +2418,16 @@ public class SectionCompilerMixin {
                 .order(ByteOrder.nativeOrder());
         final PaletteProbe paletteProbe = new PaletteProbe();
         boolean vptAny;
+
+        // 2026-11-04（#1）：按调色板 id 的预计算表（上界 1024，超过就放弃快路径）。
+        final BlockState[] stateById = new BlockState[1024];
+        final int[] wordById = new int[1024];
+        final int[] emissionById = new int[1024];
+        final int[] glassById = new int[1024];
+        final int[] countById = new int[1024];
+        final boolean[] stainedById = new boolean[1024];
+        final int[] paletteCursor = new int[1];
+        final int[] voxelCounters = new int[3];
 
         void clearVoxelAccumulators() {
             java.util.Arrays.fill(vptRed, 0);

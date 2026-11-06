@@ -817,6 +817,18 @@ JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_setSSRRange(
     return JNI_TRUE;
 }
 
+// 2026-11-03：RT 光泽射线总开关（「RT 光泽反射」UI 项）。
+// 关掉后 rgen 整段跳过 GGX 反射射线，镜面由 SSR（远场）/ SSPT（射程内）接手。
+extern "C"
+JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_setRTGlossyEnabled(
+    JNIEnv*,
+    jclass,
+    jboolean enabled)
+{
+    g_ssRtGlossy.store(enabled == JNI_TRUE ? 1.0f : 0.0f);
+    return JNI_TRUE;
+}
+
 extern "C"
 JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_setCloudSunForwardScattering(
     JNIEnv*,
@@ -1598,6 +1610,31 @@ JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_setFogExtrasPara
         std::min(std::max(static_cast<float>(values[2]), 0.0f), 1.0f));
     g_fogTemporalJitterStrength.store(
         std::min(std::max(static_cast<float>(values[3]), 0.0f), 1.0f));
+
+    g_volumetricCloudHistoryNeedsClear.store(true);
+    return JNI_TRUE;
+}
+
+// 2026-11-04：贴地薄雾四车道（godRayParams[4..7]，消费方 volumetric_fog.glsl）。
+// {enabled, 层厚标尺(×6=e折叠格数), 浓度(×0.05=每格消光), 距相机淡出半径(格)}。
+extern "C"
+JNIEXPORT jboolean JNICALL Java_com_example_vulkan_NativeVulkan_setFogGroundMistParams(
+    JNIEnv* env, jclass, jfloatArray params)
+{
+    if(params == nullptr || env->GetArrayLength(params) < 4) return JNI_FALSE;
+    jfloat values[4];
+    env->GetFloatArrayRegion(params, 0, 4, values);
+    for(int i = 0; i < 4; ++i)
+    {
+        if(!std::isfinite(static_cast<float>(values[i]))) return JNI_FALSE;
+    }
+    g_fogGroundMistEnabled.store(values[0] != 0.0f);
+    g_fogGroundMistHeight.store(
+        std::min(std::max(static_cast<float>(values[1]), 0.25f), 8.0f));
+    g_fogGroundMistExtinction.store(
+        std::min(std::max(static_cast<float>(values[2]), 0.0f), 1.0f));
+    g_fogGroundMistDistance.store(
+        std::min(std::max(static_cast<float>(values[3]), 8.0f), 96.0f));
 
     g_volumetricCloudHistoryNeedsClear.store(true);
     return JNI_TRUE;

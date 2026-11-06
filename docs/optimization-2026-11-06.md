@@ -85,6 +85,7 @@ over 的退出条件是 ratio < lowWater(0.62)，但驱逐只释放 BLAS（asBla
 | 6 | 淘汰每次在锁内**全表扫** 3253 页 | 等距抽样上限 256（`VLI_EVICT_SCAN_LIMIT`） | `wait` 7~10 → **0** |
 | 7 | `chunkUnloadScan` 单次持锁 **42 ms** | 探针查明 98% 在 `g_vliSections.erase()`（节点内联 `VLISectionCpuPage`，180 µs/次，锁内析构大块）⇒ **先 move 出大对象、锁外析构** | 3043 次列卸载、8059 页摘除，**一次都没超过 1 ms**，该 site 从 `[VLI LOCK]` 彻底消失 |
 | 8 | 淘汰路径同样的 erase 代价（一局 5887 次） | 同样 move-out 到 `thread_local` 容器 + 每帧锁外 drain | `pending` max 3.65 → **2.69 ms** |
+| 9 | **第 4 项改完后的回归**：判据变「距离」后淘汰从"偶尔跑"变成"快速移动时持续跑"，但 `evictFarthestVLIPageImpl` 尾部**仍是锁内同步 125×125** | 与第 2 项同一机制：只收集受影响页，帧内统一重建 | `rest` 8.89 ms（max 37.9）与 `wait` max 47.5 消失；末尾 `fps` 150→22.8 的塌陷不再复现 |
 
 ### 探针实测（第 7 项的依据）
 
@@ -110,25 +111,76 @@ over 的退出条件是 ratio < lowWater(0.62)，但驱逐只释放 BLAS（asBla
 
 ---
 
-## 6. 验证后**回退**的尝试（避免以后重复踩）
+## 6. 捕获链：split 缓冲池化 + 驱逐半径修正（本轮决定性改动）
+
+### 6.1 `SectionGeometrySplit` 缓冲池化
+
+**问题**：捕获线程在 `g_chunkMutex` 内为每个 Section 新建十几个 vector（最多 16K 顶点 / 几百 KB）。首次触碰触发缺页，`CAPSLOW` 的**墙钟 / CPU 周期比高达 14~25 倍**（frame=9660：墙钟 35.96 ms，实际 CPU 仅 ≈1.45 ms），单段持锁 `capHoldMs` 8.4~9.4 ms —— 这是 `pre`（等锁）与 `upWaitMs`（上传线程等锁）的共同根因。
+
+**改法**：split 在消费端（build 循环）只被**读**（`&update.second.opaque` 这类取指针），没有 move 走，所以用完可连同容量回收复用。
+
+| 文件 | 改动 |
+|---|---|
+| `OrionInternal.h` | 声明 `takeSectionSplitFromPool()` / `returnSectionSplitToPool()` |
+| `Geometry.cpp` | 池实现（上限 24、只回收有容量的、复位 `hasOmmInput`/`ommInput`）；捕获线程改为取热 buffer |
+| `WorldGeometry.cpp` | RAII guard 在 `rebuildWorldGeometry` 返回时归还全部 split（覆盖所有 early return）；两处 `SectionGeometrySplit{}` 改为从池取 |
+
+**实测**（双方都是 `capPerWake=1`，唯一差别是池）：
+
+| 指标 | 无池 | 池化 |
+|---|---|---|
+| `capHoldMs` | 8.4 ~ 9.4 ms | **2.5 ms** |
+| `upWaitMs` | 14.2 ms | 11.6 ms |
+| `geometry` avg | 5.64 ~ 8.58 ms | **3.73 ~ 5.39 ms** |
+| **`fps`（10 分钟 / 107341 帧）** | 165 → 71 → 58 → 48（持续衰减） | **165.5 恒定** |
+
+帧率分布（1789 个窗口）：`p10=163.7 / avg=159.9 / max=178.8`；`rssMB=8648` 而 `peakRssMB=8653`（零增长），`nonResident=0`、`secEvicted=0`、`gap=-16`。
+
+### 6.2 驱逐 / 补回半径修正（修「很多区块怎么也不加载」）
+
+**现象**：`meshSec=6682` 而 `blas=4447`（差 2235）、`nonResident=2665`、`secEvicted=3004` 但 `secRehydrated=230`。
+
+**根因**：`vramEvictKeepRadius()` 默认 **96** ⇒ over 时 keep=72、**驱逐半径 90**、**补回半径 72**，而 16 区块视距是 **256 格**。视野内 90~256 格那一大片被踢出 BLAS 后**永远回不来**。
+
+**改法**（`Settings.cpp`）：
+
+| 参数 | 改前 | 改后 | 效果 |
+|---|---|---|---|
+| `vramEvictKeepRadius()` | 96 | **288** | over 时驱逐半径 → 270、补回 → 216，视野内不再被误踢 |
+| `vramRehydratePerPass()` | 16 | **64** | 万一积压，排空速度 ×4 |
+
+**实测**：`gap=-4 ~ -19`、`nonResident=0`、`secEvicted=0`，区块不再缺失。
+
+### 6.3 捕获节流 `ORION_CAPTURE_PER_WAKE=1`
+
+每次唤醒的段数 4 → 1：`bld` 3.44 → **0.51 ms**，`geometry` 12.24 → **8.58 ms**（叠加 6.1 后到 3.73~5.39）。
+**代价**：`upWaitMs` 9.0 → 11.6~14.2（上传线程等得更久），区块上传变慢。
+
+---
+
+## 7. 验证后**回退**的尝试（避免以后重复踩）
 
 | 尝试 | 结果 | 原因 |
 |---|---|---|
 | **段数/距离驱动驱逐**（`ORION_SECTION_MAX_COUNT` 默认 4000） | **负优化，默认改回 0** | 16 区块视野内真实段数就是 ~6000，4000 上限让系统永远超限 ⇒ 每 4 帧全表扫 + 持续驱逐且降不下来：`asRetireN` 1130→2519、`upWaitMs` 12.8→19.2、`fps` 69.6→47.6。机制保留但默认关闭 |
 | **VLI 池增长改 fence 延迟回收** | **GPU 挂死，已回退** | 首次触发增长即 `5s timeout reached when waiting for VK semaphore` → `0xC0000409`。恢复 `vkQueueWaitIdle` 同步版后同条件稳定。结论：该路径是 8 个长期驻留 buffer 的整体切换，异步化需要 timeline semaphore 在帧边界注入，收益（一局 2×20 ms）不值风险 |
-| **`ORION_CAPTURE_PER_WAKE=1`** | 只是切片 | `capHoldMs` 10.6→2.7，但 `capWaitMs` 10.2→19.5 且加载变慢；尖峰根因是锁内堆分配/缺页，与持锁时长无关 |
+| ~~**`ORION_CAPTURE_PER_WAKE=1`**~~ | **先前判错，已改为采用**（见 6.3） | 早先的结论是"只是把工作切片、与持锁时长无关"。补充 6.1 的池化后重测：它确实把 `bld` 3.44 → 0.51、`geometry` 12.24 → 8.58，代价是 `upWaitMs` 上升。真正没用的是"只切小段、不解决缺页"——两者必须一起上 |
 | **TLAS UPDATE**（`updateTlas=false` 打开） | **不做** | `[RT GEOMETRY SLOW]` 实测 `tlas` 段 avg 0.24 / max 0.37 ms，收益仅 0.1 ms |
 
 ---
 
-## 7. 环境变量开关（本会话新增/使用）
+## 8. 环境变量开关（本会话新增/使用）
 
 | 变量 | 默认 | 作用 |
 |---|---|---|
+| `ORION_VRAM_EVICT_KEEP_RADIUS` | **288** | 保护半径（格）。**必须 ≥ 视距**，否则视野内会被驱逐且补不回（见 6.2） |
+| `ORION_VRAM_REHYDRATE_PER_PASS` | **64** | 每帧补回段数上限 |
 | `ORION_VRAM_EVICT_INTERVAL` | 4 | evict 帧节流；=1 回到逐帧（A/B） |
+| `ORION_VRAM_EVICT_PER_PASS` | 16 | 每帧驱逐段数上限 |
 | `ORION_NONRESIDENT_GUARD` | 3000 | 被驱逐段数上限，达到后停止驱逐；=0 关闭 |
-| `ORION_SECTION_MAX_COUNT` | 0 | 段数驱动驱逐上限；**默认关闭**（见第 6 节） |
+| `ORION_SECTION_MAX_COUNT` | 0 | 段数驱动驱逐上限；**默认关闭**（见第 7 节） |
 | `ORION_SECTION_KEEP_RADIUS` | 384 | 段数驱动时的保留半径（格） |
+| `ORION_CAPTURE_PER_WAKE` | 4 | 捕获线程每次唤醒处理的段数；=1 可降持锁（见 6.3，代价是 upWait 上升） |
 | `ORION_VLI_BUDGET_MS` | 4 | VLI apply 每帧时间预算 |
 | `ORION_VLI_SECTIONS_PER_FRAME` | 2 | VLI apply 每帧段数上限 |
 | `ORION_SHARC_RESOLVE_PARITY` | 2 | SHaRC resolve 隔帧 |
@@ -136,9 +188,10 @@ over 的退出条件是 ratio < lowWater(0.62)，但驱逐只释放 BLAS（asBla
 
 ---
 
-## 8. 已知未解决问题（下一步）
+## 9. 已知未解决问题（下一步）
 
-1. **`pending`（VLI apply 循环）avg 2.20 / max 2.69 ms** —— 受 `ORION_VLI_BUDGET_MS=4` 约束，属设计内；想再压可调到 2（代价：局部光照晚 1 帧）。
-2. **`rest` 6~7 ms** —— `recordVLIUpdates` 内仍未归因的 CPU（`apply`/`gather`/`upload`/`solve` 合计不到 2 ms）。
-3. **退出期 `0xC0000005 at nvoglv64.dll+0xA6639A`** —— 既有问题（`inWorld=0` 路径），与以上改动无关；15:23 / 17:43 / 18:12 / 18:30 / 19:31 / 19:36 / 20:28 全是同一签名，**未修**。
+1. **退出期挂死（比 AV 更严重的新症状）** —— 连续三局在退出时 `Responding=False`、持续烧 CPU（5 秒涨 4.9 s）、10 GB 不退，只能强杀；窗口已销毁（`FG-3 SWAPCHAIN/SURFACE DESTROY`）但进程不结束。更早的多局是 `0xC0000005 at nvoglv64.dll+0xA6639A`（15:23 / 17:43 / 18:12 / 18:30 / 19:31 / 19:36 / 20:28 同一签名）。两者都是退出路径，**均未修**。已给 `Frame.cpp` 帧首加了 6 个 `RTXMarkPhase` 打点（`frame:prio/hash/phaseCpu/persist/hotreload/atlas`），下次崩溃时 `[CRASH PATH]` 可直接定位到具体调用。
+2. **`preLoopMs` 11.4 / `tailMs` 9.4（窗口极值）** —— 预循环里 `orderedSections` 构建+排序、脏键候选扫描、`inst` 视锥剔除都是 O(段数)（16 区块约 6000~6900 段）。当前 `rebuildCalls` 仍 ≈1 次/帧，而 `asCreateN` 只有 ~2200，即**大量 rebuild 没有实活却照付 O(N) 尾部**，是下一个结构性目标。
+3. **`ORION_CAPTURE_PER_WAKE=1` 的代价**：`upWaitMs` 从 9.0 抬到 11.6~14.2，区块上传变慢。若体感加载变慢，可折中取值 2。
 4. **仓库根目录散落 177 个未跟踪 shader 文件**（`.rahit.spv`、`bloom_*.comp`、`camera_ubo.glsl` 等），疑似脚本误拷贝，**未提交**，建议清理。
+5. **部署一致性**：`src/main/resources/shaders` 曾被 gradle 用旧版覆盖，导致 RT 管线缓存键漂移、每次冷编 8~17 分钟。改动 shader 后必须同步 `cpp/shaders` → `src/main/resources/shaders` → `build/resources/main/shaders` → `run/shaders` 四处。

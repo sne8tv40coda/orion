@@ -737,6 +737,19 @@ uint32_t g_giHalfHeight = 0u;
 bool g_giHalfNeedsClear = false;
 VkImageView g_giHalfBoundView = VK_NULL_HANDLE;
 
+// 2026-11-04 A1：GI 时域重投影历史（binding 86/87）。
+VkImage g_giTemporalHistoryImages[2] =
+    {VK_NULL_HANDLE, VK_NULL_HANDLE};
+VkDeviceMemory g_giTemporalHistoryMemories[2] =
+    {VK_NULL_HANDLE, VK_NULL_HANDLE};
+VkImageView g_giTemporalHistoryViews[2] =
+    {VK_NULL_HANDLE, VK_NULL_HANDLE};
+VkImageLayout g_giTemporalHistoryLayouts[2] =
+    {VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_UNDEFINED};
+uint32_t g_giTemporalHistoryWidth = 0u;
+uint32_t g_giTemporalHistoryHeight = 0u;
+bool g_giTemporalHistoryNeedsClear = false;
+
 
 VkImage g_alphaBlendGbufferImage = VK_NULL_HANDLE;
 VkDeviceMemory g_alphaBlendGbufferMemory = VK_NULL_HANDLE;
@@ -1028,6 +1041,9 @@ std::atomic<float>
 // =====================================================
 std::atomic<float> g_ssptChunks{0.0f};
 std::atomic<float> g_ssrChunks{0.0f};
+
+// 出厂开：关闭是"仅屏幕空间镜面"的降级档，必须显式打开才会省下 RT 射线
+std::atomic<float> g_ssRtGlossy{1.0f};
 
 VkImage g_ssIndirectTermImage = VK_NULL_HANDLE;
 VkDeviceMemory g_ssIndirectTermMemory = VK_NULL_HANDLE;
@@ -1515,13 +1531,17 @@ std::unordered_map<uint64_t, VoxyLodSource> g_voxyLodSources;
 std::unordered_map<uint64_t, uint64_t> g_voxyLodSpatialOwners;
 std::vector<Vertex> g_entityFrameVertices;
 std::vector<Vertex> g_localPlayerFrameVertices;
+std::vector<Vertex> g_handFrameVertices;
 uint64_t g_entityCachedHash = 0u;
 bool g_entityCachedHashValid = false;
 uint64_t g_localPlayerCachedHash = 0u;
 bool g_localPlayerCachedHashValid = false;
+uint64_t g_handCachedHash = 0u;
+bool g_handCachedHashValid = false;
 std::vector<Vertex> g_particleFrameVertices;
 std::vector<float> g_entityFrameMotion;
 std::vector<float> g_localPlayerFrameMotion;
+std::vector<float> g_handFrameMotion;
 std::vector<float> g_particleFrameMotion;
 float g_dynamicCaptureCameraX = 0.0f;
 float g_dynamicCaptureCameraY = 0.0f;
@@ -1852,6 +1872,42 @@ VkStridedDeviceAddressRegionKHR g_giHalfMissRegion{};
 VkStridedDeviceAddressRegionKHR g_giHalfHitRegion{};
 VkStridedDeviceAddressRegionKHR g_giHalfCallableRegion{};
 bool g_giHalfPipelineFailed = false;
+
+VkPipeline g_k1Pipeline = VK_NULL_HANDLE;
+VkPipeline g_k2Pipeline = VK_NULL_HANDLE;
+// ③ K2-D/K2-I 直射/间接再拆分（默认开，ORION_K2_SPLIT=0 回退）
+VkPipeline g_k2dPipeline = VK_NULL_HANDLE;
+VkPipeline g_k2iPipeline = VK_NULL_HANDLE;
+VkStridedDeviceAddressRegionKHR g_k2dRaygenRegion{};
+VkStridedDeviceAddressRegionKHR g_k2dMissRegion{};
+VkStridedDeviceAddressRegionKHR g_k2dHitRegion{};
+VkStridedDeviceAddressRegionKHR g_k2dCallableRegion{};
+VkStridedDeviceAddressRegionKHR g_k2iRaygenRegion{};
+VkStridedDeviceAddressRegionKHR g_k2iMissRegion{};
+VkStridedDeviceAddressRegionKHR g_k2iHitRegion{};
+VkStridedDeviceAddressRegionKHR g_k2iCallableRegion{};
+VkImage g_k2DirectImage = VK_NULL_HANDLE;
+VkDeviceMemory g_k2DirectMemory = VK_NULL_HANDLE;
+VkImageView g_k2DirectView = VK_NULL_HANDLE;
+VkImageLayout g_k2DirectLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+uint32_t g_k2DirectWidth = 0u;
+uint32_t g_k2DirectHeight = 0u;
+VkBuffer g_k1LandingBuffer = VK_NULL_HANDLE;
+VkDeviceMemory g_k1LandingMemory = VK_NULL_HANDLE;
+VkBuffer g_k1k2SbtBuffer = VK_NULL_HANDLE;
+VkDeviceMemory g_k1k2SbtMemory = VK_NULL_HANDLE;
+VkStridedDeviceAddressRegionKHR g_k1RaygenRegion{};
+VkStridedDeviceAddressRegionKHR g_k1MissRegion{};
+VkStridedDeviceAddressRegionKHR g_k1HitRegion{};
+VkStridedDeviceAddressRegionKHR g_k1CallableRegion{};
+VkStridedDeviceAddressRegionKHR g_k2RaygenRegion{};
+VkStridedDeviceAddressRegionKHR g_k2MissRegion{};
+VkStridedDeviceAddressRegionKHR g_k2HitRegion{};
+VkStridedDeviceAddressRegionKHR g_k2CallableRegion{};
+bool g_k1K2PipelineFailed = false;
+uint32_t g_k1LandingWidth = 0u;
+uint32_t g_k1LandingHeight = 0u;
+uint32_t g_k1LandingSlots = 0u;
 uint32_t g_sharcStatsFrameTick = 0u;
 bool g_sharcStatsDone = false;
 VkDescriptorPool g_rtDescriptorRingPool = VK_NULL_HANDLE;

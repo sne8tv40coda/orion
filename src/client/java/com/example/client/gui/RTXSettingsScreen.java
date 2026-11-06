@@ -48,6 +48,9 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
     private float pendingSsptRange;
     private float pendingSsrRange;
 
+    // 2026-11-03 RT 光泽射线总开关（出厂 true）
+    private boolean pendingRtGlossy;
+
     private int pendingGiNearRate;
     private boolean pendingGlossyRoughLod;
 
@@ -230,6 +233,10 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
     private float fogExtrasGroundAnchorStrength;
     private float fogExtrasSkyAmbientStrength;
     private float fogExtrasTemporalJitterStrength;
+    private boolean pendingFogGroundMistEnabled;
+    private float pendingFogGroundMistHeight;
+    private float pendingFogGroundMistExtinction;
+    private float pendingFogGroundMistDistance;
     private float cloudAerialStrength;
     private float groundAerialStrength;
     private float groundAerialOcclusion;
@@ -439,6 +446,9 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
         this.pendingSsrRange =
                 RTXSettingsConfig.getSsrRange();
 
+        this.pendingRtGlossy =
+                RTXSettingsConfig.isRTGlossyEnabled();
+
         this.pendingGiNearRate =
                 NativeVulkan.getGiNearRate();
 
@@ -522,6 +532,13 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
         this.loadCloudTemporalSettings(RTXSettingsConfig.getCloudTemporalSettings());
 
         this.loadFogExtrasSettings(RTXSettingsConfig.getFogExtrasSettings());
+
+        RTXSettingsConfig.FogGroundMistSettings mist =
+                RTXSettingsConfig.getFogGroundMistSettings();
+        this.pendingFogGroundMistEnabled = mist.enabled();
+        this.pendingFogGroundMistHeight = mist.height();
+        this.pendingFogGroundMistExtinction = mist.extinction();
+        this.pendingFogGroundMistDistance = mist.distance();
 
         this.loadCloudAerialSettings(RTXSettingsConfig.getCloudAerialSettings());
 
@@ -1270,6 +1287,24 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
                 pendingFogStartDistance, "%.0f 格", value -> pendingFogStartDistance = (float) value));
         this.addOptionRow(cloudSlider("太阳取样点（性能）", 1, 8, 1,
                 pendingFogSunSteps, "%.0f", value -> pendingFogSunSteps = (int) Math.round(value)));
+
+        // 2026-11-04：贴地薄雾（godRayParams1 四车道）。层厚/浓度在 shader 里有
+        // ×6 / ×0.05 的标定映射，GUI 值维持旧档范围。
+        this.addOptionRow(CycleButton.builder(
+                        enabled -> Component.literal(enabled ? "开" : "关"),
+                        this.pendingFogGroundMistEnabled)
+                .withValues(false, true)
+                .create(Component.literal("贴地薄雾"),
+                        (button, enabled) -> this.pendingFogGroundMistEnabled = enabled));
+        this.addOptionRow(cloudSlider("薄雾层厚", 0.25, 8.0, 0.25,
+                pendingFogGroundMistHeight, "%.2f",
+                value -> pendingFogGroundMistHeight = (float) value));
+        this.addOptionRow(cloudSlider("薄雾浓度", 0.00, 1.00, 0.05,
+                pendingFogGroundMistExtinction, "%.2f",
+                value -> pendingFogGroundMistExtinction = (float) value));
+        this.addOptionRow(cloudSlider("薄雾作用距离（性能）", 8, 96, 2,
+                pendingFogGroundMistDistance, "%.0f 格",
+                value -> pendingFogGroundMistDistance = (float) value));
         this.flushOptionRow();
 
         this.addOptionRow(CycleButton.builder(
@@ -1702,6 +1737,23 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
         this.addOptionRow(cloudSlider("SSR 射程（0=关，最低 12）", 0.0, 64.0, 1.0,
                 this.pendingSsrRange, "%.0f 区块",
                 value -> this.pendingSsrRange = (float) value));
+
+        // 2026-11-03：RT 光泽射线总开关。关 = 镜面只由 SSR（远场）/ SSPT（射程内）
+        // 提供，对应的 RT 反射射线整段不再发射（这是"仅 SSPT + RTAO"的入口）。
+        CycleButton<Boolean> rtGlossyButton =
+                CycleButton.builder(
+                                enabled -> Component.literal(
+                                        enabled ? "开（RT 射线）" : "关（仅屏幕空间）"
+                                ),
+                                this.pendingRtGlossy
+                        )
+                        .withValues(true, false)
+                        .create(
+                                Component.literal("RT 光泽反射"),
+                                (button, enabled) -> this.pendingRtGlossy = enabled
+                        );
+
+        this.addOptionRow(rtGlossyButton);
 
 
         CycleButton<Integer> giNearRateButton =
@@ -2745,6 +2797,20 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
             allApplied = false;
         }
 
+        RTXSettingsConfig.FogGroundMistSettings updatedFogGroundMist =
+                new RTXSettingsConfig.FogGroundMistSettings(
+                        this.pendingFogGroundMistEnabled,
+                        this.pendingFogGroundMistHeight,
+                        this.pendingFogGroundMistExtinction,
+                        this.pendingFogGroundMistDistance
+                );
+        if(!NativeVulkan.isLoaded() ||
+                NativeVulkan.setFogGroundMistParams(updatedFogGroundMist.toParamArray())) {
+            RTXSettingsConfig.setFogGroundMistSettings(updatedFogGroundMist);
+        } else {
+            allApplied = false;
+        }
+
         RTXSettingsConfig.CloudAerialSettings updatedCloudAerial =
                 new RTXSettingsConfig.CloudAerialSettings(
                         cloudAerialStrength,
@@ -2883,6 +2949,18 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
             this.pendingSsrRange = RTXSettingsConfig.getSsrRange();
         } else {
             this.pendingSsrRange = RTXSettingsConfig.getSsrRange();
+            allApplied = false;
+        }
+
+        // 2026-11-03 RT 光泽射线总开关
+        if(!NativeVulkan.isLoaded() || NativeVulkan.setRTGlossyEnabled(
+                this.pendingRtGlossy
+        )) {
+            RTXSettingsConfig.setRTGlossyEnabled(
+                    this.pendingRtGlossy
+            );
+        } else {
+            this.pendingRtGlossy = RTXSettingsConfig.isRTGlossyEnabled();
             allApplied = false;
         }
 

@@ -17,6 +17,11 @@ layout(std430, binding = 20, set = 0) readonly buffer LodCoverage {
 } lodCoverage;
 
 // 该实例的角色。越界（不该发生）当近场地形处理，最坏结果只是不去重。
+// 2026-11-05 D1：callable TU（rt_test_material.rcall，-DORION_MATERIAL_CALLABLE
+// 由生成脚本写入）拿不到命中内建 ⇒ 整段屏蔽；它的材质层走
+// rchit_helpers_pom.glsl 的 materialLodRole()（按槽查表，等价实现）。
+// 宏未定义的 TU（rchit/rahit/rgen 全部变体）预处理结果与改动前逐字节相同。
+#ifndef ORION_MATERIAL_CALLABLE
 uint lodInstanceRole()
 {
     const uint slot =
@@ -29,6 +34,7 @@ uint lodInstanceRole()
 
     return lodRoles.roles[slot];
 }
+#endif
 
 // 该 chunk 柱的 8 bit 标志。网格外返回 0（= 未就绪 ⇒ 远场保持可见）。
 uint lodColumnFlags(ivec2 column)

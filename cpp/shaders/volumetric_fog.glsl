@@ -11,6 +11,10 @@ const float FOG_AMBIENT_SHADOW_FLOOR = 0.35;
 
 const int VFOG_SUNLIGHT_STEPS_MAX = 8;
 
+// 尾部淡出：最后这段占比的 march 距离内密度线性压到 0，替代旧档在 fogEnd 的
+// 硬切（VOLUMETRIC_FOG.md 记录过的"浓度平台"取舍）。
+const float FOG_TAIL_FADE_FRACTION = 0.18;
+
 struct FogResult
 {
     vec3 scattering;
@@ -194,6 +198,35 @@ FogResult evaluateAnalyticFog(
     const float fogTimeFactor =
         mix(1.0, max(rainBoost, 0.0), wetness);
 
+    // ===========================================================================
+    // 2026-11-04 贴地薄雾重构（godRayParams1 四车道复活）
+    //
+    // 病征（用户）："雨天的薄雾现在也有问题"。根因：10-31 删雾浪时把 shader 消费者
+    // 整段删除，而 C++ populateGroundMistParams() 一直在写 godRayParams[4..7] ——
+    // 四个原子量永远停在出厂值 (enabled/height=1.0/extinction=0.15/distance=48.0)，
+    // 等于"开着但从未生效"。
+    //
+    // 新口径：在主 march 密度场上叠加一个"距地面高度"的指数衰减项，与雾共享同一套
+    // 步进 / 太阳自阴影 / 相位 / 环境项 / 本地光衰减（不需要第二次 march；火把光
+    // 穿薄雾时也按积分衰减）。地面高度取 fogGroundAt（出地形范围回落到海平面 63，
+    // 与 FOG_ANCHOR_REFERENCE_Y 一致 ⇒ 海面上薄雾正好贴着水面）。
+    //   单位 = 每格消光。满雨带内雾 ≈3.9e-3/格；出厂 extinction 0.15 × 0.05 =
+    //   7.5e-3/格，落在旧雾浪峰值 FOG_WISP_EXTINCTION(0.0090) 附近。
+    //   height 1.0 × 6 = 6 格 e 折叠高度；distance 48 = 距相机开始淡出的半径（格）。
+    //   触发 = max(湿ness, 拂晓曲线 × 0.75)：雨天全开；晴天清晨/黄昏也有一层
+    //   （太阳仰角 [-0.12, 0.30] 的钟形，夜里与正午都是 0）。
+    // ===========================================================================
+    const vec4 mistLane = cam.godRayParams1;
+    const float mistGate = step(0.5, mistLane.x);
+    const float mistHeightScale = max(mistLane.y, 0.1) * 6.0;
+    const float mistExtinction = max(mistLane.z, 0.0) * 0.05;
+    const float mistRange = max(mistLane.w, 8.0);
+    const float mistDawnCurve =
+        smoothstep(-0.12, -0.02, sunDirection.y) *
+        (1.0 - smoothstep(0.05, 0.30, sunDirection.y));
+    const float mistStrength =
+        mistGate * mistExtinction * max(wetness, mistDawnCurve * 0.75);
+
     if(fogTimeFactor <= 0.01)
     {
         return result;
@@ -204,6 +237,8 @@ FogResult evaluateAnalyticFog(
 
     const float fogFar = min(max(sceneDistance, 0.0), max(maxDistance, 1.0));
     const float fogNear = clamp(startDistance, 0.0, fogFar);
+
+    const float fogTailFadeStart = fogFar * (1.0 - FOG_TAIL_FADE_FRACTION);
 
     result.firstDistance = fogNear;
 
@@ -243,7 +278,8 @@ FogResult evaluateAnalyticFog(
     }
     vec3 lightDensityAccum = vec3(0.0);
 
-    const bool needGroundSample = groundAnchor > 0.0;
+    // 薄雾激活时也要采地面高度场（薄雾锚在地形上）。
+    const bool needGroundSample = groundAnchor > 0.0 || mistStrength > 0.0;
 
     float transmittance = 1.0;
     float fogDensityAccum = 0.0;
@@ -269,13 +305,31 @@ FogResult evaluateAnalyticFog(
         }
         const float groundOffset = fogGroundAnchorOffset(ground, groundAnchor);
 
+        const float sampleDistance = fogNear + stepLength * rayVectorLength;
+
+        // 尾部淡出作用于视向距离：远处雾先变薄再归零，不再在 fogEnd 处硬切。
+        const float tailFade =
+            1.0 - smoothstep(fogTailFadeStart, fogFar, sampleDistance);
+
         float density = fogDensityAt(
             vec3(fogPos.x, fogPos.y - groundOffset, fogPos.z),
             baseDensity,
             fogTimeFactor,
             wetness,
             heightMax,
-            heightMin);
+            heightMin) * tailFade;
+
+        // 贴地薄雾：不参与尾部淡出（自带按 mistRange 的近场淡出）。离地高度用
+        // 本地地面 ground.height，**不**叠加锚定偏移——偏移是让雾带跟着地形整体
+        // 平移的，薄雾要的是"贴着当地地表"，山谷积雾、山脊裸露才是对的行为。
+        if(mistStrength > 0.0)
+        {
+            const float mistRangeFade = 1.0 - smoothstep(
+                mistRange * 0.4, mistRange, length(fogPos - worldOrigin));
+            density += mistStrength *
+                exp2(-max(fogPos.y - ground.height, 0.0) / mistHeightScale) *
+                mistRangeFade;
+        }
 
         const float absorption = exp2(-density * stepDensity);
 
@@ -290,13 +344,22 @@ FogResult evaluateAnalyticFog(
                 break;
             }
 
-            lightingDensity += fogDensityAt(
+            // 薄雾进自阴影：地面高度沿用主样本的（光步短、近似可接受），
+            // 否则薄雾会在阴影里均匀发光。
+            float stepMist = 0.0;
+            if(mistStrength > 0.0)
+            {
+                stepMist = mistStrength *
+                    exp2(-max(lightPos.y - ground.height, 0.0) / mistHeightScale);
+            }
+
+            lightingDensity += (fogDensityAt(
                 vec3(lightPos.x, lightPos.y - groundOffset, lightPos.z),
                 baseDensity,
                 fogTimeFactor,
                 wetness,
                 heightMax,
-                heightMin) * lightingStepLength;
+                heightMin) + stepMist) * lightingStepLength;
 
             lightPos += sunDirection * lightingStepLength;
             lightingStepLength *= 1.5;
@@ -314,11 +377,8 @@ FogResult evaluateAnalyticFog(
         fogLitAccum += integral * shadow;
         rayDensityAccum += stepRayDensity * shadow;
 
-        {
-            const float sampleDistance = fogNear + stepLength * rayVectorLength;
-            fogMeanDistanceAccum += integral * sampleDistance;
-            fogMeanWeightAccum += integral;
-        }
+        fogMeanDistanceAccum += integral * sampleDistance;
+        fogMeanWeightAccum += integral;
 
         for(int li = 0; li < FOG_LIGHT_MAX; ++li)
         {

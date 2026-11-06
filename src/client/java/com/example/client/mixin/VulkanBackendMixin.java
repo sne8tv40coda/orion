@@ -119,6 +119,96 @@ public class VulkanBackendMixin {
         }
     }
 
+    @Unique
+    private static volatile int RTX_RT_SUPPORT = -1;
+
+    /**
+     * 总闸：Orion 的 RT 后端有四项硬前提——acceleration structure、
+     * ray tracing pipeline、buffer device address（全后端都用）、
+     * 以及 ray query（太阳阴影）。这些过去是无条件请求的，一张不支持 RT
+     * 的卡会在 vkCreateDevice 直接失败：不是降级，是启动崩溃。
+     *
+     * 现在先探测，任一项缺失就整体跳过注入，宿主继续用原版 Vulkan 渲染。
+     * 结果缓存：createDevice 里两次 @Redirect 会各调一次，只应打印一次。
+     */
+    @Unique
+    private static boolean rtxProbeRtSupport(
+            VulkanPhysicalDevice physicalDevice
+    ) {
+        final int cached = RTX_RT_SUPPORT;
+
+        if (cached >= 0) {
+            return cached == 1;
+        }
+
+        final boolean accelerationStructure =
+                physicalDevice.hasDeviceExtension(
+                        "VK_KHR_acceleration_structure"
+                );
+
+        final boolean rayTracingPipeline =
+                physicalDevice.hasDeviceExtension(
+                        "VK_KHR_ray_tracing_pipeline"
+                );
+
+        final boolean bufferDeviceAddress =
+                physicalDevice.hasDeviceExtension(
+                        "VK_KHR_buffer_device_address"
+                );
+
+        final boolean supported =
+                accelerationStructure
+                        && rayTracingPipeline
+                        && bufferDeviceAddress;
+
+        RTX_RT_SUPPORT = supported ? 1 : 0;
+
+        // 同步给所有 native 调用点的守卫（见 NativeVulkan.rtActive）。
+        NativeVulkan.rtActive = supported;
+
+        System.err.println(
+                "[RT PROBE] acceleration_structure="
+                        + (accelerationStructure ? 1 : 0)
+                        + " ray_tracing_pipeline="
+                        + (rayTracingPipeline ? 1 : 0)
+                        + " buffer_device_address="
+                        + (bufferDeviceAddress ? 1 : 0)
+                        + " orionActive="
+                        + (supported ? 1 : 0)
+        );
+
+        return supported;
+    }
+
+    /**
+     * 逐项探测后再加入。请求一个设备不支持的扩展会让 vkCreateDevice
+     * 整体失败，所以这里缺失只打日志、不加入。
+     */
+    @Unique
+    private static void rtxAddExtensionIfSupported(
+            Collection<String> deviceExtensions,
+            VulkanPhysicalDevice physicalDevice,
+            String extensionName
+    ) {
+        final boolean supported =
+                physicalDevice.hasDeviceExtension(
+                        extensionName
+                );
+
+        System.err.println(
+                "[RT EXT] name="
+                        + extensionName
+                        + " supported="
+                        + (supported ? 1 : 0)
+        );
+
+        if (supported) {
+            deviceExtensions.add(
+                    extensionName
+            );
+        }
+    }
+
 
 
     @Unique
@@ -132,19 +222,42 @@ public class VulkanBackendMixin {
                 "[Mixin] Intercepted VulkanBackend.createDevice."
         );
 
+        // 2026-11-04：总闸。不支持 RT 的设备直接放行，不注入任何扩展/特性，
+        // 宿主按原版 Vulkan 继续跑（Orion 不激活，而不是启动崩溃）。
+        if (!rtxProbeRtSupport(physicalDevice)) {
+
+            System.err.println(
+                    "[RT PROBE] device lacks ray tracing support — "
+                            + "Orion disabled, falling back to vanilla Vulkan rendering"
+            );
+
+            return;
+        }
+
 
         
 
 
-        deviceExtensions.add(
+        // 2026-11-04：这三项是 Streamline（DLSS-FG）加载器的硬需求，
+        // 其中 VK_NVX_* 为 NVIDIA 专有。过去无条件加入，非 NV 设备会在
+        // vkCreateDevice 因请求不存在的扩展而直接失败。改为逐项探测：
+        // 缺失只打日志，让设备创建成功，由 native 侧的 g_fgRequirementsReady
+        // 决定 FG/DLSS 是否可用。
+        rtxAddExtensionIfSupported(
+                deviceExtensions,
+                physicalDevice,
                 "VK_KHR_push_descriptor"
         );
 
-        deviceExtensions.add(
+        rtxAddExtensionIfSupported(
+                deviceExtensions,
+                physicalDevice,
                 "VK_NVX_binary_import"
         );
 
-        deviceExtensions.add(
+        rtxAddExtensionIfSupported(
+                deviceExtensions,
+                physicalDevice,
                 "VK_NVX_image_view_handle"
         );
         
@@ -239,7 +352,11 @@ public class VulkanBackendMixin {
             );
         }
 
-        deviceExtensions.add(
+        // 异步管线编译（VK_KHR_deferred_host_operations）缺失时，
+        // native 侧 pollRtPipelineHotReload 会自动回退同步重建，因此可安全跳过。
+        rtxAddExtensionIfSupported(
+                deviceExtensions,
+                physicalDevice,
                 "VK_KHR_deferred_host_operations"
         );
 

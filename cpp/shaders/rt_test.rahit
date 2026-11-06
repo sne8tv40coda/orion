@@ -53,6 +53,31 @@ uint getRayPurpose(uint state)
     return state & RT_STATE_PURPOSE_MASK;
 }
 
+// ============================================================================
+// 2026-11-04 RTAO 修复：可见性探针必须写回命中距离
+//
+// 事实：AO 射线是 any-hit-only（gl_RayFlagsSkipClosestHitShaderEXT），而全仓
+// 没有任何着色器为它写 payload.hitDistance（本文件 grep hitDistance = 0 命中）。
+// rgen 侧却是：
+//     if(hit.hitDistance > 0.0) occlusion += distWeight * distWeight;
+// ⇒ occlusion 恒 0 ⇒ rtaoFactor 恒 1.0
+// ⇒ **RTAO 整条链在生产档是空转的**，「RTAO 近距/中距采样」两个旋钮只改变
+// 射线条数（纯成本），像素上零变化。这就是"怎么调都调不动"。
+// （rt_test.rgen 23644-23652 的注释里其实已经写下过"occlusion stays 0 and
+//  rtaoFactor stays exactly 1.0"，只是当时把它当成"死射线可以跳过"，没有
+//  回头问旋钮为什么没反应。）
+//
+// 修法：可见性探针立即写命中距离并返回。gl_HitTEXT 就是这条 any-hit 的命中 t，
+// 量纲与 rgen 的 hit.hitDistance / maxDist 判据一致。立即返回同时省掉玻璃/材质
+// 那整段 any-hit 逻辑 —— AO 探针不需要它，而且那些分支会写 alpha-blend 的
+// 73/74/75 主通道状态，让 AO 探针去写本来就是脏的。
+// 回退：-DRTAO_VISIBILITY_EARLYOUT=0 回到"AO 全空转"的旧档。
+// ============================================================================
+#ifndef RTAO_VISIBILITY_EARLYOUT
+#define RTAO_VISIBILITY_EARLYOUT 1
+#endif
+const uint RT_PURPOSE_VISIBILITY_ONLY_AO = 3u;
+
 // 2026-10-28：主透射链身份位（bit 18）。
 // 病灶：RT_PURPOSE_PRIMARY_TRANSMISSION = 8 超出 3 位 purpose 掩码
 // （RT_STATE_PURPOSE_MASK = 0x7u）⇒ makeTraceState 后被掩成 RT_PURPOSE_FULL，
@@ -460,6 +485,15 @@ vec3 glassSheetTransmissionScalarF(
 }
 
 void main() {
+
+#if RTAO_VISIBILITY_EARLYOUT
+    // AO 可见性探针：写回命中距离后立即返回（见文件头 RTAO 修复注释）
+    if((payload.state & RT_STATE_PURPOSE_MASK) == RT_PURPOSE_VISIBILITY_ONLY_AO)
+    {
+        payload.hitDistance = gl_HitTEXT;
+        return;
+    }
+#endif
 
     // 2026-10-09：表项是 16B，地址在两个低 lane（any-hit 不需要位移段）。
     // 2026-10-21 地形 32B：.w = 该段顶点步长（32/48），取顶点按它分派。

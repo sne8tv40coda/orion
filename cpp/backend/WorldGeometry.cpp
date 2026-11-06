@@ -88,6 +88,28 @@ bool rebuildWorldGeometry(
         >
     > sectionUpdates;
 
+    // 2026-11-06r：函数返回时把 sectionUpdates 里所有 split 连同容量还给池。
+    // RAII 形式，覆盖下面所有 early return；split 在 build 循环里只被读，
+    // 这里归还时它已经用完。
+    struct SectionSplitPoolReturn
+    {
+        std::vector<std::pair<uint64_t, SectionGeometrySplit>>* updates = nullptr;
+
+        ~SectionSplitPoolReturn()
+        {
+            if(updates == nullptr)
+            {
+                return;
+            }
+
+            for(auto& entry : *updates)
+            {
+                returnSectionSplitToPool(std::move(entry.second));
+            }
+        }
+    };
+    SectionSplitPoolReturn sectionSplitPoolReturn{&sectionUpdates};
+
 
 
     const auto preLoopLockWaitStart = std::chrono::steady_clock::now();
@@ -343,7 +365,7 @@ bool rebuildWorldGeometry(
             {
                 sectionUpdates.emplace_back(
                     ENTITY_RT_SPATIAL_KEY,
-                    SectionGeometrySplit{}
+                    takeSectionSplitFromPool()
                 );
                 updateIndices.emplace(
                     ENTITY_RT_SPATIAL_KEY,
@@ -447,7 +469,7 @@ bool rebuildWorldGeometry(
                     const size_t updateIndex = sectionUpdates.size();
                     sectionUpdates.emplace_back(
                         nearestEntry.second,
-                        SectionGeometrySplit{});
+                        takeSectionSplitFromPool());
                     updateIndices.emplace(nearestEntry.second, updateIndex);
                 }
             }
