@@ -876,6 +876,181 @@ void createGiHalfImage(uint32_t width, uint32_t height)
 }
 
 
+// ============================================================================
+// 2026-11-04 A1：GI 第一反弹时域重投影历史（binding 86/87）。
+// 渲染分辨率两张 rgba16f ping-pong；rgb = raw GI（乘 diffuseGILodWeight 之前的
+// 域），a = 主命中视深度（a=0 = 无效，clear 天然给出）。
+// 生命周期照 createGiHalfImage：分辨率变化整组重建并置 needsClear，
+// 由 prepareGiTemporalHistoryImages 在本帧命令里清一次。1440p 下两张 ≈ 59MB。
+// ============================================================================
+void createGiTemporalImages(uint32_t width, uint32_t height)
+{
+    if(width == 0u || height == 0u)
+    {
+        return;
+    }
+
+    if(g_giTemporalHistoryImages[0] != VK_NULL_HANDLE &&
+       g_giTemporalHistoryWidth == width &&
+       g_giTemporalHistoryHeight == height)
+    {
+        return;
+    }
+
+    if(g_giTemporalHistoryImages[0] != VK_NULL_HANDLE)
+    {
+        check(
+            FGDeviceWaitIdle(g_device),
+            "wait device before GI temporal history recreate failed"
+        );
+        for(uint32_t i = 0u; i < 2u; ++i)
+        {
+            destroyHistoryImage(
+                g_giTemporalHistoryImages[i],
+                g_giTemporalHistoryMemories[i],
+                g_giTemporalHistoryViews[i],
+                g_giTemporalHistoryLayouts[i]
+            );
+        }
+    }
+
+    for(uint32_t i = 0u; i < 2u; ++i)
+    {
+        createRRGuideImage(
+            width,
+            height,
+            VK_FORMAT_R16G16B16A16_SFLOAT,
+            g_giTemporalHistoryImages[i],
+            g_giTemporalHistoryMemories[i],
+            g_giTemporalHistoryViews[i],
+            g_giTemporalHistoryLayouts[i]
+        );
+        // createRRGuideImage 不重置宿主侧布局影子；重建后实际布局是 UNDEFINED，
+        // 残留的 GENERAL 会让 prepare 跳过 UNDEFINED→GENERAL 转换（验证层报错）。
+        g_giTemporalHistoryLayouts[i] = VK_IMAGE_LAYOUT_UNDEFINED;
+
+        VkDescriptorImageInfo info{};
+        info.imageView = g_giTemporalHistoryViews[i];
+        info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        write.dstSet = g_rayTracingDescriptorSet;
+        write.dstBinding = 86u + i;
+        write.descriptorCount = 1;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        write.pImageInfo = &info;
+
+        vkUpdateDescriptorSets(g_device, 1, &write, 0, nullptr);
+    }
+
+    g_giTemporalHistoryWidth = width;
+    g_giTemporalHistoryHeight = height;
+    g_giTemporalHistoryNeedsClear = true;
+
+    std::cerr << "[GI TEMPORAL] history created " << width << "x" << height
+              << " (ping-pong, ~"
+              << (static_cast<uint64_t>(width) * height * 8ull * 2ull) / (1024ull * 1024ull)
+              << "MB)" << std::endl;
+}
+
+
+// 与 prepareVPTDirectHistoryBuffers 同型：needsClear 时先 transfer 清再放屏障。
+// 之后跨帧的读写依赖帧间信号量的内存依赖（vptDirectHistory 同此约定）。
+void prepareGiTemporalHistoryImages(VkCommandBuffer cmd)
+{
+    if(
+        cmd == VK_NULL_HANDLE ||
+        g_giTemporalHistoryImages[0] == VK_NULL_HANDLE ||
+        g_giTemporalHistoryImages[1] == VK_NULL_HANDLE
+    )
+    {
+        return;
+    }
+
+    if(g_giTemporalHistoryNeedsClear)
+    {
+        VkClearColorValue clearColor{};
+        VkImageSubresourceRange range{};
+        range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        range.levelCount = 1u;
+        range.layerCount = 1u;
+
+        for(uint32_t i = 0u; i < 2u; ++i)
+        {
+            if(g_giTemporalHistoryLayouts[i] != VK_IMAGE_LAYOUT_GENERAL)
+            {
+                VkImageMemoryBarrier toGeneral{
+                    VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                toGeneral.srcAccessMask = 0u;
+                toGeneral.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                toGeneral.oldLayout = g_giTemporalHistoryLayouts[i];
+                toGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                toGeneral.image = g_giTemporalHistoryImages[i];
+                toGeneral.subresourceRange = range;
+
+                vkCmdPipelineBarrier(
+                    cmd,
+                    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    0,
+                    0,
+                    nullptr,
+                    0,
+                    nullptr,
+                    1,
+                    &toGeneral
+                );
+                g_giTemporalHistoryLayouts[i] = VK_IMAGE_LAYOUT_GENERAL;
+            }
+
+            vkCmdClearColorImage(
+                cmd,
+                g_giTemporalHistoryImages[i],
+                VK_IMAGE_LAYOUT_GENERAL,
+                &clearColor,
+                1u,
+                &range
+            );
+        }
+    }
+
+    VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    barrier.srcAccessMask = g_giTemporalHistoryNeedsClear
+        ? VK_ACCESS_TRANSFER_WRITE_BIT
+        : VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.dstAccessMask =
+        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    barrier.subresourceRange.levelCount = 1u;
+    barrier.subresourceRange.layerCount = 1u;
+
+    for(uint32_t i = 0u; i < 2u; ++i)
+    {
+        barrier.image = g_giTemporalHistoryImages[i];
+        vkCmdPipelineBarrier(
+            cmd,
+            g_giTemporalHistoryNeedsClear
+                ? VK_PIPELINE_STAGE_TRANSFER_BIT
+                : VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR |
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR |
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0,
+            0,
+            nullptr,
+            0,
+            nullptr,
+            1,
+            &barrier
+        );
+    }
+
+    g_giTemporalHistoryNeedsClear = false;
+}
+
+
 void destroySharcBuffers()
 {
     if(g_sharcHashEntriesBuffer != VK_NULL_HANDLE)
@@ -1761,6 +1936,14 @@ void recordSharcUpdate(VkCommandBuffer cmd, uint32_t width, uint32_t height)
         return;
     }
 
+    // 2026-11-06：ORION_SHARC_UPDATE=0 此前只影响 shader 内的 lane 取值，宿主仍然
+    // 每帧发满 dispatch（1080p 下 384x216 = 82,944 条 RT 路径），"关掉"是空跑。
+    // 这里补上 host 侧闸门，让该 env 真正省掉这次 trace。
+    if(!sharcUpdateEnabled())
+    {
+        return;
+    }
+
     ensureSharcUpdatePipeline();
     if(g_sharcUpdatePipeline == VK_NULL_HANDLE)
     {
@@ -1802,6 +1985,35 @@ void recordSharcResolve(VkCommandBuffer cmd)
     ensureSharcResolvePipeline();
 
     if(g_sharcResolvePipeline == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    // 2026-11-06：Resolve 是"消耗性读取"——SharcResolveEntry 把 accumulation 归一化
+    // 写进 resolved 并推进 sampleData / staleFrameNum 计数
+    // （shader 侧 sharc/SharcCommon.h:826-950），被跳过的帧不会丢样本，只是把累积
+    // 留到下一次 Resolve 一起合并。
+    // 成本：hash 32MB + accumulation 64MB + resolved 64MB + lock 16MB = 176MB，
+    // 全量扫描（1<<22 entry ⇒ 65536 个 workgroup）的显存流量地板约 0.20~0.25 ms/帧。
+    // ORION_SHARC_RESOLVE_PARITY=1 回到每帧（A/B 用），默认 2 = 隔帧。
+    static const uint32_t sSharcResolveParity = []()
+    {
+        const char* raw = std::getenv("ORION_SHARC_RESOLVE_PARITY");
+        if(raw == nullptr || raw[0] == '\0')
+        {
+            return 2u;
+        }
+        const int parsed = std::atoi(raw);
+        if(parsed < 1)
+        {
+            return 1u;
+        }
+        return static_cast<uint32_t>(parsed > 4 ? 4 : parsed);
+    }();
+    static uint32_t sSharcResolveTick = 0u;
+
+    if(sSharcResolveParity > 1u &&
+       (sSharcResolveTick++ % sSharcResolveParity) != 0u)
     {
         return;
     }
@@ -2044,7 +2256,11 @@ void ensureGiHalfPipeline()
         std::cerr << "[GI HALF] 管线已创建（rt_test_gi_half.rgen.spv，"
                      "半分辨率 dispatch = (w+1)/2 × (h+1)/2）" << std::endl;
 
-        persistSharedPipelineCache();
+        // 2026-11-06：不在这帧同步 fwrite 64~256MB blob
+        // （PIPELINE_CACHE_SEED_BUDGET_BYTES）。交给 maybePersistSharedPipelineCache
+        // 的 60 帧去抖 + 大小去重（PipelineCache.cpp:726-758），把冷编结束那一帧
+        // 30~400ms 的写盘尖峰摊掉。
+        g_pipelineCachePersistCountdown = 60u;
     }
     catch(const std::exception& error)
     {
@@ -2120,6 +2336,978 @@ void recordGiHalfPass(VkCommandBuffer cmd, uint32_t width, uint32_t height)
         VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
         VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
         0u, 0u, nullptr, 0u, nullptr, 1u, &giBarrier);
+}
+
+// =====================================================
+// 2026-11-05 B：K1(主视线)/K2(传输) 两发拆分。
+// K1 只做主光线求交，opaque 像素在切割点把 payload 落进 landing SSBO
+// (binding 88, 5×vec4=80B) 后提前收束（输出尾按 !anyLandingStored 跳过）；
+// K2 读回 landing 继续 GPU 传输段（输出尾按 ptLandingActive 执行）。
+// 非 opaque 像素 K1 落 invalid 并照旧完整出图，K2 的 ptLandingLoad 失败跳过
+// —— 两侧像素集互斥且由各自代码路径自行判定，不依赖 C++ 记账。
+// 管线/SBT/SER 选择全部照抄 ensureGiHalfPipeline 前例。
+// =====================================================
+namespace
+{
+VkDescriptorSet s_k1LandingBoundSet = VK_NULL_HANDLE;
+void writeK1LandingDescriptor()
+{
+    if(g_rayTracingDescriptorSet == VK_NULL_HANDLE ||
+       g_k1LandingBuffer == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    VkDescriptorBufferInfo info{};
+    info.buffer = g_k1LandingBuffer;
+    info.offset = 0u;
+    info.range = VK_WHOLE_SIZE;
+
+    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    write.dstSet = g_rayTracingDescriptorSet;
+    write.dstBinding = 88;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    write.pBufferInfo = &info;
+
+    vkUpdateDescriptorSets(g_device, 1u, &write, 0u, nullptr);
+    s_k1LandingBoundSet = g_rayTracingDescriptorSet;
+}
+}
+void destroyK1LandingBuffer()
+{
+    if(g_k1LandingBuffer != VK_NULL_HANDLE)
+    {
+        vkDestroyBuffer(g_device, g_k1LandingBuffer, nullptr);
+        g_k1LandingBuffer = VK_NULL_HANDLE;
+    }
+    if(g_k1LandingMemory != VK_NULL_HANDLE)
+    {
+        vkFreeMemory(g_device, g_k1LandingMemory, nullptr);
+        g_k1LandingMemory = VK_NULL_HANDLE;
+    }
+    g_k1LandingWidth = 0u;
+    g_k1LandingHeight = 0u;
+    g_k1LandingSlots = 0u;
+    s_k1LandingBoundSet = VK_NULL_HANDLE;
+}
+void ensureK1LandingBuffer(uint32_t width, uint32_t height, uint32_t slots)
+{
+    if(g_rayTracingDescriptorSet == VK_NULL_HANDLE ||
+       width == 0u || height == 0u || slots == 0u)
+    {
+        return;
+    }
+    if(g_k1LandingBuffer != VK_NULL_HANDLE &&
+       g_k1LandingWidth == width && g_k1LandingHeight == height &&
+       g_k1LandingSlots == slots)
+    {
+        return;
+    }
+
+    // 老缓冲可能还有在飞引用
+    FGDeviceWaitIdle(g_device);
+    destroyK1LandingBuffer();
+
+    const VkDeviceSize bytes =
+        (VkDeviceSize)width * height * slots * 80ull;
+    createBuffer(g_device, g_physicalDevice, bytes,
+                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                 g_k1LandingBuffer, g_k1LandingMemory, false);
+    if(g_k1LandingBuffer == VK_NULL_HANDLE)
+    {
+        std::cerr << "[K1/K2] landing 缓冲创建失败（" << bytes << " 字节）"
+                  << std::endl;
+        return;
+    }
+    g_k1LandingWidth = width;
+    g_k1LandingHeight = height;
+    g_k1LandingSlots = slots;
+
+    writeK1LandingDescriptor();
+    std::cerr << "[K1/K2] landing 缓冲就绪 " << width << "x" << height
+              << " x" << slots << "spp (" << bytes << " 字节, binding 88)"
+              << std::endl;
+}
+void destroyK1K2Pipeline()
+{
+    if(g_k1k2SbtBuffer != VK_NULL_HANDLE)
+    {
+        vkDestroyBuffer(g_device, g_k1k2SbtBuffer, nullptr);
+        g_k1k2SbtBuffer = VK_NULL_HANDLE;
+    }
+    if(g_k1k2SbtMemory != VK_NULL_HANDLE)
+    {
+        vkFreeMemory(g_device, g_k1k2SbtMemory, nullptr);
+        g_k1k2SbtMemory = VK_NULL_HANDLE;
+    }
+    if(g_k1Pipeline != VK_NULL_HANDLE)
+    {
+        vkDestroyPipeline(g_device, g_k1Pipeline, nullptr);
+        g_k1Pipeline = VK_NULL_HANDLE;
+    }
+    if(g_k2Pipeline != VK_NULL_HANDLE)
+    {
+        vkDestroyPipeline(g_device, g_k2Pipeline, nullptr);
+        g_k2Pipeline = VK_NULL_HANDLE;
+    }
+    if(g_k2dPipeline != VK_NULL_HANDLE)
+    {
+        vkDestroyPipeline(g_device, g_k2dPipeline, nullptr);
+        g_k2dPipeline = VK_NULL_HANDLE;
+    }
+    if(g_k2iPipeline != VK_NULL_HANDLE)
+    {
+        vkDestroyPipeline(g_device, g_k2iPipeline, nullptr);
+        g_k2iPipeline = VK_NULL_HANDLE;
+    }
+}
+
+// ============================================================================
+// ③ K2-D→K2-I 直射级交接图（binding 89，rgba32f，渲染分辨率）。
+//   K2-D 在水/不透明出口写（rgb = 直射三项和或水的完整着色，a = rtaoFactor），
+//   K2-I 在 RTAO 桩/水支读。同帧内 K2-D 完全覆盖 K2-I 会读的像素集
+//   （两者都只在 landing 有效像素上运行）⇒ 无需清理，也不需要跨帧历史。
+// 生命周期照 createGiHalfImage：分辨率变化整张重建。
+// ============================================================================
+static VkDescriptorSet s_k2DirectBoundSet = VK_NULL_HANDLE;
+void updateK2DirectRayDescriptor()
+{
+    if(g_rayTracingDescriptorSet == VK_NULL_HANDLE ||
+       g_k2DirectView == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    VkDescriptorImageInfo info{};
+    info.imageView = g_k2DirectView;
+    info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    write.dstSet = g_rayTracingDescriptorSet;
+    write.dstBinding = 89;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    write.pImageInfo = &info;
+
+    vkUpdateDescriptorSets(g_device, 1, &write, 0, nullptr);
+}
+
+void createK2DirectImage(uint32_t width, uint32_t height)
+{
+    if(!k2DirectIndirectSplitEnabled() || width == 0u || height == 0u)
+    {
+        return;
+    }
+
+    if(g_k2DirectImage != VK_NULL_HANDLE &&
+       g_k2DirectWidth == width &&
+       g_k2DirectHeight == height)
+    {
+        // 描述符集可能被环形机制重建过，binding 89 需要随动
+        if(s_k2DirectBoundSet != g_rayTracingDescriptorSet)
+        {
+            updateK2DirectRayDescriptor();
+            s_k2DirectBoundSet = g_rayTracingDescriptorSet;
+        }
+        return;
+    }
+
+    if(g_k2DirectImage != VK_NULL_HANDLE)
+    {
+        check(FGDeviceWaitIdle(g_device),
+              "wait device before K2 direct image recreate failed");
+        destroyHistoryImage(
+            g_k2DirectImage,
+            g_k2DirectMemory,
+            g_k2DirectView,
+            g_k2DirectLayout);
+        s_k2DirectBoundSet = VK_NULL_HANDLE;
+    }
+
+    createRRGuideImage(
+        width,
+        height,
+        VK_FORMAT_R32G32B32A32_SFLOAT,
+        g_k2DirectImage,
+        g_k2DirectMemory,
+        g_k2DirectView,
+        g_k2DirectLayout);
+
+    g_k2DirectWidth = width;
+    g_k2DirectHeight = height;
+
+    updateK2DirectRayDescriptor();
+    s_k2DirectBoundSet = g_rayTracingDescriptorSet;
+
+    std::cerr << "[K1/K2] k2DirectImage created "
+              << width << "x" << height << std::endl;
+}
+
+void destroyK2DirectImage()
+{
+    if(g_k2DirectImage != VK_NULL_HANDLE)
+    {
+        destroyHistoryImage(
+            g_k2DirectImage,
+            g_k2DirectMemory,
+            g_k2DirectView,
+            g_k2DirectLayout);
+    }
+    g_k2DirectWidth = 0u;
+    g_k2DirectHeight = 0u;
+    s_k2DirectBoundSet = VK_NULL_HANDLE;
+}
+
+void ensureK1K2Pipelines()
+{
+    const bool k2Split = k2DirectIndirectSplitEnabled();
+    const bool k2TransportReady =
+        k2Split
+            ? (g_k2dPipeline != VK_NULL_HANDLE && g_k2iPipeline != VK_NULL_HANDLE)
+            : (g_k2Pipeline != VK_NULL_HANDLE);
+    if((g_k1Pipeline != VK_NULL_HANDLE && k2TransportReady) ||
+       g_k1K2PipelineFailed)
+    {
+        return;
+    }
+    if(!k1k2SplitEnabled())
+    {
+        return;
+    }
+    if(g_rayTracingPipelineLayout == VK_NULL_HANDLE || g_handleSizeAligned == 0u)
+    {
+        return;
+    }
+
+    std::cerr << "[K1/K2] 开始创建 K1/K2 拆分管线（驱动编译着色器，可能阻塞数秒）"
+              << std::endl;
+
+    try
+    {
+        // SER 选择条件照抄 Device.cpp 主管线：env + 特性 + 硬件重排全开才用 _ser spv
+        // 二分开关（2026-11-05 设备丢失排查）：ORION_K1K2_NO_SER=1 强制 plain
+        const bool k1k2NoSer =
+            [](){
+                const char* raw = std::getenv("ORION_K1K2_NO_SER");
+                return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
+            }();
+        const bool serShaderRequested =
+            !k1k2NoSer &&
+            g_serEnabled.load() && g_serFeatureSupported && g_serHardwareReordering;
+        auto loadRgen = [serShaderRequested](
+                            const char* serPath, const char* plainPath)
+        {
+            if(serShaderRequested)
+            {
+                try
+                {
+                    return loadSpv(serPath);
+                }
+                catch(const std::exception&)
+                {
+                    RTLog(std::string("[K1/K2] ser spv 加载失败，回退 plain: ") +
+                          serPath);
+                }
+            }
+            return loadSpv(plainPath);
+        };
+        auto k1Code = loadRgen("shaders/rt_test_k1_ser.rgen.spv",
+                               "shaders/rt_test_k1.rgen.spv");
+        // 2026-11-05 设备丢失二分：ORION_K2_VARIANT=1 → nocall 桩版（不执行
+        // callable）；=2 → B① 内联材质版（D1 之前的 k2 spv，基线 32d637b6）。
+        // 两个诊断变体不分 SER；=0/未设走正常 D1 双变体。
+        const int k2Variant = [](){
+            const char* raw = std::getenv("ORION_K2_VARIANT");
+            if(raw == nullptr || raw[0] == '\0')
+            {
+                return 0;
+            }
+            return raw[0] == '1' ? 1 : (raw[0] == '2' ? 2 : 0);
+        }();
+        RTLog("[K1/K2] ORION_K2_VARIANT=" + std::to_string(k2Variant));
+        // ③ K2-D/K2-I 再拆分（默认开，ORION_K2_SPLIT=0 回退）：传输级再分直射级与间接级，
+        // 各自只编译自己那半 ⇒ 驱动编译与 spill 都只看最坏分支的一半。
+        // 2026-11-06 -3 定案：INITIALIZATION_FAILED = 同会话连续巨型冷编译的
+        // 驱动资源耗尽（对照：main+k1 命中缓存时 k2d_ser 冷编成功），非
+        // shader/SER 问题；PipelineDiag 已加失败重试。这里恢复 SER 优先；
+        // SER 档最终仍失败时在下方降级 plain 重建，拆分模式不连坐。
+        const bool k2SerProbe =
+            [](){
+                const char* raw = std::getenv("ORION_K2_SER_PROBE");
+                return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
+            }();
+        auto k2dCode = k2Split
+            ? loadRgen("shaders/rt_test_k2d_ser.rgen.spv",
+                       "shaders/rt_test_k2d.rgen.spv")
+            : std::vector<uint8_t>{};
+        auto k2iCode = k2Split
+            ? loadRgen("shaders/rt_test_k2i_ser.rgen.spv",
+                       "shaders/rt_test_k2i.rgen.spv")
+            : std::vector<uint8_t>{};
+        if(k2SerProbe && k2Split)
+        {
+            auto fnv32 = [](const std::vector<uint8_t>& b){
+                uint32_t h = 0x811c9dc5u;
+                for(uint8_t c : b)
+                {
+                    h = (h ^ c) * 0x01000193u;
+                }
+                return h;
+            };
+            char buf[160]{};
+            std::snprintf(buf, sizeof(buf),
+                          "[K2SERPROBE] k2d bytes=%zu fnv=%08x | k2i bytes=%zu fnv=%08x",
+                          k2dCode.size(), fnv32(k2dCode),
+                          k2iCode.size(), fnv32(k2iCode));
+            RTLog(buf);
+        }
+        auto k2Code =
+            k2Split
+                ? std::vector<uint8_t>{}
+                : k2Variant == 1
+                    ? loadSpv("shaders/rt_test_k2_nocall.rgen.spv")
+                    : k2Variant == 2
+                        ? loadSpv("shaders/rt_test_k2_inline.rgen.spv")
+                        : loadRgen("shaders/rt_test_k2_ser.rgen.spv",
+                                   "shaders/rt_test_k2.rgen.spv");
+        // B①：K1 的主命中组用精简 rchit（只落身份）；K2 与玻璃命中组用全功能版。
+        auto chit = loadSpv("shaders/rt_test.rchit.spv");
+        auto k1Chit = loadSpv("shaders/rt_test_k1.rchit.spv");
+        auto miss = loadSpv("shaders/rt_test.rmiss.spv");
+        auto ahit = loadSpv("shaders/rt_test.rahit.spv");
+        auto translucentChit = loadSpv("shaders/rt_test_translucent.rchit.spv");
+        auto translucentAhit = loadSpv("shaders/rt_test_translucent.rahit.spv");
+        // D1：材质层 callable（K2 的 landing 解析经它执行；K1 不用）
+        auto materialCode = loadSpv("shaders/rt_test_material.spv");
+
+        VkShaderModule mods[11]{};
+        const char* entry = "main";
+        VkShaderModuleCreateInfo mci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        auto makeModule = [&](const std::vector<uint8_t>& code, VkShaderModule& out)
+        {
+            mci.codeSize = code.size();
+            mci.pCode = reinterpret_cast<const uint32_t*>(code.data());
+            check(vkCreateShaderModule(g_device, &mci, nullptr, &out),
+                  "Failed to create K1/K2 shader module");
+        };
+        makeModule(k1Code, mods[0]);
+        if(k2Split)
+        {
+            makeModule(k2dCode, mods[9]);
+            makeModule(k2iCode, mods[10]);
+        }
+        else
+        {
+            makeModule(k2Code, mods[1]);
+        }
+        makeModule(chit, mods[2]);
+        makeModule(k1Chit, mods[3]);
+        makeModule(miss, mods[4]);
+        makeModule(ahit, mods[5]);
+        makeModule(translucentChit, mods[6]);
+        makeModule(translucentAhit, mods[7]);
+        makeModule(materialCode, mods[8]);
+
+        // 每条管线的 stage 0 换成自己的 rgen；stage 1（主命中组 chit）K1 用精简版；
+        // stage 6 = 材质 callable（两条管线共用同一模块，SBT 单记录即可）
+        VkPipelineShaderStageCreateInfo stages1[7]{};
+        VkPipelineShaderStageCreateInfo stages2[7]{};
+        const VkShaderStageFlagBits stageKinds[7] = {
+            VK_SHADER_STAGE_RAYGEN_BIT_KHR, VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR,
+            VK_SHADER_STAGE_MISS_BIT_KHR, VK_SHADER_STAGE_ANY_HIT_BIT_KHR,
+            VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, VK_SHADER_STAGE_ANY_HIT_BIT_KHR,
+            VK_SHADER_STAGE_CALLABLE_BIT_KHR };
+        const uint32_t stageModules[7] = { 0u, 2u, 4u, 5u, 6u, 7u, 8u };
+        for(uint32_t i = 0u; i < 7u; ++i)
+        {
+            stages1[i].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            stages1[i].stage = stageKinds[i];
+            stages1[i].module = mods[stageModules[i]];
+            stages1[i].pName = entry;
+            stages2[i] = stages1[i];
+        }
+        // 传输管线 rgen：默认 = K2 单发；拆分 = 先 K2-D 后 K2-I（创建前切换）
+        stages2[0].module = k2Split ? mods[9] : mods[1];
+        // 主命中组（含水）走精简 chit；玻璃命中组（stage 4/5）两条管线共用全功能版
+        stages1[1].module = mods[3];
+
+        VkRayTracingShaderGroupCreateInfoKHR groups[6]{};
+        groups[0].sType = VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR;
+        groups[0].type = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
+        groups[0].generalShader = 0u;
+        groups[0].closestHitShader = VK_SHADER_UNUSED_KHR;
+        groups[0].anyHitShader = VK_SHADER_UNUSED_KHR;
+        groups[0].intersectionShader = VK_SHADER_UNUSED_KHR;
+        groups[1] = groups[0];
+        groups[1].type = VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR;
+        groups[1].generalShader = VK_SHADER_UNUSED_KHR;
+        groups[1].closestHitShader = 1u;
+        groups[1].anyHitShader = 3u;
+        groups[2] = groups[0];
+        groups[2].generalShader = 2u;
+        groups[3] = groups[1];
+        groups[3].closestHitShader = 4u;
+        groups[3].anyHitShader = 5u;
+        groups[4] = groups[1];
+        // D1：材质 callable 组（general = stage 6）
+        groups[5] = groups[0];
+        groups[5].generalShader = 6u;
+
+        VkRayTracingPipelineCreateInfoKHR pci{
+            VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_KHR};
+        pci.stageCount = 7u;
+        pci.pStages = stages1;
+        pci.groupCount = 6u;
+        pci.pGroups = groups;
+        pci.maxPipelineRayRecursionDepth = 1u;
+        pci.layout = g_rayTracingPipelineLayout;
+        if(g_ommNativeEnabled)
+        {
+            pci.flags |= VK_PIPELINE_CREATE_RAY_TRACING_OPACITY_MICROMAP_BIT_EXT;
+        }
+
+        check(OrionCreateRayTracingPipelineTimed(
+                  "k1-primary", 1u, &pci, getSharedPipelineCache(),
+                  &g_k1Pipeline),
+              "Failed to create K1 RT pipeline");
+
+        if(k2Split)
+        {
+            // ③ 拆分模式：K2-D（直射级）与 K2-I（间接级）两条管线，stages2
+            // 其余 stage 与单发 K2 完全一致（rgen 已在上方切换为 mods[9]）。
+            pci.pStages = stages2;
+            auto tryCreateSplit = [&](const char* tag,
+                                      VkPipelineCache cache,
+                                      VkPipeline* out) -> VkResult
+            {
+                VkRayTracingPipelineCreateInfoKHR p = pci;
+                p.pStages = stages2;
+                return OrionCreateRayTracingPipelineTimed(
+                    tag, 1u, &p, cache, out);
+            };
+            VkResult k2dR = tryCreateSplit(
+                "k2d-direct", getSharedPipelineCache(), &g_k2dPipeline);
+            if(k2dR != VK_SUCCESS && k2SerProbe)
+            {
+                char buf[192]{};
+                std::snprintf(buf, sizeof(buf),
+                              "[K2SERPROBE] k2d 主尝试 result=%d "
+                              "stageCount=7 groupCount=6 flags=0x%x recursion=%u "
+                              "layout=%p cache=%p",
+                              static_cast<int>(k2dR), pci.flags,
+                              pci.maxPipelineRayRecursionDepth,
+                              reinterpret_cast<void*>(pci.layout),
+                              reinterpret_cast<void*>(getSharedPipelineCache()));
+                RTLog(buf);
+                VkResult rNocache = tryCreateSplit(
+                    "k2d-probe-nocache", VK_NULL_HANDLE, &g_k2dPipeline);
+                RTLog(std::string("[K2SERPROBE] k2d nocache result=") +
+                      std::to_string(static_cast<int>(rNocache)));
+                if(rNocache != VK_SUCCESS)
+                {
+                    VkPipelineCache fresh = VK_NULL_HANDLE;
+                    VkPipelineCacheCreateInfo fci{
+                        VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+                    vkCreatePipelineCache(
+                        g_device, &fci, nullptr, &fresh);
+                    VkResult rFresh = tryCreateSplit(
+                        "k2d-probe-freshcache", fresh, &g_k2dPipeline);
+                    RTLog(std::string("[K2SERPROBE] k2d freshcache result=") +
+                          std::to_string(static_cast<int>(rFresh)));
+                    vkDestroyPipelineCache(g_device, fresh, nullptr);
+                }
+                if(g_k2dPipeline == VK_NULL_HANDLE)
+                {
+                    VkPipelineCreateFlags savedFlags = pci.flags;
+                    pci.flags &=
+                        ~VK_PIPELINE_CREATE_RAY_TRACING_OPACITY_MICROMAP_BIT_EXT;
+                    VkResult rNoOmm = tryCreateSplit(
+                        "k2d-probe-noomm", getSharedPipelineCache(),
+                        &g_k2dPipeline);
+                    RTLog(std::string("[K2SERPROBE] k2d noomm result=") +
+                          std::to_string(static_cast<int>(rNoOmm)));
+                    pci.flags = savedFlags;
+                }
+                if(g_k2dPipeline != VK_NULL_HANDLE)
+                {
+                    RTLog("[K2SERPROBE] k2d 采用探针成功档");
+                }
+            }
+            if(g_k2dPipeline == VK_NULL_HANDLE && serShaderRequested)
+            {
+                // SER 档最终失败（含 wrapper 内重试）→ 降级 plain 重建，
+                // 保住拆分模式，只丢这两条传输腿的 SER。
+                vkDestroyShaderModule(g_device, mods[9], nullptr);
+                makeModule(loadSpv("shaders/rt_test_k2d.rgen.spv"), mods[9]);
+                stages2[0].module = mods[9];
+                RTLog("[K1/K2] k2d SER 档创建失败，降级 plain 重建");
+                VkResult rPlain = tryCreateSplit(
+                    "k2d-plain", getSharedPipelineCache(), &g_k2dPipeline);
+                if(rPlain != VK_SUCCESS)
+                {
+                    check(rPlain, "Failed to create K2-D RT pipeline");
+                }
+            }
+            if(g_k2dPipeline == VK_NULL_HANDLE)
+            {
+                check(k2dR, "Failed to create K2-D RT pipeline");
+            }
+            stages2[0].module = mods[10];
+            VkResult k2iR = tryCreateSplit(
+                "k2i-indirect", getSharedPipelineCache(), &g_k2iPipeline);
+            if(k2iR != VK_SUCCESS && k2SerProbe)
+            {
+                VkResult rNocache = tryCreateSplit(
+                    "k2i-probe-nocache", VK_NULL_HANDLE, &g_k2iPipeline);
+                RTLog(std::string("[K2SERPROBE] k2i nocache result=") +
+                      std::to_string(static_cast<int>(rNocache)));
+                if(g_k2iPipeline == VK_NULL_HANDLE)
+                {
+                    VkPipelineCreateFlags savedFlags = pci.flags;
+                    pci.flags &=
+                        ~VK_PIPELINE_CREATE_RAY_TRACING_OPACITY_MICROMAP_BIT_EXT;
+                    VkResult rNoOmm = tryCreateSplit(
+                        "k2i-probe-noomm", getSharedPipelineCache(),
+                        &g_k2iPipeline);
+                    RTLog(std::string("[K2SERPROBE] k2i noomm result=") +
+                          std::to_string(static_cast<int>(rNoOmm)));
+                    pci.flags = savedFlags;
+                }
+                if(g_k2iPipeline != VK_NULL_HANDLE)
+                {
+                    RTLog("[K2SERPROBE] k2i 采用探针成功档");
+                }
+            }
+            if(g_k2iPipeline == VK_NULL_HANDLE && serShaderRequested)
+            {
+                vkDestroyShaderModule(g_device, mods[10], nullptr);
+                makeModule(loadSpv("shaders/rt_test_k2i.rgen.spv"), mods[10]);
+                stages2[0].module = mods[10];
+                RTLog("[K1/K2] k2i SER 档创建失败，降级 plain 重建");
+                VkResult rPlain = tryCreateSplit(
+                    "k2i-plain", getSharedPipelineCache(), &g_k2iPipeline);
+                if(rPlain != VK_SUCCESS)
+                {
+                    check(rPlain, "Failed to create K2-I RT pipeline");
+                }
+            }
+            if(g_k2iPipeline == VK_NULL_HANDLE)
+            {
+                check(k2iR, "Failed to create K2-I RT pipeline");
+            }
+        }
+        else
+        {
+            pci.pStages = stages2;
+            check(OrionCreateRayTracingPipelineTimed(
+                      "k2-transport", 1u, &pci, getSharedPipelineCache(),
+                      &g_k2Pipeline),
+                  "Failed to create K2 RT pipeline");
+        }
+
+        for(uint32_t i = 0u; i < 11u; ++i)
+        {
+            vkDestroyShaderModule(g_device, mods[i], nullptr);
+        }
+
+        auto getHandles =
+            reinterpret_cast<PFN_vkGetRayTracingShaderGroupHandlesKHR>(
+                vkGetDeviceProcAddr(g_device,
+                                    "vkGetRayTracingShaderGroupHandlesKHR"));
+        if(!getHandles)
+        {
+            throw std::runtime_error(
+                "vkGetRayTracingShaderGroupHandlesKHR unavailable");
+        }
+
+        VkPhysicalDeviceRayTracingPipelinePropertiesKHR rtProps{};
+        rtProps.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_PROPERTIES_KHR;
+        VkPhysicalDeviceProperties2 props2{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        props2.pNext = &rtProps;
+        vkGetPhysicalDeviceProperties2(g_physicalDevice, &props2);
+
+        const uint32_t hs = rtProps.shaderGroupHandleSize;
+        const uint32_t ha = rtProps.shaderGroupHandleAlignment;
+        const uint32_t ba = rtProps.shaderGroupBaseAlignment;
+        const uint32_t handleAligned = ((hs + ha - 1u) / ha) * ha;
+        // 单 SBT 双 raygen 槽：K1@0，K2@对齐后的下一槽
+        const uint32_t raygen1Offset = 0u;
+        const uint32_t raygen2Offset =
+            ((raygen1Offset + handleAligned + ba - 1u) / ba) * ba;
+        // ③ 拆分模式：追加 K2-I raygen 槽、K2-D/K2-I 各自的 miss/hit/callable
+        // 记录集（句柄按管线区分，不能互借）；默认模式偏移逐字节同旧布局。
+        const uint32_t raygen3Offset =
+            k2Split
+                ? ((raygen2Offset + handleAligned + ba - 1u) / ba) * ba
+                : 0u;
+        const uint32_t missOffset =
+            (((k2Split ? raygen3Offset : raygen2Offset) + handleAligned + ba - 1u) /
+             ba) *
+            ba;
+        const uint32_t miss2dOffset =
+            k2Split ? ((missOffset + handleAligned + ba - 1u) / ba) * ba : 0u;
+        const uint32_t miss2iOffset =
+            k2Split
+                ? ((miss2dOffset + handleAligned + ba - 1u) / ba) * ba
+                : 0u;
+        const uint32_t hitOffset =
+            (((k2Split ? miss2iOffset : missOffset) + handleAligned + ba - 1u) /
+             ba) *
+            ba;
+        // D1：callable 记录（两条管线共用同一 callable 模块 ⇒ 单记录）。
+        // 2026-11-05 修正：hit 记录**两份** —— K1 的 group1 是精简 rchit，
+        // K2 的 group1 是全功能 rchit，共用一份会把 K2 的次级命中也路由到
+        // 精简版（不算材质）⇒ 传输全黑。hit1 供 K1，hit2 供 K2（拆分模式下
+        // hit2 = K2-D，hit3 = K2-I）。
+        const uint32_t hit2Offset =
+            ((hitOffset + SBT_HIT_RECORD_COUNT * handleAligned + ba - 1u) / ba) *
+            ba;
+        const uint32_t hit3Offset =
+            k2Split
+                ? ((hit2Offset + SBT_HIT_RECORD_COUNT * handleAligned + ba - 1u) /
+                   ba) *
+                      ba
+                : 0u;
+        const uint32_t callableOffset =
+            (((k2Split ? hit3Offset : hit2Offset) +
+              SBT_HIT_RECORD_COUNT * handleAligned + ba - 1u) /
+             ba) *
+            ba;
+        const uint32_t callable2Offset =
+            k2Split ? ((callableOffset + handleAligned + ba - 1u) / ba) * ba : 0u;
+        const uint32_t sbtSize =
+            (((k2Split ? callable2Offset : callableOffset) + handleAligned + ba - 1u) /
+             ba) *
+            ba;
+
+        const uint32_t groupCount = 6u;
+        std::vector<uint8_t> handles1((size_t)groupCount * hs, 0);
+        std::vector<uint8_t> handles2((size_t)groupCount * hs, 0);
+        std::vector<uint8_t> handles3((size_t)groupCount * hs, 0);
+        check(getHandles(g_device, g_k1Pipeline, 0u,
+                         groupCount, handles1.size(), handles1.data()),
+              "Failed to get K1 RT shader handles");
+        if(k2Split)
+        {
+            // ③ 拆分：handles2 = K2-D，handles3 = K2-I
+            check(getHandles(g_device, g_k2dPipeline, 0u,
+                             groupCount, handles2.size(), handles2.data()),
+                  "Failed to get K2-D RT shader handles");
+            check(getHandles(g_device, g_k2iPipeline, 0u,
+                             groupCount, handles3.size(), handles3.data()),
+                  "Failed to get K2-I RT shader handles");
+        }
+        else
+        {
+            check(getHandles(g_device, g_k2Pipeline, 0u,
+                             groupCount, handles2.size(), handles2.data()),
+                  "Failed to get K2 RT shader handles");
+        }
+
+        std::vector<uint8_t> data((size_t)sbtSize, 0);
+        std::memcpy(data.data() + raygen1Offset, handles1.data(), hs);
+        std::memcpy(data.data() + raygen2Offset, handles2.data(), hs);
+        if(k2Split)
+        {
+            std::memcpy(data.data() + raygen3Offset,
+                        handles3.data(), hs);
+        }
+        std::memcpy(data.data() + missOffset,
+                    handles1.data() + 2u * hs, hs);
+        if(k2Split)
+        {
+            std::memcpy(data.data() + miss2dOffset,
+                        handles2.data() + 2u * hs, hs);
+            std::memcpy(data.data() + miss2iOffset,
+                        handles3.data() + 2u * hs, hs);
+        }
+        // hit 记录组与 giHalf 相同：opaque, opaque, alpha, water, opaque
+        // K1 用 handles1（group1=精简 rchit），K2 用 handles2（group1=全功能
+        // rchit）；玻璃组两管线同模块，两份取值相同。
+        const uint32_t recordGroups[SBT_HIT_RECORD_COUNT] = {
+            1u, 1u, 3u, 4u, 1u };
+        for(uint32_t record = 0u; record < SBT_HIT_RECORD_COUNT; ++record)
+        {
+            std::memcpy(data.data() + hitOffset + record * handleAligned,
+                        handles1.data() + recordGroups[record] * hs, hs);
+            std::memcpy(data.data() + hit2Offset + record * handleAligned,
+                        handles2.data() + recordGroups[record] * hs, hs);
+            if(k2Split)
+            {
+                std::memcpy(data.data() + hit3Offset + record * handleAligned,
+                            handles3.data() + recordGroups[record] * hs, hs);
+            }
+        }
+        std::memcpy(data.data() + callableOffset,
+                    handles2.data() + 5u * hs, hs);
+        if(k2Split)
+        {
+            std::memcpy(data.data() + callable2Offset,
+                        handles3.data() + 5u * hs, hs);
+        }
+
+        createBuffer(g_device, g_physicalDevice, sbtSize,
+                     VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR |
+                         VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                     g_k1k2SbtBuffer, g_k1k2SbtMemory, true);
+
+        void* sbtMapped = nullptr;
+        check(vkMapMemory(g_device, g_k1k2SbtMemory, 0u, sbtSize, 0u,
+                          &sbtMapped),
+              "map K1/K2 SBT failed");
+        std::memcpy(sbtMapped, data.data(), sbtSize);
+        vkUnmapMemory(g_device, g_k1k2SbtMemory);
+
+        const uint64_t sbtAddress =
+            getBufferDeviceAddress(g_device, g_k1k2SbtBuffer);
+
+        // miss/hit 两组管线完全同句柄，region 两份取值相同
+        for(int p = 0; p < 2; ++p)
+        {
+            VkStridedDeviceAddressRegionKHR& raygen =
+                p == 0 ? g_k1RaygenRegion : g_k2RaygenRegion;
+            raygen.deviceAddress = sbtAddress +
+                (p == 0 ? raygen1Offset : raygen2Offset);
+            raygen.stride = handleAligned;
+            raygen.size = handleAligned;
+        }
+        g_k1MissRegion.deviceAddress = sbtAddress + missOffset;
+        g_k1MissRegion.stride = handleAligned;
+        g_k1MissRegion.size = handleAligned;
+        g_k1HitRegion.deviceAddress = sbtAddress + hitOffset;
+        g_k1HitRegion.stride = handleAligned;
+        g_k1HitRegion.size = SBT_HIT_RECORD_COUNT * handleAligned;
+        if(k2Split)
+        {
+            // ③ 拆分：K2-D/K2-I 各自的 region（单发 K2 的 region 不再使用）
+            g_k2dRaygenRegion.deviceAddress = sbtAddress + raygen2Offset;
+            g_k2dRaygenRegion.stride = handleAligned;
+            g_k2dRaygenRegion.size = handleAligned;
+            g_k2iRaygenRegion.deviceAddress = sbtAddress + raygen3Offset;
+            g_k2iRaygenRegion.stride = handleAligned;
+            g_k2iRaygenRegion.size = handleAligned;
+            g_k2dMissRegion.deviceAddress = sbtAddress + miss2dOffset;
+            g_k2dMissRegion.stride = handleAligned;
+            g_k2dMissRegion.size = handleAligned;
+            g_k2iMissRegion.deviceAddress = sbtAddress + miss2iOffset;
+            g_k2iMissRegion.stride = handleAligned;
+            g_k2iMissRegion.size = handleAligned;
+            g_k2dHitRegion.deviceAddress = sbtAddress + hit2Offset;
+            g_k2dHitRegion.stride = handleAligned;
+            g_k2dHitRegion.size = SBT_HIT_RECORD_COUNT * handleAligned;
+            g_k2iHitRegion.deviceAddress = sbtAddress + hit3Offset;
+            g_k2iHitRegion.stride = handleAligned;
+            g_k2iHitRegion.size = SBT_HIT_RECORD_COUNT * handleAligned;
+            g_k2dCallableRegion.deviceAddress = sbtAddress + callableOffset;
+            g_k2dCallableRegion.stride = handleAligned;
+            g_k2dCallableRegion.size = handleAligned;
+            g_k2iCallableRegion.deviceAddress = sbtAddress + callable2Offset;
+            g_k2iCallableRegion.stride = handleAligned;
+            g_k2iCallableRegion.size = handleAligned;
+        }
+        else
+        {
+            g_k2MissRegion = g_k1MissRegion;
+            g_k2HitRegion.deviceAddress = sbtAddress + hit2Offset;
+            g_k2HitRegion.stride = handleAligned;
+            g_k2HitRegion.size = SBT_HIT_RECORD_COUNT * handleAligned;
+        }
+        // D1：材质 callable 记录（两条管线共用；K1 的 rgen 不发起 callable，
+        // region 挂上对 K1 无影响）
+        g_k1CallableRegion.deviceAddress = sbtAddress + callableOffset;
+        g_k1CallableRegion.stride = handleAligned;
+        g_k1CallableRegion.size = handleAligned;
+        if(!k2Split)
+        {
+            g_k2CallableRegion = g_k1CallableRegion;
+        }
+
+        {
+            std::ostringstream dbg;
+            dbg << "[K1/K2] SBT addr=0x" << std::hex << sbtAddress
+                << " hs=" << std::dec << hs << " ha=" << ha << " ba=" << ba
+                << " rg1=" << raygen1Offset << " rg2=" << raygen2Offset
+                << " miss=" << missOffset << " hit1=" << hitOffset
+                << " hit2=" << hit2Offset
+                << " call=" << callableOffset << " size=" << sbtSize;
+            RTLog(dbg.str());
+        }
+
+        std::cerr << "[K1/K2] 管线已创建（k1=主视线落盘, k2=读盘续算传输）"
+                  << std::endl;
+
+        // 2026-11-06：同 GI HALF，改为交给 maybePersist 去抖。
+        g_pipelineCachePersistCountdown = 60u;
+    }
+    catch(const std::exception& error)
+    {
+        std::cerr << "[K1/K2] 管线创建失败（本会话不再重试，回退单发主管线）："
+                  << error.what() << std::endl;
+        destroyK1K2Pipeline();
+        g_k1K2PipelineFailed = true;
+        g_k1Pipeline = VK_NULL_HANDLE;
+        g_k2Pipeline = VK_NULL_HANDLE;
+    }
+}
+bool traceK1K2(VkCommandBuffer cmd, uint32_t width, uint32_t height)
+{
+    if(!k1k2SplitEnabled())
+    {
+        return false;
+    }
+    if(g_rayTracingPipeline == VK_NULL_HANDLE ||
+       g_rayTracingPipelineLayout == VK_NULL_HANDLE ||
+       g_rayTracingDescriptorSet == VK_NULL_HANDLE)
+    {
+        return false;
+    }
+
+    ensureK1K2Pipelines();
+    if(g_k1Pipeline == VK_NULL_HANDLE || g_k2Pipeline == VK_NULL_HANDLE)
+    {
+        return false;
+    }
+
+    // slotCount 两侧同式：max(1, int(clamp(spp,0.5,4.0)+0.5))
+    const float spp = std::clamp(g_perfRtSpp.load(), 0.5f, 4.0f);
+    const uint32_t slots = (uint32_t)std::max(1, (int)(spp + 0.5f));
+    ensureK1LandingBuffer(width, height, slots);
+    if(g_k1LandingBuffer == VK_NULL_HANDLE)
+    {
+        return false;
+    }
+    // 描述符集若被重建，binding 88 需要重写
+    if(s_k1LandingBoundSet != g_rayTracingDescriptorSet)
+    {
+        writeK1LandingDescriptor();
+    }
+
+    auto trace = getCmdTraceRays();
+    if(!trace)
+    {
+        return false;
+    }
+
+    // 崩溃二分（2026-11-05）：首个 K1/K2 dispatch 在驱动里 AV（读 0x1c8），
+    // 头 3 帧逐调用打点定位是 bind/trace/barrier 哪一步。
+    // ORION_K1K2_K1_ONLY=1：只录 K1，跳过 K2（测故障在 K1 侧还是 K2 侧）。
+    static const bool k1k2K1Only = [](){
+        const char* raw = std::getenv("ORION_K1K2_K1_ONLY");
+        return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
+    }();
+    static int s_k1k2TraceLog = 0;
+    const bool logTrace = s_k1k2TraceLog < 3;
+    if(logTrace) ++s_k1k2TraceLog;
+    if(logTrace) RTLog("[K1/K2] pre bind-k1");
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
+                      g_k1Pipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
+                            g_rayTracingPipelineLayout, 0u, 1u,
+                            &g_rayTracingDescriptorSet, 0u, nullptr);
+    if(logTrace) RTLog("[K1/K2] pre trace-k1");
+    trace(cmd, &g_k1RaygenRegion, &g_k1MissRegion,
+          &g_k1HitRegion, &g_k1CallableRegion, width, height, 1u);
+    if(logTrace) RTLog("[K1/K2] post trace-k1");
+
+    if(k1k2K1Only)
+    {
+        if(logTrace) RTLog("[K1/K2] K1_ONLY: 跳过 K2");
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
+                          g_rayTracingPipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
+                                g_rayTracingPipelineLayout, 0u, 1u,
+                                &g_rayTracingDescriptorSet, 0u, nullptr);
+        return true;
+    }
+
+    if(logTrace) RTLog("[K1/K2] pre bind-k2");
+
+    // K1→K2 的交接不止 landing 一个 buffer：K1 还写了 depth/MV/guide 等
+    // 图像，K2 的传输段要读（A1 时域重投影读 MV）。只对 landing 设 buffer
+    // barrier 时图像侧是竞态 ⇒ K2 随机读到陈旧/半写 MV ⇒ 重投影扭曲+噪点。
+    // 全局 memory barrier 一次覆盖全部 buffer/图像。
+    VkMemoryBarrier k1k2Barrier{
+        VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    k1k2Barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    k1k2Barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT |
+                                VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(
+        cmd,
+        VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+        VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+        0u, 1u, &k1k2Barrier, 0u, nullptr, 0u, nullptr);
+
+    // ③ K2-D/K2-I 再拆分（默认开，ORION_K2_SPLIT=0 回退）：K1→K2D（直射级）→barrier→
+    // K2I（间接级，负责 GI/稀疏合成/公共尾段/最终输出）。两次交接都过同一
+    // 全局 barrier（landing d 字段与 k2DirectImage 都是上一级的写）。
+    if(k2DirectIndirectSplitEnabled())
+    {
+        if(g_k2dPipeline == VK_NULL_HANDLE || g_k2iPipeline == VK_NULL_HANDLE)
+        {
+            return false;
+        }
+        createK2DirectImage(width, height);
+
+        if(logTrace) RTLog("[K1/K2] pre bind-k2d");
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
+                          g_k2dPipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
+                                g_rayTracingPipelineLayout, 0u, 1u,
+                                &g_rayTracingDescriptorSet, 0u, nullptr);
+        trace(cmd, &g_k2dRaygenRegion, &g_k2dMissRegion,
+              &g_k2dHitRegion, &g_k2dCallableRegion, width, height, 1u);
+        if(logTrace) RTLog("[K1/K2] post trace-k2d");
+
+        vkCmdPipelineBarrier(
+            cmd,
+            VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+            VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+            0u, 1u, &k1k2Barrier, 0u, nullptr, 0u, nullptr);
+
+        if(logTrace) RTLog("[K1/K2] pre bind-k2i");
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
+                          g_k2iPipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
+                                g_rayTracingPipelineLayout, 0u, 1u,
+                                &g_rayTracingDescriptorSet, 0u, nullptr);
+        trace(cmd, &g_k2iRaygenRegion, &g_k2iMissRegion,
+              &g_k2iHitRegion, &g_k2iCallableRegion, width, height, 1u);
+        if(logTrace) RTLog("[K1/K2] post trace-k2i");
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
+                          g_rayTracingPipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
+                                g_rayTracingPipelineLayout, 0u, 1u,
+                                &g_rayTracingDescriptorSet, 0u, nullptr);
+        return true;
+    }
+
+    if(logTrace) RTLog("[K1/K2] pre bind-k2");
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
+                      g_k2Pipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
+                            g_rayTracingPipelineLayout, 0u, 1u,
+                            &g_rayTracingDescriptorSet, 0u, nullptr);
+    if(logTrace) RTLog("[K1/K2] pre trace-k2");
+    trace(cmd, &g_k2RaygenRegion, &g_k2MissRegion,
+          &g_k2HitRegion, &g_k2CallableRegion, width, height, 1u);
+    if(logTrace) RTLog("[K1/K2] post trace-k2");
+
+    // K1/K2 两发录完，把主管线绑回去——后续 Frame 代码假设主管线在绑
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
+                      g_rayTracingPipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
+                            g_rayTracingPipelineLayout, 0u, 1u,
+                            &g_rayTracingDescriptorSet, 0u, nullptr);
+    return true;
 }
 void sharcStatsRecordReadBack(VkCommandBuffer commandBuffer)
 {

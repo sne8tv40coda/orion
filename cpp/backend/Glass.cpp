@@ -312,7 +312,7 @@ bool ensureSparseActiveMaskPipeline()
         return false;
     }
 
-    VkDescriptorSetLayoutBinding bindings[2]{};
+    VkDescriptorSetLayoutBinding bindings[4]{};
 
     bindings[0].binding = 0u;
     bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
@@ -324,8 +324,22 @@ bool ensureSparseActiveMaskPipeline()
     bindings[1].descriptorCount = 1u;
     bindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
+    // 2026-11-04：逐像素采样率（RTX Remix 口径，见 shader 的 SPARSE_EDGE_AWARE）。
+    // binding 2 = 上一帧深度，binding 3 = 上一帧颜色（rtOutput）。
+    // 两者只用于"高对比块抬到全速率"的判定，阴影边界正是靠**颜色**这一步判出来的
+    // （阴影终止线两侧深度相同，只有亮度差）。
+    bindings[2].binding = 2u;
+    bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    bindings[2].descriptorCount = 1u;
+    bindings[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+    bindings[3].binding = 3u;
+    bindings[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    bindings[3].descriptorCount = 1u;
+    bindings[3].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
     VkDescriptorSetLayoutCreateInfo setLayoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    setLayoutInfo.bindingCount = 2u;
+    setLayoutInfo.bindingCount = 4u;
     setLayoutInfo.pBindings = bindings;
 
     if(vkCreateDescriptorSetLayout(g_device, &setLayoutInfo, nullptr, &g_sparseActiveMaskSetLayout) != VK_SUCCESS)
@@ -342,11 +356,15 @@ bool ensureSparseActiveMaskPipeline()
     poolSizeBuffer.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     poolSizeBuffer.descriptorCount = 1u;
 
-    VkDescriptorPoolSize poolSizes[2] = { poolSize, poolSizeBuffer };
+    VkDescriptorPoolSize poolSizeSampled{};
+    poolSizeSampled.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    poolSizeSampled.descriptorCount = 2u;
+
+    VkDescriptorPoolSize poolSizes[3] = { poolSize, poolSizeBuffer, poolSizeSampled };
 
     VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     poolInfo.maxSets = 1u;
-    poolInfo.poolSizeCount = 2u;
+    poolInfo.poolSizeCount = 3u;
     poolInfo.pPoolSizes = poolSizes;
 
     if(vkCreateDescriptorPool(g_device, &poolInfo, nullptr, &g_sparseActiveMaskPool) != VK_SUCCESS)
@@ -425,7 +443,25 @@ void updateSparseActiveMaskDescriptors()
         noiseInfo.offset = 0u;
         noiseInfo.range = VK_WHOLE_SIZE;
 
-        VkWriteDescriptorSet writes[2]{};
+        // 2026-11-04：逐像素采样率（RTX Remix 口径）。
+        // 深度 = g_dlssDepthView，颜色 = g_rtOutputView（上一帧）。
+        // 两者任一缺失时不写这两格 —— 此时 shader 的 SPARSE_EDGE_AWARE 也必须为 0，
+        // 否则采到未绑定的描述符（未定义行为）。
+        const bool edgeAwareBound =
+            g_dlssDepthView != VK_NULL_HANDLE &&
+            g_rtOutputView != VK_NULL_HANDLE;
+
+        VkDescriptorImageInfo depthInfo{};
+        depthInfo.sampler = getLinearSampler();
+        depthInfo.imageView = g_dlssDepthView;
+        depthInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        VkDescriptorImageInfo colorInfo{};
+        colorInfo.sampler = getLinearSampler();
+        colorInfo.imageView = g_rtOutputView;
+        colorInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        VkWriteDescriptorSet writes[4]{};
 
         writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[0].dstSet = g_sparseActiveMaskSet;
@@ -441,7 +477,28 @@ void updateSparseActiveMaskDescriptors()
         writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         writes[1].pBufferInfo = &noiseInfo;
 
-        vkUpdateDescriptorSets(g_device, 2u, writes, 0u, nullptr);
+        uint32_t writeCount = 2u;
+
+        if(edgeAwareBound)
+        {
+            writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[2].dstSet = g_sparseActiveMaskSet;
+            writes[2].dstBinding = 2u;
+            writes[2].descriptorCount = 1u;
+            writes[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            writes[2].pImageInfo = &depthInfo;
+
+            writes[3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[3].dstSet = g_sparseActiveMaskSet;
+            writes[3].dstBinding = 3u;
+            writes[3].descriptorCount = 1u;
+            writes[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            writes[3].pImageInfo = &colorInfo;
+
+            writeCount = 4u;
+        }
+
+        vkUpdateDescriptorSets(g_device, writeCount, writes, 0u, nullptr);
     }
 
     if(g_rayTracingDescriptorSet != VK_NULL_HANDLE)
@@ -471,6 +528,20 @@ void recordSparseActiveMask(
     if(cmd == VK_NULL_HANDLE ||
        renderWidth == 0u ||
        renderHeight == 0u)
+    {
+        return;
+    }
+
+    // 2026-11-06：采样率 <= 0 时本 pass 的输出没有任何消费者 —— 消费方
+    // rgen_vpt_sparse.glsl:57-73 在 samplingRate<=0 时直接 return true，连
+    // binding 78 的 mask 都不读。而 g_sparseEffectiveRate 由 Frame.cpp:389-391
+    // 每帧从 sparseSamplingRateEffective() 写入，设置页「稀疏渲染采样率% = 0(关)」
+    // 或 ORION_SPARSE_RATE=0 时恒为 0。
+    // 此时整条 pass 是纯空转：2× vkUpdateDescriptorSets + 3× vkCmdPipelineBarrier
+    // + 1 dispatch（1920x1080 下约 51.8 万线程）。
+    // 首帧 clear 一并不做：图像保持未创建/UNDEFINED，needsClear 仍为真，等采样率
+    // 真正 > 0 时照原路径"清 → dispatch → 转可读"，语义不变。
+    if(g_sparseEffectiveRate.load(std::memory_order_relaxed) <= 0.0f)
     {
         return;
     }

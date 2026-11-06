@@ -470,6 +470,7 @@ void prepareVPTDirectHistoryBuffers(VkCommandBuffer cmd)
     g_vptDirectHistoryNeedsClear = false;
 }
 bool rtDescriptorRingEnabledByEnv()
+#if 0
 {
     static int cached = -1;
     if(cached < 0)
@@ -479,7 +480,15 @@ bool rtDescriptorRingEnabledByEnv()
     }
     return cached != 0;
 }
+#endif
+// 2026-11-06 #13 退役：环的 publish 是 bisect 残留（恒 return false、零调用
+// 点），创建体在 RTX_ATLAS_RING=1 时仍会白占 512 CIS 配额 × 槽数的池。按死码
+// 规范外层 #if 0 屏蔽保留（含 env 门，-D 也打不开）；下方三行空壳维持 ABI。
+{
+    return false;
+}
 void createRtDescriptorRing()
+#if 0
 {
     g_rtDescriptorRingReady = false;
 
@@ -574,6 +583,8 @@ void createRtDescriptorRing()
         (g_rtDescriptorRingReady ? "" : " (legacy device-idle path stays)")
     );
 }
+#endif
+{}
 
 // ---------------------------------------------------------------------------
 // churn 发布的零等待路径。成功时 g_rayTracingDescriptorSet 已指向"整份拷贝自
@@ -582,6 +593,7 @@ void createRtDescriptorRing()
 // device-idle 路径（行为与旧版逐位一致）。
 // ---------------------------------------------------------------------------
 bool rtDescriptorRingPublish()
+#if 0
 {
     g_rtDescriptorRingLastPublishUsedRing = false;
 
@@ -634,14 +646,21 @@ bool rtDescriptorRingPublish()
     g_rtDescriptorRingLastPublishUsedRing = false;
     return false;
 }
+#endif
+{
+    return false;
+}
 void createRayTracingDescriptorPoolAndSet()
 {
     VkDescriptorPoolSize ps[5] = {
         { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1 },
-        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 20 },
+        // 2026-11-04 A1：+2 = GI 时域历史 binding 86/87（20 → 22，原配额恰好用满）。
+        // 2026-11-05 ③：+1 = K2-D/K2-I 直射级交接图 binding 89（22 → 23）。
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 23 },
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 },
         { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 512 },
-        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 21 }
+        // 2026-11-05 B：+1 = K1/K2 landing SSBO（binding 88，21 → 22）。
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 22 }
     };
     VkDescriptorPoolCreateInfo pi{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
     pi.maxSets = 1;
@@ -657,7 +676,8 @@ void createRayTracingDescriptorPoolAndSet()
 
     check(vkAllocateDescriptorSets(g_device, &ai, &g_rayTracingDescriptorSet), "Failed to allocate RT descriptor set");
 
-    createRtDescriptorRing();
+    // createRtDescriptorRing() 已随 #13 退役（publish 零调用点 + bisect 残留），
+    // 不再调用；空壳与 #if 0 原体留在上方。
 
     VkWriteDescriptorSetAccelerationStructureKHR asi{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR };
     asi.accelerationStructureCount = 1;
@@ -1018,9 +1038,15 @@ void growVLIPageCapacityLocked(uint32_t requiredPages)
     }
 
     uint32_t newCapacity = g_vliPageCapacity;
+
+    // 2026-11-06h：2x -> 4x。
+    // 实测一局会触发 2 次增长（1024 -> 2048 -> 3253），每次在 g_vliMutex 内同步
+    // 迁移整池并 vkQueueWaitIdle，持锁 17~22ms（[VLI LOCK] site=vliGrow）。
+    // 4x 让它一步到 limit（1024 -> 4096，被 capacityLimit 截断），一局最多 1 次；
+    // 最终占用不变（本来也会涨到 3253），只是少付一次迁移。
     while(newCapacity < requiredPages && newCapacity < capacityLimit)
     {
-        newCapacity *= 2u;
+        newCapacity *= 4u;
     }
     if(newCapacity > capacityLimit)
     {
@@ -1707,6 +1733,79 @@ void rebuildVPTCandidatePageLocked(VLISectionCpuPage& receiver)
 }
 
 
+// 2026-11-06e：邻域重建的去重版本（配合 applyVLISectionVoxelsLocked 的
+// deferredNeighborhoodPages 参数）。
+//
+// 为什么需要：rebuildVPTCandidateNeighborhoodLocked 是 125 个邻域 Section，
+// 每个再走 rebuildVPTSourceDirectoryPageLocked（内部又扫 125）⇒ 单次约 15625 次
+// 哈希查找。一帧批量 apply N 个相邻 Section 时，邻域重叠高达 64/125，等于重复
+// 做 N 遍。这里先按 pageIndex 去重收集，再统一重建一次。
+static void collectVPTNeighborhoodPageIndices(
+    int32_t sectionX,
+    int32_t sectionY,
+    int32_t sectionZ,
+    std::unordered_set<uint32_t>& outPageIndices
+)
+{
+    forEachVPTNeighborhoodSection(
+        sectionX,
+        sectionY,
+        sectionZ,
+        [&outPageIndices](VLISectionCpuPage& page)
+        {
+            outPageIndices.insert(page.pageIndex);
+        }
+    );
+}
+static void rebuildVPTNeighborhoodPagesLocked(
+    const std::unordered_set<uint32_t>& pageIndices
+)
+{
+    for(const uint32_t pageIndex : pageIndices)
+    {
+        if(pageIndex >= g_vliPageSectionKeys.size())
+        {
+            continue;
+        }
+
+        const uint64_t sectionKey = g_vliPageSectionKeys[pageIndex];
+
+        if(sectionKey == VLI_INVALID_SECTION_KEY)
+        {
+            continue;
+        }
+
+        const auto pageIt = g_vliSections.find(sectionKey);
+
+        if(pageIt == g_vliSections.end())
+        {
+            continue;
+        }
+
+        rebuildVPTCandidatePageLocked(pageIt->second);
+        rebuildVPTSourceDirectoryPageLocked(pageIt->second);
+    }
+}
+
+// 2026-11-06h：延后到帧内统一重建的邻域页集合。
+// 生产者是 refreshVPTEmitterSectionFromLocalLights（Java 回调线程，持 g_vliMutex），
+// 消费者是 recordVLIUpdates（渲染线程，持 g_vliMutex）。用 g_vliMutex 保护，
+// 另用一个原子标志避免空闲帧白拿一次锁。
+static std::unordered_set<uint32_t> s_deferredVptNeighborhoodPages;
+static std::atomic<bool> s_hasDeferredVptNeighborhoodPages{ false };
+
+// 2026-11-06i：定义在本文件靠后（约 3000 行），而调用点在 applyVLISectionVoxelsLocked，
+// 需要提前声明。
+static bool evictFarthestVLIPageForIncomingLocked(
+    uint32_t& outPageIndex,
+    int32_t sectionX,
+    int32_t sectionY,
+    int32_t sectionZ
+);
+
+// 2026-11-06m???????????recordVLIUpdates ??????
+static void drainVLIEvictGarbage();
+
 void rebuildVPTCandidateNeighborhoodLocked(
     int32_t sectionX,
     int32_t sectionY,
@@ -1737,7 +1836,8 @@ bool applyVLISectionVoxelsLocked(
     int32_t sectionZ,
     std::vector<uint32_t>& incoming,
     std::vector<uint32_t>& emitterIndexWords,
-    std::vector<uint32_t>& emitterAliasWords
+    std::vector<uint32_t>& emitterAliasWords,
+    std::unordered_set<uint32_t>* deferredNeighborhoodPages
 )
 {
     uint32_t pageIndex = 0u;
@@ -1765,8 +1865,14 @@ bool applyVLISectionVoxelsLocked(
             {
                 uint32_t evictedPageIndex = 0u;
 
-                if(!g_vramGovernor.over ||
-                   !evictFarthestVLIPageLocked(evictedPageIndex))
+                // 2026-11-06i：判据从「显存是否超预算」改为「最远页是否比新段更远」。
+                // 淘汰不释放显存（页号被新 Section 复用），所以 over 门本来就不解决
+                // 显存问题，只导致 over=0 时新 Section 被永久丢弃（远处光照缺失）。
+                if(!evictFarthestVLIPageForIncomingLocked(
+                       evictedPageIndex,
+                       sectionX,
+                       sectionY,
+                       sectionZ))
                 {
                     ++g_vliGovernorIgnoredSections;
                     return false;
@@ -1815,7 +1921,20 @@ bool applyVLISectionVoxelsLocked(
     g_vptDirtyEmitterPages.insert(pageIndex);
     g_vptDirtyEmitterAliasPages.insert(pageIndex);
     markVLINeighborhoodDirty(sectionX, sectionY, sectionZ);
-    rebuildVPTCandidateNeighborhoodLocked(sectionX, sectionY, sectionZ);
+
+    if(deferredNeighborhoodPages != nullptr)
+    {
+        // 批量路径：只收集受影响的邻域页，由调用方在循环结束后统一重建一次。
+        collectVPTNeighborhoodPageIndices(
+            sectionX,
+            sectionY,
+            sectionZ,
+            *deferredNeighborhoodPages);
+    }
+    else
+    {
+        rebuildVPTCandidateNeighborhoodLocked(sectionX, sectionY, sectionZ);
+    }
 
     return true;
 }
@@ -1872,7 +1991,16 @@ void refreshVPTEmitterSectionFromLocalLights(
         g_vptDirtyEmitterPages.insert(pageIndex);
         g_vptDirtyEmitterAliasPages.insert(pageIndex);
         markVLINeighborhoodDirty(sectionX, sectionY, sectionZ);
-        rebuildVPTCandidateNeighborhoodLocked(sectionX, sectionY, sectionZ);
+
+        // 2026-11-06h：不在这里做 125x125 邻域重建。这条路径由 Java 逐 Section
+        // 调用且持有 g_vliMutex，是这个锁 wait 的常态来源（site=workerApply）。
+        // 只收集受影响的页，帧内 recordVLIUpdates 统一去重重建一次。
+        collectVPTNeighborhoodPageIndices(
+            sectionX,
+            sectionY,
+            sectionZ,
+            s_deferredVptNeighborhoodPages);
+        s_hasDeferredVptNeighborhoodPages.store(true, std::memory_order_release);
     }
 
     if(hasVoxelPage)
@@ -2004,6 +2132,9 @@ void recordVLIUpdates(VkCommandBuffer cmd)
     g_vliMsGather = 0.0;
     g_vliMsUpload = 0.0;
 
+    // 2026-11-06m：这里在取 g_vliMutex 之前，回收上一帧淘汰摘下的页（锁外析构）。
+    drainVLIEvictGarbage();
+
     if(g_vliGrowthRequested)
     {
         // 2026-10-31（C）：增长放在"安静帧"做。
@@ -2086,6 +2217,9 @@ void recordVLIUpdates(VkCommandBuffer cmd)
 
         size_t vliPendingProcessed = 0u;
 
+        // 2026-11-06e：本帧受影响的邻域页（按 pageIndex 去重），循环结束后统一重建。
+        std::unordered_set<uint32_t> deferredNeighborhoodPages;
+
         for(;
             vliPendingProcessed < g_vliPendingSections.size();
             ++vliPendingProcessed)
@@ -2160,16 +2294,46 @@ void recordVLIUpdates(VkCommandBuffer cmd)
                    pending.sectionZ,
                    incoming,
                    emitterIndexWords,
-                   emitterAliasWords
+                   emitterAliasWords,
+                   &deferredNeighborhoodPages
                ))
             {
-                RTLog("[VLI-1.4 SOURCE] page capacity exhausted; Section ignored");
+                // 2026-11-06i：改成距离判据后，这条表示「池满 且 新段比最远页更远」，
+                // 属于正常丢弃（实测 2.5 分钟 1211 次），限频到每 600 次一条。
+                static uint32_t s_exhaustedLogCount = 0u;
+
+                if((++s_exhaustedLogCount % 600u) == 1u)
+                {
+                    RTLog(
+                        "[VLI-1.4 SOURCE] page pool full; farther Section ignored"
+                        " total=" + std::to_string(s_exhaustedLogCount));
+                }
             }
 
             g_vliMsApply +=
                 std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - vliApplyBegin
                 ).count();
+        }
+
+        // 2026-11-06e：批量 apply 结束后，按去重后的页集合统一重建一次邻域。
+        // 原来每段都重建一次 125x125，相邻段邻域重叠 64/125 ⇒ 重复 N 遍。
+        //
+        // 2026-11-06f：计入 g_vliMsApply。之前这段在 apply 循环之外、也没被任何
+        // 计时区间包住，全部落进 [RT VLI SLOW] 的 rest 残差里（实测 rest 22~28ms
+        // 就是这么来的），从日志看像是"时间凭空消失"。
+        if(!deferredNeighborhoodPages.empty())
+        {
+            const auto vliDedupBegin = std::chrono::steady_clock::now();
+
+            rebuildVPTNeighborhoodPagesLocked(deferredNeighborhoodPages);
+
+            g_vliMsApply +=
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - vliDedupBegin
+                ).count();
+
+            deferredNeighborhoodPages.clear();
         }
 
         if(vliPendingProcessed > 0u)
@@ -2181,6 +2345,29 @@ void recordVLIUpdates(VkCommandBuffer cmd)
         }
 
         g_vliPendingBacklogForLog = g_vliPendingSections.size();
+    }
+
+    // 2026-11-06h：把 Java 回调线程延后的邻域重建在这里做完（按页去重一次）。
+    // 必须早于下面的 upload 采集 —— 候选/目录就是在采集后被上传到 GPU 的。
+    if(s_hasDeferredVptNeighborhoodPages.load(std::memory_order_acquire))
+    {
+        std::lock_guard<std::mutex> deferredLock(g_vliMutex);
+
+        if(!s_deferredVptNeighborhoodPages.empty())
+        {
+            // 2026-11-06i：计入 apply，别让它再落进 rest 残差。
+            const auto vliDeferredBegin = std::chrono::steady_clock::now();
+
+            rebuildVPTNeighborhoodPagesLocked(s_deferredVptNeighborhoodPages);
+            s_deferredVptNeighborhoodPages.clear();
+
+            g_vliMsApply +=
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - vliDeferredBegin
+                ).count();
+        }
+
+        s_hasDeferredVptNeighborhoodPages.store(false, std::memory_order_release);
     }
 
     const auto vliBreakdownGatherBegin =
@@ -2864,7 +3051,27 @@ void eraseVLITableSlot(uint32_t eraseSlot)
 //
 // Caller must hold g_vliMutex.
 // =====================================================
-bool evictFarthestVLIPageLocked(uint32_t& outPageIndex)
+// 2026-11-06m：淘汰摘下的页先缓存，由调用方在锁外清空（析构）。
+// thread_local：淘汰可能发生在渲染线程（apply 循环）或 JNI 线程（上传回调），
+// 各自独立，不需要额外加锁。
+static thread_local std::vector<VLISectionCpuPage> s_vliEvictGarbage;
+
+// 必须在 g_vliMutex 之外调用：这里才真正析构那些大对象。
+static void drainVLIEvictGarbage()
+{
+    s_vliEvictGarbage.clear();
+}
+
+// 2026-11-06i：带「距离闸」的内部实现。hasIncomingSection 为真时，只有当池里
+// 最远的页严格比新来的 Section 更远，才允许淘汰 —— 否则换掉它只是抖动。
+// 淘汰本身不释放显存（页号立刻被新 Section 复用），所以不该用 over 当判据。
+static bool evictFarthestVLIPageImpl(
+    uint32_t& outPageIndex,
+    bool hasIncomingSection,
+    int32_t incomingSectionX,
+    int32_t incomingSectionY,
+    int32_t incomingSectionZ
+)
 {
     outPageIndex = 0u;
 
@@ -2891,8 +3098,28 @@ bool evictFarthestVLIPageLocked(uint32_t& outPageIndex)
     float victimDistanceSq = 0.0f;
     uint64_t victimTick = 0u;
 
+    // 2026-11-06j：等距抽样，避免每帧在锁内全表扫描 3000+ 页。
+    // 页数 3253 时 stride=13、候选约 250 个；判据只要求「比新段更远」，
+    // 近似取样不影响正确性（最坏是本次不淘汰，退回旧行为：丢弃新 Section）。
+    constexpr size_t VLI_EVICT_SCAN_LIMIT = 256u;
+
+    size_t scanStride = 1u;
+
+    if(g_vliSections.size() > VLI_EVICT_SCAN_LIMIT)
+    {
+        scanStride =
+            (g_vliSections.size() + VLI_EVICT_SCAN_LIMIT - 1u) / VLI_EVICT_SCAN_LIMIT;
+    }
+
+    size_t scanIndex = 0u;
+
     for(const auto& entry : g_vliSections)
     {
+        if(scanStride > 1u && (scanIndex++ % scanStride) != 0u)
+        {
+            continue;
+        }
+
         const VLISectionCpuPage& page = entry.second;
 
         const float posX = static_cast<float>(page.sectionX) * 16.0f + 8.0f;
@@ -2932,10 +3159,48 @@ bool evictFarthestVLIPageLocked(uint32_t& outPageIndex)
         }
     }
 
+    // 2026-11-06i：新 Section 不比最远页更近 ⇒ 不值得换（换了下一帧又换回来）。
+    if(hasIncomingSection && victimKey != VLI_INVALID_SECTION_KEY)
+    {
+        const float incomingPosX =
+            static_cast<float>(incomingSectionX) * 16.0f + 8.0f;
+        const float incomingPosY =
+            static_cast<float>(incomingSectionY) * 16.0f + 8.0f;
+        const float incomingPosZ =
+            static_cast<float>(incomingSectionZ) * 16.0f + 8.0f;
+
+        const float inDx = incomingPosX - centerX;
+        const float inDy = incomingPosY - centerY;
+        const float inDz = incomingPosZ - centerZ;
+        const float incomingDistanceSq = inDx * inDx + inDy * inDy + inDz * inDz;
+
+        if(victimDistanceSq <= incomingDistanceSq)
+        {
+            return false;
+        }
+    }
+
     if(victimKey == VLI_INVALID_SECTION_KEY ||
        victimPageIndex >= g_vliPageSectionKeys.size())
     {
         return false;
+    }
+
+    // 2026-11-06m：与列卸载同因 —— 节点内联着整个 VLISectionCpuPage，
+    // erase 会在锁内析构 180µs 级的大块。先 move 出来（只搬指针），锁外销毁。
+    {
+        const auto victimIt = g_vliSections.find(victimKey);
+
+        if(victimIt != g_vliSections.end())
+        {
+            s_vliEvictGarbage.push_back(std::move(victimIt->second));
+
+            // JNI 线程可能在两个 drain 之间攒很多，兜底：攒到 16 个就地清一次。
+            if(s_vliEvictGarbage.size() >= 16u)
+            {
+                s_vliEvictGarbage.clear();
+            }
+        }
     }
 
     g_vliSections.erase(victimKey);
@@ -2951,6 +3216,28 @@ bool evictFarthestVLIPageLocked(uint32_t& outPageIndex)
 
     outPageIndex = victimPageIndex;
     return true;
+}
+
+// 保留原原型（OrionInternal.h），行为 = 不带距离闸（无条件淘汰最远页）。
+bool evictFarthestVLIPageLocked(uint32_t& outPageIndex)
+{
+    return evictFarthestVLIPageImpl(outPageIndex, false, 0, 0, 0);
+}
+
+// 池满时给新 Section 让位：仅当最远页比新段更远才淘汰。
+static bool evictFarthestVLIPageForIncomingLocked(
+    uint32_t& outPageIndex,
+    int32_t sectionX,
+    int32_t sectionY,
+    int32_t sectionZ
+)
+{
+    return evictFarthestVLIPageImpl(
+        outPageIndex,
+        true,
+        sectionX,
+        sectionY,
+        sectionZ);
 }
 
 extern "C"
@@ -3199,11 +3486,21 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_uploadVoxelLightSect
         {
             g_vliGrowthRequested = true;
 
-            std::stringstream ss;
-            ss << "[VLI-1.4 SOURCE] page pool at capacity "
-               << g_vliPageCapacity
-               << "; Section parked for the render-thread growth";
-            RTLog(ss.str());
+            // 2026-11-06i：限频。池顶到 capacityLimit 之后增长会立即返回，
+            // 而 g_vliGrowthRequested 每帧被清，于是这条每帧重打（实测刷屏）。
+            static uint32_t s_parkLogCount = 0u;
+
+            if((++s_parkLogCount % 600u) == 1u)
+            {
+                std::stringstream ss;
+                ss << "[VLI-1.4 SOURCE] page pool at capacity "
+                   << g_vliPageCapacity
+                   << "; Section parked for the render-thread growth"
+                   << " growthPossible="
+                   << (g_vliPageCapacity < vliPageCapacityLimit() ? 1 : 0)
+                   << " parkedTotal=" << s_parkLogCount;
+                RTLog(ss.str());
+            }
         }
     }
 }
@@ -3727,6 +4024,11 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_removeLightChunk(
 
     std::vector<std::array<int32_t, 3>> vliRemovedCoordinates;
 
+    // 2026-11-06l：被摘下的 VLI 页先 move 到这里，等 g_vliMutex 释放后再析构。
+    // 声明位置必须在锁作用域之外 —— 否则析构仍发生在锁内。
+    std::vector<VLISectionCpuPage> vliUnloadGarbage;
+    vliUnloadGarbage.reserve(64u);
+
     {
         VliLockHoldProbe vliLockHoldProbe("chunkUnloadScan");
         std::lock_guard<std::mutex> lock(g_vliMutex);
@@ -3751,16 +4053,31 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_removeLightChunk(
 
                 const VLISectionCpuPage& page = vliPageIt->second;
 
+                // 先把要用的标量取出来：下面 move 之后 page 就是空壳了。
+                const int32_t pageSectionX = page.sectionX;
+                const int32_t pageSectionY = page.sectionY;
+                const int32_t pageSectionZ = page.sectionZ;
+                const uint32_t pageIndexValue = page.pageIndex;
+                const uint32_t pageTableSlot = page.tableSlot;
+
                 vliRemovedCoordinates.push_back({
-                    page.sectionX,
-                    page.sectionY,
-                    page.sectionZ
+                    pageSectionX,
+                    pageSectionY,
+                    pageSectionZ
                 });
-                g_vliFreePages.push_back(page.pageIndex);
-                g_vliPageSectionKeys[page.pageIndex] = VLI_INVALID_SECTION_KEY;
-                eraseVLITableSlot(page.tableSlot);
+                g_vliFreePages.push_back(pageIndexValue);
+                g_vliPageSectionKeys[pageIndexValue] = VLI_INVALID_SECTION_KEY;
+
+                eraseVLITableSlot(pageTableSlot);
+
+                // 2026-11-06l：把大对象 move 出去（只搬内部指针），让 erase 立刻返回；
+                // 真正的析构发生在函数返回、g_vliMutex 已释放之后。
+                // 实测这一段曾占 chunkUnloadScan 的 98%（7 段 1.26ms，180µs/次）。
+                vliUnloadGarbage.push_back(std::move(vliPageIt->second));
                 g_vliSections.erase(vliPageIt);
+
                 vliUploadHashForget(vliColumnKey);
+
                 ++vliRemovedSections;
             }
         }

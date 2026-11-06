@@ -172,6 +172,29 @@ target_compile_definitions(rtx_backend PRIVATE
 
 # VulkanCore.cpp contains UTF-8 comments and string literals. Explicitly tell
 # MSVC to consume UTF-8 rather than the active Windows ANSI code page.
+#
+# 2026-11-06 拆分后的构建期优化（单 TU 时代这三条都没有意义）：
+#
+#   /MP  —— 36 个 backend TU 属于同一个 .vcxproj，不加 /MP 时 cl.exe 一次只编
+#           一个文件。拆分前是 1 个 TU，/MP 恒等于 1。
+#
+#   PCH  —— 35 个 TU 都把 backend/OrionInternal.h 作为**第一个** include（已逐
+#           文件核对，且首个 include 之前没有任何预处理指令），而它集中了
+#           vulkan.h(beta)/windows.h/psapi.h + 9 个 Streamline 头 + NRD.h +
+#           13 个 STL 头，每个 TU 都要重复解析约 3.5~4 万行。
+#           ⚠ 绝不能把 TrackingHooks.h 放进 PCH：它对 15 个分配/创建入口做宏
+#             劫持，而 Tracking.cpp 的记账实现必须见到**真实**入口（它只 include
+#             OrionInternal.h，正是这个原因）。
+#           ⚠ external/bc7enc/bc7enc.cpp 不 include 本头，必须跳过 PCH，否则
+#             MSVC 报 C1010（unexpected end of file while looking for PCH）。
+#
+#   本机 PCH 命中后，增量编译只重编被改的 .cpp；全量构建的解析阶段基本归零。
 if(MSVC)
-    target_compile_options(rtx_backend PRIVATE /utf-8)
+    target_compile_options(rtx_backend PRIVATE /utf-8 /MP)
+
+    target_precompile_headers(rtx_backend PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/backend/OrionInternal.h)
+
+    set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/external/bc7enc/bc7enc.cpp
+            PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
 endif()

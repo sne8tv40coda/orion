@@ -574,11 +574,20 @@ double vramGovernorHighWater()
 
         if(raw == nullptr || raw[0] == '\0')
         {
-            return 0.72;
+            // 2026-11-06f：0.80 → 0.82。实测 16 区块跑图的稳态 ratio 已经到 0.808，
+            // 贴着 0.80 会让 over 在边缘反复进出（nonResident 又顶到 guard 3000）。
+            // 0.82 仍低于注释记录的 DLSS eWarnOutOfVRAM 线（0.849）。
+            // 2026-11-06c：0.72 → 0.80。
+            // 0.72 是按"驱逐能降 used"标定的，但驱逐只释放 BLAS（实测 asBlasMB
+            // 仅 144MB / usedMB 5077）⇒ ratio 只能降 2.8%，永远回不到 lowWater
+            // 0.62 ⇒ over 永久为真、无限驱逐、视野内区块被清空（实测 nonResident
+            // 4637 / blas 只剩 2038）。0.80 仍低于注释记录的 DLSS
+            // eWarnOutOfVRAM 线（0.849），保留余量。
+            return 0.82;
         }
 
         const double parsed = std::atof(raw);
-        return (parsed > 0.0 && parsed <= 1.0) ? parsed : 0.72;
+        return (parsed > 0.0 && parsed <= 1.0) ? parsed : 0.82;
     }();
 
     return cached;
@@ -1274,6 +1283,37 @@ void updateVramGovernor()
     else if(ratio < vramGovernorLowWater())
     {
         g_vramGovernor.over = false;
+    }
+    else
+    {
+        // 2026-11-06d：驱逐已饱和 ⇒ 退出 over。
+        //
+        // over 的滞回带（0.80 进 / 0.62 出）假设"驱逐能降 used"，但驱逐只释放
+        // BLAS（asBlasMB 约 300MB / usedMB 4600），永远降不到 0.62 ⇒ over 常驻。
+        // 常驻 over 的副作用是 keepCap=0：每次 tick 释放全部空 slab、下次重新分配
+        // （实测 slabAlloc 49.7GB / slabFree 48.4GB、vkAllocN 1188），制造缺页。
+        // 此时驱逐已被 nonResident guard 拦住，继续 over 只有坏处。
+        static const size_t sNonResidentOverExit = []()
+        {
+            const char* raw = std::getenv("ORION_NONRESIDENT_GUARD");
+
+            if(raw == nullptr || raw[0] == '\0')
+            {
+                return static_cast<size_t>(3000u);
+            }
+
+            const long parsed = std::atol(raw);
+
+            return parsed >= 0
+                ? static_cast<size_t>(parsed)
+                : static_cast<size_t>(3000u);
+        }();
+
+        if(sNonResidentOverExit > 0u &&
+           g_nonResidentSections.size() >= sNonResidentOverExit)
+        {
+            g_vramGovernor.over = false;
+        }
     }
 
     g_vramGovernor.freedTotalMb += trimSectionMemoryPool();
@@ -3564,7 +3604,41 @@ void writeSectionRoleSlot(const RTSectionAS& section)
         return;
     }
 
+    // 2026-11-06b：只在 role 真的变化时写 GPU 表。
+    //
+    // g_sectionRoleMapped 是主机可见映射（write-combined）。这里是**离散** 4B 写
+    // （每个槽一处、槽序随机），一次写就要刷一次 WC 缓冲 —— 实测 ord 段
+    // 3.04ms / 约 6000 段 ≈ 0.5µs 每次，正是这个特征。
+    // 用普通内存里的影子数组做比较（缓存内读），命中则整帧几乎零写入。
+    //
+    // 正确性：
+    //   · 影子以 g_sectionRoleMapped 指针为代际，映射重建（memset 0）时整体
+    //     失效重填，保证每个槽至少写一次；
+    //   · 槽位回收再分配给别的段时，若新 role 与旧值相同，GPU 表里本来就是该值，
+    //     跳过是安全的；不同则照常写。
+    static void* sRoleShadowBase = nullptr;
+    static std::vector<uint32_t> sRoleShadow;
+
+    if(sRoleShadowBase != g_sectionRoleMapped ||
+       sRoleShadow.size() < SECTION_VERTEX_ADDRESS_SLOT_LIMIT)
+    {
+        sRoleShadow.assign(
+            SECTION_VERTEX_ADDRESS_SLOT_LIMIT,
+            0xFFFFFFFFu);
+        sRoleShadowBase = g_sectionRoleMapped;
+    }
+
+    const uint32_t role = sectionRoleOf(section);
+    uint32_t& shadow = sRoleShadow[section.vertexAddressSlot];
+
+    if(shadow == role)
+    {
+        return;
+    }
+
+    shadow = role;
+
     static_cast<uint32_t*>(
         g_sectionRoleMapped
-    )[section.vertexAddressSlot] = sectionRoleOf(section);
+    )[section.vertexAddressSlot] = role;
 }

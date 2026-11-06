@@ -173,9 +173,12 @@ void main()
         float rayStep = (viewZ - previousViewZ) / cosAngle;
         previousViewZ = viewZ;
 
-        float depthSlice = pow(clamp((viewZ - nearPlane) / maxViewZ, 0.0, 1.0),
-            1.0 / depthExponent) * depthSlices;
-        float froxelW = (depthSlice + 0.5) / depthSlices;
+        // 2026-11-06：恒等式化简（省 2 次 pow + 1 次 clamp + 1 次除法/步）。
+        //   (viewZ - nearPlane) / maxViewZ == pow(sliceT, depthExponent)  ← 上两行定义
+        //   clamp(..., 0, 1) 对 sliceT ∈ (0,1] 是恒等
+        //   pow(pow(t, e), 1/e) == t
+        //   ⇒ froxelW == sliceT + 0.5 / depthSlices   （depthSlices >= 1，无除零）
+        float froxelW = sliceT + 0.5 / depthSlices;
 
         vec3 radiance = textureLod(froxelRadiance, vec3(uv, froxelW), 0.0).rgb;
 

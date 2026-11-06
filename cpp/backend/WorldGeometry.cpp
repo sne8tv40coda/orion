@@ -1902,8 +1902,125 @@ bool rebuildWorldGeometry(
         }
     }
 
+    // ------------------------------------------------------------------
+    // 2026-11-06：驱逐扫描按帧节流。
+    //
+    // 这段是 O(全部段) 的全表扫描：遍历 g_sectionBLAS（本局约 2000~2900 段）、
+    // 每段解 spatialKey 求中心、过太阳阴影保留盒（9 次乘加）、再过视锥 5 平面，
+    // 然后 sort 候选、remove_if 有序表、遍历 BLAS 逐条 retire。
+    // 实测（16 区块跑图，[RT GEOMETRY SLOW] 92 个慢帧）单次 evict = 5.03ms，
+    // p90 9.81ms，max 15.43ms —— 是 tail 里最大的一块。
+    //
+    // 而它只在 VRAM 超预算时才有意义，且 governor 自身是按
+    // VRAM_GOVERNOR_SAMPLE_TICKS = 30 采样的。每次 rebuild 都扫一遍纯属浪费，
+    // 这里按帧节流（默认 4 帧一次）：超预算时的响应仍比采样周期快一个数量级。
+    // ORION_VRAM_EVICT_INTERVAL=1 回到逐帧（A/B 用）。
+    // ------------------------------------------------------------------
+    static const uint32_t sEvictInterval = []()
+    {
+        const char* raw = std::getenv("ORION_VRAM_EVICT_INTERVAL");
+
+        if(raw == nullptr || raw[0] == '\0')
+        {
+            return 4u;
+        }
+
+        const int parsed = std::atoi(raw);
+
+        if(parsed < 1)
+        {
+            return 1u;
+        }
+
+        return static_cast<uint32_t>(parsed > 64 ? 64 : parsed);
+    }();
+    static uint32_t sEvictTick = 0u;
+
+    const bool evictDue =
+        sEvictInterval <= 1u ||
+        ((sEvictTick++ % sEvictInterval) == 0u);
+
+    // ------------------------------------------------------------------
+    // 2026-11-06：段数/距离驱动的驱逐（不再只等 VRAM over）。
+    //
+    // 实测（16 区块跑图）：显存只到 65%（vramUsedMB=4646/7180）⇒ over 永不成立
+    // ⇒ 跑过的 Section 永久留在 BLAS/TLAS 里 ⇒ meshSec 1280→5437、
+    // geometry 段 0.78→5.59ms、fps 165→29。
+    //
+    // 这里补一条与显存无关的判据：段数超过上限时，用固定保留半径驱逐最远的段。
+    // 非 over 路径**不缩**太阳阴影保留盒（shadowKeepScale=1）：那条收缩是为
+    // 了压显存，正常运行时缩了会漏光（见下方 2026-11-03 的注释）。
+    //
+    // ORION_SECTION_MAX_COUNT   段数上限（默认 4000；=0 关闭）
+    // ORION_SECTION_KEEP_RADIUS 保留半径（默认 384 格）
+    // ------------------------------------------------------------------
+    static const size_t sSectionMaxCount = []()
+    {
+        const char* raw = std::getenv("ORION_SECTION_MAX_COUNT");
+
+        if(raw == nullptr || raw[0] == '\0')
+        {
+            // 2026-11-06b：默认关闭。
+            // 实测 16 区块视野内的真实段数就是 ~6000（33x33 chunk x 每 chunk 数个
+            // 垂直 Section），4000 上限让系统永远超限 ⇒ 每 4 帧全表扫 6000 段 +
+            // 持续驱逐/重建（asRetireN 1130→2519、upWaitMs 12.8→19.2、fps 69.6→47.6）。
+            // 只在"段数异常增长"的场景（例如传送/维度切换残留）用 env 手动开启。
+            return static_cast<size_t>(0u);
+        }
+
+        const long parsed = std::atol(raw);
+
+        return parsed > 0
+            ? static_cast<size_t>(parsed)
+            : static_cast<size_t>(0u);
+    }();
+    static const float sSectionKeepRadius = []()
+    {
+        const char* raw = std::getenv("ORION_SECTION_KEEP_RADIUS");
+
+        if(raw == nullptr || raw[0] == '\0')
+        {
+            return 384.0f;
+        }
+
+        const double parsed = std::atof(raw);
+
+        return parsed > 16.0 ? static_cast<float>(parsed) : 384.0f;
+    }();
+
+    const bool sectionCountPressure =
+        sSectionMaxCount > 0u &&
+        orderedSections.size() > sSectionMaxCount;
+
+    // 2026-11-06c：驱逐饱和保护。
+    // 被驱逐进 nonResident 的段已经远多于还活着的段时，继续驱逐只会清空视野
+    // （实测 nonResident 4637 / blas 2038 ⇒ 大片区块在 RT 里不可见），而释放的
+    // 显存可以忽略（BLAS 合计 144MB）。此时停止驱逐，等 rehydrate 或手工降画质。
+    // ORION_NONRESIDENT_GUARD=0 关闭该保护。
+    static const size_t sNonResidentGuard = []()
+    {
+        const char* raw = std::getenv("ORION_NONRESIDENT_GUARD");
+
+        if(raw == nullptr || raw[0] == '\0')
+        {
+            return static_cast<size_t>(3000u);
+        }
+
+        const long parsed = std::atol(raw);
+
+        return parsed >= 0
+            ? static_cast<size_t>(parsed)
+            : static_cast<size_t>(3000u);
+    }();
+
+    const bool nonResidentSaturated =
+        sNonResidentGuard > 0u &&
+        g_nonResidentSections.size() > sNonResidentGuard;
+
     if(vramGovernorMode() >= 2 &&
-       g_vramGovernor.over &&
+       (g_vramGovernor.over || sectionCountPressure) &&
+       evictDue &&
+       !nonResidentSaturated &&
        !orderedSections.empty())
     {
         constexpr float VRAM_EVICT_SHRINK_RADIUS = 0.25f;
@@ -1923,14 +2040,17 @@ bool rebuildWorldGeometry(
 
         (void)overRatio;
 
-        const float keepRadius =
-            vramEvictKeepRadius() *
-            (1.0f - VRAM_EVICT_SHRINK_RADIUS * overageT);
+        // 非 over（段数驱动）时用固定的保留半径，且不缩阴影盒。
+        const float keepRadius = g_vramGovernor.over
+            ? vramEvictKeepRadius() *
+                  (1.0f - VRAM_EVICT_SHRINK_RADIUS * overageT)
+            : sSectionKeepRadius;
         const float evictRadius = keepRadius * VRAM_EVICT_HYSTERESIS;
         const float evictRadiusSq = evictRadius * evictRadius;
 
-        const float shadowKeepScale =
-            1.0f - VRAM_EVICT_SHRINK_SHADOW * overageT;
+        const float shadowKeepScale = g_vramGovernor.over
+            ? (1.0f - VRAM_EVICT_SHRINK_SHADOW * overageT)
+            : 1.0f;
 
         const CameraUBO* evictUbo =
             g_cameraUboMapped != nullptr
@@ -1949,12 +2069,18 @@ bool rebuildWorldGeometry(
 
         rtxPreCmdAfterOrdered = std::chrono::steady_clock::now();
 
-        std::vector<VramEvictCandidate> candidates;
+        // 2026-11-06：候选容器改成静态复用。
+        // 段数驱动驱逐让这段每 4 帧就跑一次，每次重建 ~4000 个哈希节点
+        // 纯属浪费；clear() 保留 bucket，后续插入不再分配。
+        // rebuildWorldGeometry 只在渲染线程调用，无需加锁。
+        static std::vector<VramEvictCandidate> candidates;
+        static std::unordered_set<uint64_t> seen;
+
+        candidates.clear();
         candidates.reserve(g_sectionBLAS.size());
+        seen.clear();
 
         {
-            std::unordered_set<uint64_t> seen;
-
             for(const auto& entry : g_sectionBLAS)
             {
                 const uint64_t spatialKey =
@@ -2533,6 +2659,14 @@ bool rebuildWorldGeometry(
                 instance.mask = 0x02;
             }
 
+            // 2026-11-03：第一人称手部（见 SECTION_AS_CLASS_HAND 的说明）。
+            // 0x04 = 只被主相机射线（0x05）命中，所有次级射线（0xfb）都排除它
+            // ⇒ 手能看见、但不在世界里投影。
+            if(geometryClass == SECTION_AS_CLASS_HAND)
+            {
+                instance.mask = 0x04;
+            }
+
             if(geometryClass == SECTION_AS_CLASS_PARTICLE)
             {
                 instance.mask = 0xf7;
@@ -2565,6 +2699,11 @@ bool rebuildWorldGeometry(
                     SBT_RECORD_ENTITY;
             }
             else if(geometryClass == SECTION_AS_CLASS_LOCAL_PLAYER)
+            {
+                instance.instanceShaderBindingTableRecordOffset =
+                    SBT_RECORD_ENTITY;
+            }
+            else if(geometryClass == SECTION_AS_CLASS_HAND)
             {
                 instance.instanceShaderBindingTableRecordOffset =
                     SBT_RECORD_ENTITY;

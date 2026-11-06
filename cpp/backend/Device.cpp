@@ -8,9 +8,6 @@
 
 extern "C"
 JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_initDeviceHandlesNative(JNIEnv*,jclass,jlong instanceHandle,jlong physicalDeviceHandle,jlong deviceHandle,jlong queueHandle,jint queueFamily,jlong,jlong){
-    fprintf(stderr,
-"[CPP TEST] initDeviceHandlesNative ENTER\n");
-    fflush(stderr);
     g_instance=reinterpret_cast<VkInstance>(instanceHandle);
     g_physicalDevice=reinterpret_cast<VkPhysicalDevice>(physicalDeviceHandle);
     g_device=reinterpret_cast<VkDevice>(deviceHandle);
@@ -265,7 +262,11 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_initDeviceHandlesNat
                       &g_rayTracingPipeline),
                   "Failed to create RT pipeline");
 
-            persistSharedPipelineCache();
+            // 2026-11-06：主 RT 管线创建成功后立刻同步写一次 64~256MB blob 会造出
+            // 30~400ms 的一次性尖峰。改为交给 maybePersistSharedPipelineCache 的
+            // 60 帧去抖 + 大小去重（PipelineCache.cpp:726-758）；60 帧≈1~2s，
+            // 相对 8~17 分钟的冷编可忽略，且三处创建合并成一次写盘。
+            g_pipelineCachePersistCountdown = 60u;
             RTLog(
                 "[RT TRANSLUCENT SPV]"
                 " group3=rt_test_translucent.rchit+rahit"

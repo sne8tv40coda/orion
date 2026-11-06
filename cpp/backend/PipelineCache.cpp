@@ -533,6 +533,16 @@ VkPipelineCache getSharedPipelineCache()
             "[PERF PC.1] pipeline cache restored bytes=" +
             std::to_string(initialData.size())
         );
+
+        // 2026-11-06：把"已落盘字节数"记成刚恢复的那一份。
+        //
+        // 否则 g_pipelineCachePersistedBytes 一直是 0，于是启动后第一次
+        // maybePersistSharedPipelineCache() 必然把**与磁盘上完全相同**的 blob
+        // 再原样写一遍。实测（18:10:46 [PERF PC.1] saved bytes=184033829 ms=120）
+        // 就是这种空写：大小与 restored 完全一致，120ms 纯浪费。
+        // 判据与 maybePersist 里已有的去重口径相同（只比大小，见本文件 :751）。
+        // 恢复之后若又创建了新管线（K1/K2、GI-half），blob 大小会变，仍会正常落盘。
+        g_pipelineCachePersistedBytes = initialData.size();
     }
     else
     {

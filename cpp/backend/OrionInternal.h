@@ -781,7 +781,16 @@ inline constexpr uint32_t kCloudAtrousIterations = 4u;
 inline constexpr uint32_t VOL_RESTIR_DEPTH = 64u;
 inline constexpr uint32_t VOL_FROXEL_DOWNSCALE = 8u;
 inline constexpr uint32_t VOL_RESTIR_DOWNSCALE = 4u;
-inline constexpr uint32_t VOL_RESTIR_COMPOSITE_STEPS = 16u;
+// 2026-11-04：16 -> 32。
+//
+// 病灶（用户报"ReSTIR 体积光穿墙"）：composite 只有 16 步，却要跨
+// VOL_RESTIR_DEPTH = 64 层 froxel ⇒ 每步 4 层。远端每层 0.5 格，于是每步跨度
+// 2 格，比一格墙还厚：marchViewZ 虽然被 sceneDistance 截断，但步内的 froxelW
+// 采样点已经跨进墙后那一层，把墙后房间的灯算到墙前的雾上。
+// 32 步时每步 2 层、远端 1 格，误差落回墙体内部（由墙自遮挡吸收）。
+// 成本：god ray 那张图（低于全屏）的 march 次数 ×2。
+// 若仍可见穿墙：-DVOL_RESTIR_COMPOSITE_STEPS 提到 64（每步 1 层），成本 ×4。
+inline constexpr uint32_t VOL_RESTIR_COMPOSITE_STEPS = 32u;
 inline constexpr float VOL_RESTIR_EXTINCTION_SCALE = 1.0f;
 inline constexpr uint32_t VOL_RESTIR_MAX_SAMPLES = 2u;
 inline constexpr uint32_t VOL_RESTIR_CHAIN_PUSH_BYTES = 32u;
@@ -1499,6 +1508,9 @@ inline constexpr uint64_t ENTITY_RT_LAYER_KEY =
     (5ull << 60ull) | ENTITY_RT_SPATIAL_KEY;
 inline constexpr uint64_t LOCAL_PLAYER_RT_LAYER_KEY =
     (6ull << 60ull) | ENTITY_RT_SPATIAL_KEY;
+// 2026-11-03：第一人称手部层（见 SECTION_AS_CLASS_HAND 处的说明）。
+inline constexpr uint64_t HAND_RT_LAYER_KEY =
+    (8ull << 60ull) | ENTITY_RT_SPATIAL_KEY;
 inline constexpr uint64_t PARTICLE_RT_LAYER_KEY =
     (7ull << 60ull) | ENTITY_RT_SPATIAL_KEY;
 // 2026-11-03：8 -> 1。手部（本地玩家代理 + 手持物）是**逐帧骨骼动画**，
@@ -1542,6 +1554,17 @@ inline constexpr uint64_t SECTION_AS_CLASS_WATER  = 4ull << 60ull;
 inline constexpr uint64_t SECTION_AS_CLASS_ENTITY = 5ull << 60ull;
 inline constexpr uint64_t SECTION_AS_CLASS_LOCAL_PLAYER = 6ull << 60ull;
 inline constexpr uint64_t SECTION_AS_CLASS_PARTICLE = 7ull << 60ull;
+// 2026-11-03：第一人称手部（手臂 + 手持物）独立成层。
+//
+// 它需要一对互相矛盾的可见性：**主相机要看得见**（不然手上什么都没有），
+// 但**次级射线必须打不到**（不然会在世界里投出一截手臂影子 —— 而 viewmodel
+// 本来就不参与世界阴影，且它的坐标是相机相对的，影子会随视角乱飘）。
+// 现有的位组合不出来：0xff 两者都可见、0x02 主相机不可见、0xfb 两者都可见。
+// 所以新开一位 0x04：
+//   instance.mask = 0x04
+//   主相机射线   0x01 -> 0x05   （0x01 | 0x04）
+//   所有次级射线 0xff -> 0xfb   （0xff & ~0x04）
+inline constexpr uint64_t SECTION_AS_CLASS_HAND = 8ull << 60ull;
 inline constexpr uint64_t LOD_AS_CLASS_ALPHA = 2ull << 60ull;
 inline constexpr uint64_t LOD_AS_CLASS_WATER = 3ull << 60ull;
 inline constexpr uint32_t SBT_RECORD_OPAQUE = 0u;
@@ -2395,10 +2418,12 @@ bool giHalfRotateEnabled();
 int giNearRateLevel();
 bool glossyRoughLodEnabled();
 bool giNoPomEnabled();
+bool giTemporalEnabled();
 int directLightMode();
 int sparseRatePercent();
 int rtxdiReuseInactiveEnabled();
 bool giHalfEnabled();
+bool k1k2SplitEnabled();
 bool rrTransparencyHintEnabled();
 bool ResolveSLVulkanProxies();
 VkResult FGDeviceWaitIdle(
@@ -2924,6 +2949,8 @@ void createRRGBufferImages(
     uint32_t height);
 void updateGiHalfRayDescriptor();
 void createGiHalfImage(uint32_t width, uint32_t height);
+void createGiTemporalImages(uint32_t width, uint32_t height);
+void prepareGiTemporalHistoryImages(VkCommandBuffer cmd);
 void prepareGlassAlphaBlendImages(VkCommandBuffer cmd);
 void createGlassBlueNoiseBuffer();
 void destroySparseActiveMaskImage();
@@ -3002,6 +3029,8 @@ void updateVPTDirectHistoryDescriptors();
 void createVPTDirectHistoryBuffers(uint32_t width, uint32_t height);
 void prepareVPTDirectHistoryBuffers(VkCommandBuffer cmd);
 void rebuildLocalLightGpuBuffer();
+// 2026-11-06 #13 退役：三者为 bisect 时代描述符环残留（publish 零调用点），
+// Vli.cpp 里原体外层 #if 0，壳恒禁用；勿再调用或复用 env RTX_ATLAS_RING。
 bool rtDescriptorRingEnabledByEnv();
 void createRtDescriptorRing();
 bool rtDescriptorRingPublish();
@@ -3077,7 +3106,10 @@ bool applyVLISectionVoxelsLocked(
     int32_t sectionZ,
     std::vector<uint32_t>& incoming,
     std::vector<uint32_t>& emitterIndexWords,
-    std::vector<uint32_t>& emitterAliasWords
+    std::vector<uint32_t>& emitterAliasWords,
+    // 2026-11-06e：非空时只把受影响的邻域页索引收进这个集合，由调用方在批量
+    // 结束后统一重建一次（按页去重）；为空时保持旧行为（立刻重建本次邻域）。
+    std::unordered_set<uint32_t>* deferredNeighborhoodPages = nullptr
 );
 void refreshVPTEmitterSectionFromLocalLights(
     int32_t sectionX,
@@ -3493,7 +3525,22 @@ extern VkPipelineCache g_pipelineCache;
 inline constexpr const char* const RT_PIPELINE_SPV_FILES[] = {
     "shaders\\rt_test.rgen.spv",
     "shaders\\rt_test_ser.rgen.spv",
+    "shaders\\rt_test_k1.rgen.spv",
+    "shaders\\rt_test_k1_ser.rgen.spv",
+    "shaders\\rt_test_k2.rgen.spv",
+    "shaders\\rt_test_k2_ser.rgen.spv",
+    // 2026-11-05 设备丢失二分变体（ORION_K2_VARIANT 门控加载，仅诊断用）
+    "shaders\\rt_test_k2_nocall.rgen.spv",
+    "shaders\\rt_test_k2_inline.rgen.spv",
+    // ③ K2-D/K2-I 直射/间接拆分（默认加载，ORION_K2_SPLIT=0 回退）
+    "shaders\\rt_test_k2d.rgen.spv",
+    "shaders\\rt_test_k2d_ser.rgen.spv",
+    "shaders\\rt_test_k2i.rgen.spv",
+    "shaders\\rt_test_k2i_ser.rgen.spv",
+    // D1：材质层 callable（gen_material_callable.py 从 rt_test.rchit 生成）
+    "shaders\\rt_test_material.spv",
     "shaders\\rt_test.rchit.spv",
+    "shaders\\rt_test_k1.rchit.spv",
     "shaders\\rt_test.rmiss.spv",
     "shaders\\rt_test.rahit.spv",
     "shaders\\rt_test_translucent.rchit.spv",
@@ -4198,6 +4245,15 @@ extern uint32_t g_giHalfHeight;
 extern bool g_giHalfNeedsClear;
 extern VkImageView g_giHalfBoundView;
 
+// 2026-11-04 A1：GI 第一反弹时域重投影历史（binding 86/87，ping-pong 两半）。
+extern VkImage g_giTemporalHistoryImages[2];
+extern VkDeviceMemory g_giTemporalHistoryMemories[2];
+extern VkImageView g_giTemporalHistoryViews[2];
+extern VkImageLayout g_giTemporalHistoryLayouts[2];
+extern uint32_t g_giTemporalHistoryWidth;
+extern uint32_t g_giTemporalHistoryHeight;
+extern bool g_giTemporalHistoryNeedsClear;
+
 
 extern VkImage g_alphaBlendGbufferImage;
 extern VkDeviceMemory g_alphaBlendGbufferMemory;
@@ -4464,6 +4520,11 @@ extern std::atomic<float>
 // =====================================================
 extern std::atomic<float> g_ssptChunks;
 extern std::atomic<float> g_ssrChunks;
+
+// 2026-11-03（UI 开关）：RT 光泽射线总开关。1 = 开（出厂），0 = 关。
+// 写进 CameraUBO.ssHybridParams.z，rgen 读到 < 0.5 就不再发那条 GGX 反射射线，
+// 镜面交给 SSR（远场）/ SSPT（射程内）—— 这是"仅 SSPT + RTAO"配置的入口。
+extern std::atomic<float> g_ssRtGlossy;
 
 // 分项 G-buffer（rt_test.rgen 写、ss_hybrid.comp 读）
 extern VkImage g_ssIndirectTermImage;
@@ -4955,13 +5016,17 @@ extern std::unordered_map<uint64_t, VoxyLodSource> g_voxyLodSources;
 extern std::unordered_map<uint64_t, uint64_t> g_voxyLodSpatialOwners;
 extern std::vector<Vertex> g_entityFrameVertices;
 extern std::vector<Vertex> g_localPlayerFrameVertices;
+extern std::vector<Vertex> g_handFrameVertices;
 extern uint64_t g_entityCachedHash;
 extern bool g_entityCachedHashValid;
 extern uint64_t g_localPlayerCachedHash;
 extern bool g_localPlayerCachedHashValid;
+extern uint64_t g_handCachedHash;
+extern bool g_handCachedHashValid;
 extern std::vector<Vertex> g_particleFrameVertices;
 extern std::vector<float> g_entityFrameMotion;
 extern std::vector<float> g_localPlayerFrameMotion;
+extern std::vector<float> g_handFrameMotion;
 extern std::vector<float> g_particleFrameMotion;
 extern float g_dynamicCaptureCameraX;
 extern float g_dynamicCaptureCameraY;
@@ -5289,6 +5354,55 @@ extern VkStridedDeviceAddressRegionKHR g_giHalfMissRegion;
 extern VkStridedDeviceAddressRegionKHR g_giHalfHitRegion;
 extern VkStridedDeviceAddressRegionKHR g_giHalfCallableRegion;
 extern bool g_giHalfPipelineFailed;
+
+// 2026-11-05 B：K1(主视线)/K2(传输) 拆分
+extern VkPipeline g_k1Pipeline;
+extern VkPipeline g_k2Pipeline;
+// ③ K2-D/K2-I 直射/间接再拆分（默认开；ORION_K2_SPLIT=0 时与 g_k2Pipeline 互斥创建）
+extern VkPipeline g_k2dPipeline;
+extern VkPipeline g_k2iPipeline;
+extern VkStridedDeviceAddressRegionKHR g_k2dRaygenRegion;
+extern VkStridedDeviceAddressRegionKHR g_k2dMissRegion;
+extern VkStridedDeviceAddressRegionKHR g_k2dHitRegion;
+extern VkStridedDeviceAddressRegionKHR g_k2dCallableRegion;
+extern VkStridedDeviceAddressRegionKHR g_k2iRaygenRegion;
+extern VkStridedDeviceAddressRegionKHR g_k2iMissRegion;
+extern VkStridedDeviceAddressRegionKHR g_k2iHitRegion;
+extern VkStridedDeviceAddressRegionKHR g_k2iCallableRegion;
+// ③ K2-D→K2-I 直射级交接图（binding 89，rgba32f，全分辨率）
+extern VkImage g_k2DirectImage;
+extern VkDeviceMemory g_k2DirectMemory;
+extern VkImageView g_k2DirectView;
+extern VkImageLayout g_k2DirectLayout;
+extern uint32_t g_k2DirectWidth;
+extern uint32_t g_k2DirectHeight;
+extern VkBuffer g_k1LandingBuffer;
+extern VkDeviceMemory g_k1LandingMemory;
+extern VkBuffer g_k1k2SbtBuffer;
+extern VkDeviceMemory g_k1k2SbtMemory;
+extern VkStridedDeviceAddressRegionKHR g_k1RaygenRegion;
+extern VkStridedDeviceAddressRegionKHR g_k1MissRegion;
+extern VkStridedDeviceAddressRegionKHR g_k1HitRegion;
+extern VkStridedDeviceAddressRegionKHR g_k1CallableRegion;
+extern VkStridedDeviceAddressRegionKHR g_k2RaygenRegion;
+extern VkStridedDeviceAddressRegionKHR g_k2MissRegion;
+extern VkStridedDeviceAddressRegionKHR g_k2HitRegion;
+extern VkStridedDeviceAddressRegionKHR g_k2CallableRegion;
+extern bool g_k1K2PipelineFailed;
+extern uint32_t g_k1LandingWidth;
+extern uint32_t g_k1LandingHeight;
+extern uint32_t g_k1LandingSlots;
+
+void ensureK1K2Pipelines();
+void destroyK1K2Pipeline();
+void ensureK1LandingBuffer(uint32_t width, uint32_t height, uint32_t slots);
+void destroyK1LandingBuffer();
+void createK2DirectImage(uint32_t width, uint32_t height);
+void destroyK2DirectImage();
+// ③ K2-D/K2-I 再拆分（默认开，ORION_K2_SPLIT=0 回退）：K1→K2D(直射)→K2I(间接) 三发
+bool k2DirectIndirectSplitEnabled();
+// 返回 true 表示 K1→K2 两发已录完并已重新绑定主管线；false 表示回退单发主管线
+bool traceK1K2(VkCommandBuffer cmd, uint32_t width, uint32_t height);
 
 
 inline constexpr const uint32_t SHARC_STATS_FRAMES = 300u;

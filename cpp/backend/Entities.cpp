@@ -164,8 +164,10 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_beginEntityFrame(
     }
     g_entityFrameVertices.clear();
     g_localPlayerFrameVertices.clear();
+    g_handFrameVertices.clear();
     g_entityFrameMotion.clear();
     g_localPlayerFrameMotion.clear();
+    g_handFrameMotion.clear();
     g_entityFrameOpen = true;
 }
 
@@ -205,13 +207,16 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_uploadEntityBatch(
         ? reinterpret_cast<const float*>(motionPointer)
         : nullptr;
 
-    const bool localPlayerProxy = source[0].pad1 > 0.5f;
-    std::vector<Vertex>& target = localPlayerProxy
-        ? g_localPlayerFrameVertices
-        : g_entityFrameVertices;
-    std::vector<float>& motionTarget = localPlayerProxy
-        ? g_localPlayerFrameMotion
-        : g_entityFrameMotion;
+    // pad1 编码批次归属（Java 侧 EntityRtCapture.emit 写入）：
+    //   0.0 = 普通实体 / -1.0 = 自发光 / +1.0 = 本地玩家代理 / +2.0 = 第一人称手部
+    const bool handBatch = source[0].pad1 > 1.5f;
+    const bool localPlayerProxy = !handBatch && source[0].pad1 > 0.5f;
+    std::vector<Vertex>& target = handBatch
+        ? g_handFrameVertices
+        : (localPlayerProxy ? g_localPlayerFrameVertices : g_entityFrameVertices);
+    std::vector<float>& motionTarget = handBatch
+        ? g_handFrameMotion
+        : (localPlayerProxy ? g_localPlayerFrameMotion : g_entityFrameMotion);
     const size_t oldSize = target.size();
     target.resize(
         oldSize + static_cast<size_t>(vertexCount)
@@ -261,10 +266,17 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_endEntityFrame(
 
     g_entityFrameOpen = false;
 
-    const uint64_t entityFrameHash =
-        hashVertexPayload(g_entityFrameVertices);
-    const uint64_t localPlayerFrameHash =
-        hashVertexPayload(g_localPlayerFrameVertices);
+    // #16 探针：帧间隔 24-93ms 而 recordFrameCommand 只 1-12ms，怀疑点在
+    // Java→JNI 每帧全量 FNV。此计时只在超过 3ms 时打 [PERF L10 STALL]，
+    // 不超 = 该嫌疑排除。
+    uint64_t entityFrameHash = 0u;
+    uint64_t localPlayerFrameHash = 0u;
+    uint64_t handFrameHash = 0u;
+    PERF_L10_TIME_STALL("entityFrameVertexHash", {
+        entityFrameHash = hashVertexPayload(g_entityFrameVertices);
+        localPlayerFrameHash = hashVertexPayload(g_localPlayerFrameVertices);
+        handFrameHash = hashVertexPayload(g_handFrameVertices);
+    });
 
     const auto currentEntity = g_chunkMeshes.find(ENTITY_RT_LAYER_KEY);
     const auto currentLocalPlayer = g_chunkMeshes.find(LOCAL_PLAYER_RT_LAYER_KEY);
@@ -279,6 +291,49 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_endEntityFrame(
             g_localPlayerCachedHash == localPlayerFrameHash &&
             currentLocalPlayer->second.size() ==
                 g_localPlayerFrameVertices.size());
+
+    // 2026-11-06：手部层改为与实体层同口径的指纹判等。
+    //
+    // 旧写法是 `!g_handFrameVertices.empty()`（原注释称"顶点是相机相对的、每帧都在
+    // 变"），但 uploadEntityBatch 在构造时已经把相机位置加回世界空间（见本文件的
+    // `vertex.x += g_dynamicCaptureCameraX`），所以"相机不动 + 手部动画静止"（站立、
+    // 看物品栏、AFK、暂停）时这一层的世界坐标逐位不变，指纹必然命中。
+    // 而 handChanged 会把 g_entityRebuildRequested 置真（见下方 requestRebuild 段），
+    // Frame.cpp 的帧首又让它**绕过** 10 帧静默窗直接 rebuildWorldGeometry(24) ⇒
+    // 手里有东西时整轮世界几何重建退化成每帧执行（全部段遍历 + 全量 sort +
+    // role 表重写 + TLAS 全量 BUILD）。判等成本：手部顶点只有几十~几百个，
+    // FNV 8 字节步进 < 20µs。
+    const auto currentHand = g_chunkMeshes.find(HAND_RT_LAYER_KEY);
+    const bool handChanged = currentHand == g_chunkMeshes.end()
+        ? !g_handFrameVertices.empty()
+        : !(g_handCachedHashValid &&
+            g_handCachedHash == handFrameHash &&
+            currentHand->second.size() == g_handFrameVertices.size());
+
+    // 观测（2026-11-06）：每 300 次 endEntityFrame 打一行手部层判等命中率。
+    // 走 RTLog（缓冲、不 flush、不 fprintf），稳态开销可忽略；只用来确认这次改动
+    // 是否真的把"每帧全量重建"变成了"静止时跳过"。
+    {
+        static uint32_t sHandProbeFrames = 0u;
+        static uint32_t sHandProbeChanged = 0u;
+
+        ++sHandProbeFrames;
+        if(handChanged)
+        {
+            ++sHandProbeChanged;
+        }
+
+        if(sHandProbeFrames >= 300u)
+        {
+            RTLog(
+                "[HAND LAYER] frames=" + std::to_string(sHandProbeFrames) +
+                " changed=" + std::to_string(sHandProbeChanged) +
+                " unchanged=" +
+                std::to_string(sHandProbeFrames - sHandProbeChanged));
+            sHandProbeFrames = 0u;
+            sHandProbeChanged = 0u;
+        }
+    }
 
     const bool entityMotionReset =
         publishDynamicLayerMotion(
@@ -298,6 +353,7 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_endEntityFrame(
     const bool changed =
         entityChanged ||
         localPlayerChanged ||
+        handChanged ||
         entityMotionReset ||
         localPlayerMotionReset;
 
@@ -350,8 +406,33 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_endEntityFrame(
         }
     }
 
+    if(handChanged)
+    {
+        if(g_handFrameVertices.empty())
+        {
+            // 手部层消失（切第三人称 / 打开物品栏）：旧写法会把上一次的几何永远
+            // 留在表里，现在与实体层同口径地删掉。
+            g_chunkMeshes.erase(HAND_RT_LAYER_KEY);
+            g_handCachedHashValid = false;
+        }
+        else
+        {
+            std::vector<Vertex>& cached = g_chunkMeshes[HAND_RT_LAYER_KEY];
+            cached.swap(g_handFrameVertices);
+
+            g_handCachedHash = handFrameHash;
+            g_handCachedHashValid = true;
+        }
+
+        g_handFrameVertices.clear();
+    }
+
     bool requestRebuild =
         requestDynamicRTASRebuild(entityChanged || entityMotionReset);
+    if(handChanged)
+    {
+        requestRebuild = true;
+    }
     if(localPlayerChanged || localPlayerMotionReset)
     {
         g_localPlayerASUpdatePending = true;
