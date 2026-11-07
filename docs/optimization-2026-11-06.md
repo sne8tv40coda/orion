@@ -180,7 +180,8 @@ over 的退出条件是 ratio < lowWater(0.62)，但驱逐只释放 BLAS（asBla
 | `ORION_NONRESIDENT_GUARD` | 3000 | 被驱逐段数上限，达到后停止驱逐；=0 关闭 |
 | `ORION_SECTION_MAX_COUNT` | 0 | 段数驱动驱逐上限；**默认关闭**（见第 7 节） |
 | `ORION_SECTION_KEEP_RADIUS` | 384 | 段数驱动时的保留半径（格） |
-| `ORION_CAPTURE_PER_WAKE` | 4 | 捕获线程每次唤醒处理的段数；=1 可降持锁（见 6.3，代价是 upWait 上升） |
+| `ORION_CAPTURE_PER_WAKE` | 4 | 捕获线程每次唤醒处理的段数；=1 可降持锁（见 6.3，代价是 upWait 上升）。**实测对 `pCap` 无效**，见 10.1 |
+| `ORION_VLI_GATHER_PAGES` | 384 | VLI gather 每帧最多搬运的源页数（每页 16 KB）。稳态建议 128（见 10.2） |
 | `ORION_VLI_BUDGET_MS` | 4 | VLI apply 每帧时间预算 |
 | `ORION_VLI_SECTIONS_PER_FRAME` | 2 | VLI apply 每帧段数上限 |
 | `ORION_SHARC_RESOLVE_PARITY` | 2 | SHaRC resolve 隔帧 |
@@ -195,3 +196,49 @@ over 的退出条件是 ratio < lowWater(0.62)，但驱逐只释放 BLAS（asBla
 3. **`ORION_CAPTURE_PER_WAKE=1` 的代价**：`upWaitMs` 从 9.0 抬到 11.6~14.2，区块上传变慢。若体感加载变慢，可折中取值 2。
 4. **仓库根目录散落 177 个未跟踪 shader 文件**（`.rahit.spv`、`bloom_*.comp`、`camera_ubo.glsl` 等），疑似脚本误拷贝，**未提交**，建议清理。
 5. **部署一致性**：`src/main/resources/shaders` 曾被 gradle 用旧版覆盖，导致 RT 管线缓存键漂移、每次冷编 8~17 分钟。改动 shader 后必须同步 `cpp/shaders` → `src/main/resources/shaders` → `build/resources/main/shaders` → `run/shaders` 四处。
+
+---
+
+## 10. 2026-11-07 续：VLI gather 预算、帧外时间归因
+
+### 10.1 两个新探针
+
+| 探针 | 位置 | 作用 |
+|---|---|---|
+| `[CHUNK LOCK] site=… held=…` | `Geometry.cpp`（`g_chunkMutex` 的两处主要持有点：`capture` / `uploadErase`） | 超 3 ms 才打。实测**只有 `capture` 触发**，`uploadErase` 一次都没有 |
+| `[FRAME GAP] n=120 avg=… max=…` | `Frame.cpp` 帧首 | 量相邻两次 `recordFrameCommand` 的间隔，与 `[PERF L10 CPU]` 的 `workAvgMs` 相减即得「帧外时间」 |
+
+**结论 1**：帧外时间占大头。典型一帧 `avgMs=17.77 / workAvgMs=6.03`，即约 2/3 不在后端代码里（Java 侧 + 驱动提交 + 呈现）。
+**结论 2**：`pCap`（等 `g_chunkMutex`）的唯一来源是捕获线程；`capPerWake=1` 已开仍无改善 ⇒ 单段成本是主因，不是"一次抓太多段"。
+
+### 10.2 VLI gather 每帧预算
+
+`gather` 把 `g_vliDirtySourcePages` 每页 4096×u32（16 KB）拷进上传 arena，页多时单次 3.3 ms / 16 ms 峰值，把 worker 饿到 `wait` 8.6 ms / 45.8 ms 峰值。
+
+改动（`Vli.cpp`）：
+- 每帧最多搬 `ORION_VLI_GATHER_PAGES`（默认 384）个源页，搬完的逐页 `erase`，剩余留到下一帧；
+- 其余 6 个脏集合（table / solve / emitter / emitterAlias / candidate / sourceDirectory）**无条件清空**。
+
+> 踩过一次坑：第一版写成「源页排空才清那 6 个集合」，想避免"表项已更新、源数据未同步"。但稳态下脏页持续多于预算 ⇒ 源页永不排空 ⇒ 那 6 项每帧全量重做，`gather` 从 n=2 恶化到 n=179。已改为无条件清空。
+
+实测（`ORION_VLI_GATHER_PAGES=128`）：
+
+| 指标 | 384 | 128 |
+|---|---|---|
+| `gather` 次数 / max | 179 / 14.24 ms | **70 / 7.30 ms** |
+| 几何慢帧 `pCap` max | 35.17 ms | **20.24 ms** |
+| `geom_slow` 条数 | 254 | **94** |
+| `cpuFps` 末段 | 34.4 | **77.8** |
+
+### 10.3 回退：`orderedSections` 签名缓存
+
+曾给「收集 + 排序 + role 写 + LOD 覆盖」加签名缓存（key + vertexAddress + blasAddress 的 FNV），命中则复用上一帧顺序。实测命中率只有 **31%**（`[GEOM ORD CACHE] hit=2453 miss=5347`）——签名含全部段，任意一段重建就整帧 miss，而 miss 时还要白付每段 3 次 FNV。**已回退**。
+
+### 10.4 当前剩余瓶颈
+
+| 项 | 数值 | 说明 |
+|---|---|---|
+| **`pCap`（等 `g_chunkMutex`）** | avg 8.50 / max 20.24 ms | 捕获线程单段持锁 ~4.8 ms × 排队；`capPerWake=1` 无效 |
+| `VLI wait`（等 `g_vliMutex`） | avg 7.55 / max 31.24 ms | `gather` 已限流，但 `pending` 与 `vliGrow` 仍在 |
+
+已排除 `CAPSLOW` 的"计算"假设：`Mcycles` 换算只有 ~1.45 ms，而墙钟 35.96 ms ⇒ 96% 在等内存（每顶点 300~600 ns，是 memcpy 的数百倍）。下一步该查的是**捕获是否还有漏掉的冷分配**（给 7 个 layer + 3 个 motion + 4 个 packed 各加一个 `capacity()==0` 计数），而不是继续切分 route/copy/omm。

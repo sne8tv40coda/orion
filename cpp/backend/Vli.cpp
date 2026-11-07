@@ -2412,11 +2412,39 @@ void recordVLIUpdates(VkCommandBuffer cmd)
             return;
         }
 
-        sourceUploads.reserve(g_vliDirtySourcePages.size());
-        for(uint32_t pageIndex : g_vliDirtySourcePages)
+        // 2026-11-07d：每帧最多搬 N 个源页（每页 16KB）。没搬完的留脏，下一帧继续。
+        static const size_t sGatherSourcePageBudget = []() -> size_t
         {
+            const char* raw = std::getenv("ORION_VLI_GATHER_PAGES");
+
+            if(raw == nullptr || raw[0] == '\0')
+            {
+                return 384u;
+            }
+
+            const long parsed = std::atol(raw);
+
+            if(parsed <= 0)
+            {
+                return 384u;
+            }
+
+            return static_cast<size_t>(parsed > 4096 ? 4096 : parsed);
+        }();
+
+        sourceUploads.reserve(
+            std::min(g_vliDirtySourcePages.size(), sGatherSourcePageBudget));
+
+        size_t gatheredSourcePages = 0u;
+
+        for(auto it = g_vliDirtySourcePages.begin();
+            it != g_vliDirtySourcePages.end() &&
+            gatheredSourcePages < sGatherSourcePageBudget;)
+        {
+            const uint32_t pageIndex = *it;
             const VLISectionCpuPage* const page =
                 findVLISectionPageByIndexLocked(pageIndex);
+
             if(page != nullptr)
             {
                 appendVliUpload(
@@ -2425,7 +2453,11 @@ void recordVLIUpdates(VkCommandBuffer cmd)
                     page->sourceWords
                 );
             }
+
+            it = g_vliDirtySourcePages.erase(it);
+            ++gatheredSourcePages;
         }
+
 
         emitterUploads.reserve(g_vptDirtyEmitterPages.size());
         for(uint32_t pageIndex : g_vptDirtyEmitterPages)
@@ -2506,7 +2538,9 @@ void recordVLIUpdates(VkCommandBuffer cmd)
             }
         }
 
-        g_vliDirtySourcePages.clear();
+        // 2026-11-07e：无条件清空（源页已在上面按预算逐页 erase）。
+        // 这些集合每帧都会重新收集；若像 07d 那样"排空才清"，稳态下它们永不
+        // 清空 ⇒ 每帧全量重做，gather 从 n=2 恶化到 n=179。
         g_vliDirtyTableSlots.clear();
         g_vliDirtySolveTableSlots.clear();
         g_vptDirtyEmitterPages.clear();

@@ -1145,6 +1145,41 @@ void returnSectionSplitToPool(SectionGeometrySplit&& split)
     g_sectionSplitPool.push_back(std::move(split));
 }
 
+// ---------------------------------------------------------------------------
+// 2026-11-07c：g_chunkMutex 持锁时长探针（诊断用）。
+//
+// 渲染线程的 `pCap`（等区块锁）实测 8.27ms avg / 24.33ms max，是当前最大单项。
+// 全项目该锁有 36 个使用点，先覆盖最可能的两处，超 3ms 才打。
+// ---------------------------------------------------------------------------
+namespace
+{
+struct ChunkMutexHoldProbe
+{
+    const char* site;
+    std::chrono::steady_clock::time_point begin;
+
+    explicit ChunkMutexHoldProbe(const char* name)
+        : site(name), begin(std::chrono::steady_clock::now())
+    {
+    }
+
+    ~ChunkMutexHoldProbe()
+    {
+        const double heldMs = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - begin).count();
+
+        if(heldMs < 3.0)
+        {
+            return;
+        }
+
+        RTLog(
+            std::string("[CHUNK LOCK] site=") + site +
+            " held=" + std::to_string(heldMs));
+    }
+};
+}
+
 // 2026-10-31：脏 Section 的全局取序开关。
 //   nearest（默认）：在全量脏集合里挑最近的候选；
 //   hash：回退到旧行为（只对迭代器顺序的前 16 个排序），用于 A/B。
@@ -1203,6 +1238,8 @@ void geometryCaptureWorkerLoop()
         const auto captureWaitStart = std::chrono::steady_clock::now();
         {
             std::lock_guard<std::timed_mutex> chunkLock(g_chunkMutex);
+            // 2026-11-07c：必须在 lock_guard 之后声明，析构顺序保证它先于解锁。
+            const ChunkMutexHoldProbe chunkHoldProbe("capture");
             const auto captureHoldStart = std::chrono::steady_clock::now();
             std::lock_guard<std::mutex> capturedLock(g_capturedSectionsMutex);
 
@@ -1918,6 +1955,7 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_uploadChunk(
 
     if (vertexCount == 0 || vertexPointer == 0 || vertexStride != 28) {
         std::lock_guard<std::timed_mutex> lock(g_chunkMutex);
+        const ChunkMutexHoldProbe chunkHoldProbe("uploadErase");
 
         bool removedCachedLayer =
             g_chunkMeshes.erase(chunkKey) > 0u;

@@ -583,11 +583,16 @@ double vramGovernorHighWater()
             // 0.62 ⇒ over 永久为真、无限驱逐、视野内区块被清空（实测 nonResident
             // 4637 / blas 只剩 2038）。0.80 仍低于注释记录的 DLSS
             // eWarnOutOfVRAM 线（0.849），保留余量。
-            return 0.82;
+            // 2026-11-06t?0.82 -> 0.84?
+            // ?????? 288 ?????? ~7300??????? 0.803~0.822?
+            // ???? 0.82 ? over ???? keepCap ?? 0????????
+            // ??? 56 ?????? 110ms?poolMiss 0?56 / allocMs 0?109.9??
+            // 0.84 ???????? DLSS eWarnOutOfVRAM ? 0.849?
+            return 0.84;
         }
 
         const double parsed = std::atof(raw);
-        return (parsed > 0.0 && parsed <= 1.0) ? parsed : 0.82;
+        return (parsed > 0.0 && parsed <= 1.0) ? parsed : 0.84;
     }();
 
     return cached;

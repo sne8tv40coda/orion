@@ -893,6 +893,48 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_recordFrameCommand(
     const LeakProbeScope leakProbeScope;
 
     RTXMarkPhase("frame:begin");
+
+    // 2026-11-07a：帧间隔探针。
+    // [PERF L10 CPU] 的 avgMs 是帧间隔，workAvgMs 才是我方工作量；上一局二者
+    // 是 17.77 vs 6.03 ⇒ 三分之二不在我们的代码里。这里直接量"两次进入
+    // recordFrameCommand 的间隔"，与 workAvgMs 相减即可定位剩余部分属于
+    // Java 侧逻辑、驱动提交还是呈现等待。
+    {
+        static std::chrono::steady_clock::time_point sGapPrev{};
+        static double sGapSum = 0.0;
+        static double sGapMax = 0.0;
+        static uint32_t sGapCount = 0u;
+
+        const auto gapNow = std::chrono::steady_clock::now();
+
+        if(sGapPrev.time_since_epoch().count() != 0)
+        {
+            const double gapMs = std::chrono::duration<double, std::milli>(
+                gapNow - sGapPrev).count();
+
+            sGapSum += gapMs;
+
+            if(gapMs > sGapMax)
+            {
+                sGapMax = gapMs;
+            }
+
+            if(++sGapCount >= 120u)
+            {
+                RTLog(
+                    "[FRAME GAP] n=" + std::to_string(sGapCount) +
+                    " avg=" + std::to_string(sGapSum / static_cast<double>(sGapCount)) +
+                    " max=" + std::to_string(sGapMax));
+
+                sGapSum = 0.0;
+                sGapMax = 0.0;
+                sGapCount = 0u;
+            }
+        }
+
+        sGapPrev = gapNow;
+    }
+
     RTXHeartbeatTick();
 
     applyRenderThreadPriorityOnce();

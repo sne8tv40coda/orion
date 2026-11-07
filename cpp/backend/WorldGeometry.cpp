@@ -1534,7 +1534,6 @@ bool rebuildWorldGeometry(
         g_sectionBLAS.size()
     );
 
-
     for(auto& entry : g_sectionBLAS)
     {
         if(
@@ -1555,42 +1554,42 @@ bool rebuildWorldGeometry(
     }
 
 
-    std::sort(
-        orderedSections.begin(),
-        orderedSections.end(),
-        [](
-            const RTSectionAS* a,
-            const RTSectionAS* b
-        )
-        {
-            return
-                a->sectionKey <
-                b->sectionKey;
-        }
-    );
-
-
-    for(auto it = orderedSections.begin(); it != orderedSections.end(); )
-    {
-        RTSectionAS* section = *it;
-
-        if(!ensureSectionVertexAddressSlot(*section))
-        {
-            it = orderedSections.erase(it);
-            continue;
-        }
-
-        writeSectionRoleSlot(
-            *section
+        std::sort(
+            orderedSections.begin(),
+            orderedSections.end(),
+            [](
+                const RTSectionAS* a,
+                const RTSectionAS* b
+            )
+            {
+                return
+                    a->sectionKey <
+                    b->sectionKey;
+            }
         );
 
-        ++it;
-    }
+
+        for(auto it = orderedSections.begin(); it != orderedSections.end(); )
+        {
+            RTSectionAS* section = *it;
+
+            if(!ensureSectionVertexAddressSlot(*section))
+            {
+                it = orderedSections.erase(it);
+                continue;
+            }
+
+            writeSectionRoleSlot(
+                *section
+            );
+
+            ++it;
+        }
 
 
-    rebuildLodCoverage(
-        orderedSections
-    );
+        rebuildLodCoverage(
+            orderedSections
+        );
 
 
     constexpr size_t MAX_TLAS_CUSTOM_INDEX_COUNT =
