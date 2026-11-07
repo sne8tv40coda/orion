@@ -242,3 +242,32 @@ over 的退出条件是 ratio < lowWater(0.62)，但驱逐只释放 BLAS（asBla
 | `VLI wait`（等 `g_vliMutex`） | avg 7.55 / max 31.24 ms | `gather` 已限流，但 `pending` 与 `vliGrow` 仍在 |
 
 已排除 `CAPSLOW` 的"计算"假设：`Mcycles` 换算只有 ~1.45 ms，而墙钟 35.96 ms ⇒ 96% 在等内存（每顶点 300~600 ns，是 memcpy 的数百倍）。下一步该查的是**捕获是否还有漏掉的冷分配**（给 7 个 layer + 3 个 motion + 4 个 packed 各加一个 `capacity()==0` 计数），而不是继续切分 route/copy/omm。
+
+### 10.5 决定性发现：capture 的 split 池**基本没命中**
+
+在唯一汇聚点 `geometryAppendSectionVertices` 的扩容分支加了累计计数（`destination.capacity() < requiredSize` 即"这次必须新分配"），输出并入 `[CHUNK LOCK]`：
+
+```text
+12:34:07  [CHUNK LOCK] site=capture held=8.31  grow=241    growMB=36.2
+12:37:49  [CHUNK LOCK] site=capture held=3.26  grow=22144  growMB=4385.0
+```
+
+**3.7 分钟：22144 次扩容、4385 MB 新分配（平均每次 ~198 KB）。**
+
+如果池在工作，这个数字应当在开局几百次后**归零**（容量足够后全是复用）。实际却线性增长 ⇒ 每次捕获都在真正分配新内存，而不是复用池里的 buffer。这正好解释了每顶点 300~600 ns 的开销（memcpy 应为 ~3 ns）——时间花在**分配与缺页**上。
+
+**没命中的机制**（推断，待下一轮验证）：
+
+```text
+捕获线程：take(池空) → 冷分配 → 填充 → 入队
+渲染线程：取队列 → 使用 → rebuildWorldGeometry **退出时**才 return
+```
+
+归还只发生在函数退出那一刻，而捕获是独立持续运行的；只要捕获快于「渲染消费 + 函数退出归还」这个周期，池就**一直是空的**。再加上池上限 24、一次 wake 可吃掉几十个 split，命中率自然接近 0。
+
+**修复方向（S 级，两处都在 `WorldGeometry.cpp`，无需动 `geometryCaptureSectionLocked`）**：
+
+1. 把归还从「函数退出时统一还」改成「build 循环里每处理完一个 `update` 就还池」；
+2. 池上限 `SECTION_SPLIT_POOL_LIMIT`（当前 24）提到 128，给两个线程之间留够缓冲。
+
+预期：`grow` 在开局后停止增长、`capHold` 从 ~4.8 ms 降到 1 ms 量级，`pCap`（当前 8.50 / 20.24 ms）随之塌到 2~3 ms。

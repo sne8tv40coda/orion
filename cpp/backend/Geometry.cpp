@@ -815,6 +815,14 @@ bool captureTimeGateEnabled()
 
     return enabled;
 }
+namespace
+{
+// 2026-11-07f：捕获路径的"冷分配"计数（诊断用）。
+// 只在 destination 容量不足、必须扩容时累加。
+uint64_t g_captureGrowCount = 0ull;
+uint64_t g_captureGrowBytes = 0ull;
+}
+
 void geometryAppendSectionVertices(
     std::vector<Vertex>& destination,
     const std::vector<Vertex>& source
@@ -831,7 +839,14 @@ void geometryAppendSectionVertices(
             destination.capacity() > std::numeric_limits<size_t>::max() / 2u
                 ? requiredSize
                 : destination.capacity() * 2u;
-        destination.reserve(std::max(requiredSize, geometricCapacity));
+        const size_t targetCapacity = std::max(requiredSize, geometricCapacity);
+
+        // 2026-11-07f：这次填充必须新分配。
+        ++g_captureGrowCount;
+        g_captureGrowBytes +=
+            (targetCapacity - destination.capacity()) * sizeof(Vertex);
+
+        destination.reserve(targetCapacity);
     }
     destination.insert(destination.end(), source.begin(), source.end());
 }
@@ -1175,7 +1190,10 @@ struct ChunkMutexHoldProbe
 
         RTLog(
             std::string("[CHUNK LOCK] site=") + site +
-            " held=" + std::to_string(heldMs));
+            " held=" + std::to_string(heldMs) +
+            " grow=" + std::to_string(g_captureGrowCount) +
+            " growMB=" + std::to_string(
+                static_cast<double>(g_captureGrowBytes) / 1048576.0));
     }
 };
 }
