@@ -132,6 +132,8 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
     private float pendingLocalLightMaxDistance;
     private float pendingLocalLightIntensity;
     private float pendingDynamicLightIntensity;
+    private boolean pendingBuiltinLodEnabled;
+    private int pendingBuiltinLodDistanceChunks;
     private float pendingSunDiskLuminance;
     private float pendingSunHaloStrength;
     private float pendingSunAngularDiameterDegrees;
@@ -517,6 +519,10 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
 
         this.pendingDynamicLightIntensity =
                 RTXSettingsConfig.getDynamicLightIntensity();
+        this.pendingBuiltinLodEnabled =
+                RTXSettingsConfig.isBuiltinLodEnabled();
+        this.pendingBuiltinLodDistanceChunks =
+                RTXSettingsConfig.getBuiltinLodDistanceChunks();
 
         RTXSettingsConfig.SunVisualSettings sunVisuals =
                 RTXSettingsConfig.getSunVisualSettings();
@@ -1110,6 +1116,18 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
                                 (button, value) -> this.pendingRtSpp = value
                         );
         this.addOptionRow(rtSppButton);
+        this.addOptionRow(CycleButton.builder(
+                        enabled -> Component.literal(enabled ? "开" : "关"),
+                        this.pendingBuiltinLodEnabled)
+                .withValues(false, true)
+                .create(Component.literal("内置远景 LOD"),
+                        (button, value) -> this.pendingBuiltinLodEnabled = value));
+        this.addOptionRow(CycleButton.builder(
+                        chunks -> Component.literal(chunks + " 区块"),
+                        this.pendingBuiltinLodDistanceChunks)
+                .withValues(32, 48, 64, 96, 128, 160, 192, 256)
+                .create(Component.literal("远景 LOD 视距"),
+                        (button, value) -> this.pendingBuiltinLodDistanceChunks = value));
         this.flushOptionRow();
 
         // =====================================================
@@ -3985,6 +4003,9 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
                 this.pendingAutoExposureCompensation
         );
 
+        RTXSettingsConfig.setBuiltinLodEnabled(this.pendingBuiltinLodEnabled);
+        RTXSettingsConfig.setBuiltinLodDistanceChunks(this.pendingBuiltinLodDistanceChunks);
+        com.example.client.lod.OrionLodManager.onSettingsChanged();
 
         System.out.println(
                 allApplied

@@ -61,6 +61,7 @@ set(SOURCES
         backend/Lights.cpp
         backend/Lod.cpp
         backend/Memory.cpp
+        backend/NativeLod.cpp
         backend/Nrd.cpp
         backend/Particles.cpp
         backend/Perf.cpp

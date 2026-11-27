@@ -9024,9 +9024,150 @@ int dhFarModeRequested = int(cam.dhFarFieldLight.x + 0.5);
 // 图替代 DH 贴图源，不再依赖 dhFarFieldParams.x（DH 纹理发布态）。其余 mode
 // 的门不变（dhFarModeRequested 由 Java 推送，rasterLod 关闭时永远到不了 14）。
 #ifndef ORION_K2_TRANSPORT
+// ============================================================================
+// Orion 内置自研远景 LOD（mode=16，零外部 Mod 依赖）
+// 仅在主 RT 射线 miss (dhFarFieldOurs > 0.5) 且光栅线性距离 > 0.5 时生效；
+// 近场真光追几何永远 100% 优先。使用与近场同源的太阳/天光/云影/水体/大气透视，
+// 并同步更新 depthImage / dlssMotionImage / DLSS-RR guides 以实现雾与超分融合。
+// ============================================================================
+if (dhFarModeRequested == 16 && dhFarFieldOurs > 0.5) {
+    float lodDist = orionLodLinearDistAt(pixelCoord);
+    if (dhFarFinite(lodDist) && lodDist > 0.5) {
+        vec3 lodCamPos;
+        vec3 lodRayDir;
+        dhFarPrimaryRay(pixelCoord, lodCamPos, lodRayDir);
+        vec3 lodPos = lodCamPos + lodRayDir * lodDist;
+
+        vec4 lodColorAo = orionLodColorAoAt(pixelCoord);
+        vec4 lodNormalMat = orionLodNormalMatAt(pixelCoord);
+
+        vec3 lodAlbedo = pow(max(lodColorAo.rgb, vec3(0.0)), vec3(2.2));
+        float lodSkyAo = clamp(lodColorAo.a, 0.12, 1.0);
+        vec3 lodN = orionDecodeOctNormal(lodNormalMat.rg);
+        int lodMatClass = int(floor(lodNormalMat.b * 4.0 + 0.5));
+        float lodAux = clamp(lodNormalMat.a, 0.0, 1.0);
+
+        vec3 lodSunDir = normalize(getTimeDrivenSkyLightDirection());
+        float lodCloudTrans = c3CloudSunTransmittance(lodPos + lodSunDir * 0.001, lodSunDir);
+        vec3 lodSunRadiance =
+            getTimeDrivenSkyLightColor() *
+            3.2 *
+            getTimeDrivenSkyLightRadianceScale() *
+            lodCloudTrans;
+
+        vec3 lodSkyZenith = samplePhysicalClearSkyForAerialPerspective(vec3(0.0, 1.0, 0.0));
+        vec3 lodSkyHemiDir = normalize(mix(lodN, vec3(0.0, 1.0, 0.0), 0.45));
+        lodSkyHemiDir.y = max(lodSkyHemiDir.y, 0.03);
+        vec3 lodSkySample = samplePhysicalClearSkyForAerialPerspective(normalize(lodSkyHemiDir));
+        vec3 lodSkyGi = max(mix(lodSkyZenith, lodSkySample, 0.55), lodSkyZenith * 0.50);
+
+        vec3 lodAmbient = lodAlbedo * getSurfaceAmbientRadiance() * mix(0.75, 1.0, lodSkyAo);
+        vec3 lodViewDir = normalize(-lodRayDir);
+        vec3 lodLit = vec3(0.0);
+        vec3 lodGuideNormal = lodN;
+        float lodGuideRoughness = 0.95;
+        vec3 lodGuideSpec = vec3(0.0);
+        vec3 lodGuideDiffuse = lodAlbedo;
+
+        if (lodMatClass == 4) {
+            // 自发光方柱（岩浆/荧石等）
+            lodLit = lodAlbedo * 4.2 + lodAmbient;
+            lodGuideRoughness = 0.85;
+        } else if (lodMatClass == 1) {
+            // 远景水体：微浪法线 + Fresnel 天空反射 + GGX 太阳高光 + 水深 Beer-Lambert 吸收
+            vec3 waterN = orionLodWaterWaveNormal(lodPos.xz, lodDist, float(cam.frameCount) * 0.016);
+            lodGuideNormal = waterN;
+            lodGuideRoughness = 0.08;
+            lodGuideSpec = vec3(0.04);
+
+            float NdotV = max(dot(waterN, lodViewDir), 0.02);
+            float fresnel = clamp(0.02 + 0.98 * pow(1.0 - NdotV, 5.0), 0.02, 0.95);
+            vec3 reflDir = reflect(lodRayDir, waterN);
+            reflDir.y = max(reflDir.y, 0.02);
+            vec3 reflSky = samplePhysicalClearSkyForAerialPerspective(normalize(reflDir))
+                         * mix(0.55, 1.0, lodCloudTrans);
+
+            BsdfTerms waterBsdf = evalBSDFTerms(
+                waterN, lodViewDir, lodSunDir, vec3(0.02), 0.0, 0.08, NdotV, false
+            );
+            float waterNdotL = max(dot(waterN, lodSunDir), 0.0);
+            vec3 waterSpec = waterBsdf.specular * waterNdotL * lodSunRadiance;
+
+            vec3 deepTint = lodAlbedo * vec3(0.18, 0.36, 0.52);
+            vec3 waterBodyColor = mix(deepTint, lodAlbedo * 0.72, exp(-lodAux * 4.5));
+            vec3 waterScatter = waterBodyColor * (
+                lodSunRadiance * waterNdotL * 0.32 +
+                lodSkyZenith * (0.50 * 1.35) +
+                getSurfaceAmbientRadiance()
+            );
+            lodGuideDiffuse = waterBodyColor;
+            lodLit = mix(waterScatter, reflSky, fresnel * 0.90) + waterSpec;
+        } else {
+            // 地形 / 植被 / 冰雪
+            float roughness = (lodMatClass == 3) ? 0.35 : ((lodMatClass == 2) ? 0.92 : 0.96);
+            lodGuideRoughness = roughness;
+            vec3 f0 = (lodMatClass == 3) ? vec3(0.05) : vec3(0.04);
+            lodGuideSpec = (lodMatClass == 3) ? vec3(0.04) : vec3(0.0);
+
+            float rawNdotL = dot(lodN, lodSunDir);
+            float microShadow = smoothstep(-0.18, 0.25, rawNdotL) * mix(0.65, 1.0, lodSkyAo);
+            float viewNdotL = max(dot(lodN, lodViewDir), 0.02);
+
+            BsdfTerms lodBsdf = evalBSDFTerms(
+                lodN, lodViewDir, lodSunDir, f0, 0.0, roughness, viewNdotL, false
+            );
+            vec3 lodDiffuseBrdf = lodBsdf.kD * lodAlbedo * evaluateBurleyDiffuseAngular(
+                lodN, lodViewDir, lodSunDir, roughness
+            );
+            vec3 lodDirect = lodSunRadiance * microShadow * (
+                lodDiffuseBrdf + lodBsdf.specular * max(rawNdotL, 0.0)
+            );
+            if (lodMatClass == 2) {
+                lodDirect += lodSunRadiance * (0.16 * lodSkyAo) * lodAlbedo * max(-rawNdotL, 0.0);
+            }
+            float hemiLift = mix(0.72, 1.0, clamp(lodN.y * 0.5 + 0.5, 0.0, 1.0));
+            vec3 lodIndirect = lodAlbedo * lodSkyGi * (0.6 * 1.8) * mix(0.62, 1.0, lodSkyAo) * hemiLift;
+            lodLit = lodDirect + lodIndirect + lodAmbient;
+        }
+
+        lodLit = applyClearSkyAerialPerspective(lodLit, lodCamPos, lodRayDir, lodDist);
+        currentColor = lodLit;
+        dhFarFieldOursDistance = lodDist;
+
+#if !GI_HALFRES && !SHARC_UPDATE
+        vec4 lodCurClip = cam.viewProj * vec4(lodPos, 1.0);
+        if (abs(lodCurClip.w) > 1.0e-4) {
+            float lodRawDepth = clamp(lodCurClip.z / lodCurClip.w, 1.0e-5, 1.0);
+            imageStore(depthImage, pixelCoord, vec4(lodRawDepth, 0.0, 0.0, 0.0));
+        }
+
+        if (cam.perfAblationStage.z != 0u) {
+            vec4 lodPrevClip = cam.prevViewProj * vec4(lodPos, 1.0);
+            if (abs(lodCurClip.w) > 1.0e-4 && abs(lodPrevClip.w) > 1.0e-4) {
+                vec2 lodPrevNdc = lodPrevClip.xy / lodPrevClip.w;
+                vec2 lodCurNdc = lodCurClip.xy / lodCurClip.w;
+                vec2 lodMotion = (lodPrevNdc - lodCurNdc) * vec2(0.5, -0.5);
+                imageStore(dlssMotionImage, pixelCoord, vec4(lodMotion, 0.0, 1.0));
+                rtDebugPrimaryMotion = lodMotion;
+            }
+        }
+
+        if (!perfL10DisableG2bLocalGuide()) {
+#if GI_RR_DELTA_FLAG
+            imageStore(rrDiffuseAlbedoImage, pixelCoord, vec4(lodGuideDiffuse, rrDeltaCrossedFlag));
+#else
+            imageStore(rrDiffuseAlbedoImage, pixelCoord, vec4(lodGuideDiffuse, 1.0));
+#endif
+            imageStore(rrSpecularAlbedoImage, pixelCoord, vec4(lodGuideSpec, 1.0));
+            imageStore(rrNormalRoughnessImage, pixelCoord, vec4(lodGuideNormal, lodGuideRoughness));
+            imageStore(rrSpecularHitDistanceImage, pixelCoord, vec4(lodDist, 0.0, 0.0, 0.0));
+        }
+#endif
+    }
+}
 // K2 编出 DH 远场整块：它由 dhFarFieldOurs > 0.5 守卫，而 K2 只处理 opaque
 // 像素（dhFarFieldOurs 恒 0），K1 已为 miss/水/玻璃像素做完 DH 合成。
-if ((cam.dhFarFieldParams.x > 0.5 || dhFarModeRequested == 14
+else if ((cam.dhFarFieldParams.x > 0.5 || dhFarModeRequested == 14
         || dhFarModeRequested == 15)
     && dhFarModeRequested >= 0
     && dhFarFieldOurs > 0.5) {

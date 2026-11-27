@@ -619,6 +619,7 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_clearWorldGeometry(J
         g_voxyLodSpatialOwners.clear();
 
         clearDhLodSpatialTablesLocked();
+        clearOrionLodState();
 
         g_dirtySectionKeys.clear();
 

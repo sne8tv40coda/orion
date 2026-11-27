@@ -202,7 +202,7 @@ PERF_L10_TIME_STALL("tlasQueueIdle", check(
 << "[RT INIT] TLAS BUILD COMPLETE\n";
 }
 VkDescriptorSetLayout createRTDescriptorSetLayout(){
-    VkDescriptorSetLayoutBinding b[101]{};
+    VkDescriptorSetLayoutBinding b[102]{};
 
     b[0].binding=0; b[0].descriptorType=VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR; b[0].descriptorCount=1; b[0].stageFlags=VK_SHADER_STAGE_RAYGEN_BIT_KHR|VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
     b[1].binding=1; b[1].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; b[1].descriptorCount=1; b[1].stageFlags=VK_SHADER_STAGE_RAYGEN_BIT_KHR|VK_SHADER_STAGE_COMPUTE_BIT;
@@ -847,6 +847,12 @@ VkDescriptorSetLayout createRTDescriptorSetLayout(){
     b[100].descriptorCount = 1;
     b[100].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
 
+    // 内置自研远景 LOD 法线/材质 G-Buffer（binding 101）。
+    b[101].binding = 101;
+    b[101].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    b[101].descriptorCount = 1;
+    b[101].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+
     // D1：材质 callable 也读这套描述符（landing 槽位回传）。stageFlags 不参与
     // 管线布局兼容性判定，全量放行不影响既有管线（spv 无 callable 阶段照常工作）。
     for(auto& entry : b)
@@ -856,7 +862,7 @@ VkDescriptorSetLayout createRTDescriptorSetLayout(){
 
     VkDescriptorSetLayoutCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     static_assert(
-        sizeof(b) / sizeof(b[0]) == 101u,
+        sizeof(b) / sizeof(b[0]) == 102u,
         "RT descriptor set layout: update this assert together with b[]"
     );
     ci.bindingCount = static_cast<uint32_t>(sizeof(b) / sizeof(b[0]));

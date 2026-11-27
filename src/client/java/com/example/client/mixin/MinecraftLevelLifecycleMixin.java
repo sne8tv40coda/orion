@@ -2,6 +2,7 @@ package com.example.client.mixin;
 
 import com.example.client.compat.FarFieldGate;
 import com.example.client.compat.dh.DhBridge;
+import com.example.client.lod.OrionLodManager;
 import com.example.client.access.SectionUploadDedup;
 import com.example.vulkan.NativeVulkan;
 import net.minecraft.client.Minecraft;
@@ -54,6 +55,7 @@ public class MinecraftLevelLifecycleMixin {
         SectionUploadDedup.invalidateAll();
 
         DhBridge.reset();
+        OrionLodManager.reset();
 
         FarFieldGate.onLodHardReset();
     }

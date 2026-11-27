@@ -812,8 +812,8 @@ void createRayTracingDescriptorPoolAndSet()
         // 2026-11-19 rasterLod：+2 = DH LOD 光栅 color/depth binding 96/97
         //（23 → 25；描述符按需写，但池配额按布局的静态绑定数扣减，不补
         // 会在 g_rayTracingDescriptorSet 分配时直接失败）。
-        // 2026-11-21 P0-1：+1 = 主命中世界位移旁路槽 binding 98（25 → 26）。
-        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 28u * RT_DESCRIPTOR_RING_SIZE },
+        // 2026-11-21 P0-1：+1 = 主命中世界位移旁路槽 binding 98（25 → 26），+1 = binding 101 Orion LOD normalMat。
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 32u * RT_DESCRIPTOR_RING_SIZE },
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1u * RT_DESCRIPTOR_RING_SIZE },
         { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 512u * RT_DESCRIPTOR_RING_SIZE },
         // 2026-11-05 B：+1 = K1/K2 landing SSBO（binding 88，21 → 22）。

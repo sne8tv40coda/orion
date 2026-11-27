@@ -156,6 +156,10 @@ public final class RTXSettingsConfig {
     private static float dynamicLightIntensity =
             1.0f;
 
+    private static boolean builtinLodEnabled = true;
+
+    private static int builtinLodDistanceChunks = 96;
+
     private static float postBloomStrength =
             0.0f;
 
@@ -2467,6 +2471,32 @@ public final class RTXSettingsConfig {
         }
     }
 
+    public static synchronized boolean isBuiltinLodEnabled() {
+        return builtinLodEnabled;
+    }
+
+    public static synchronized void setBuiltinLodEnabled(boolean enabled) {
+        if (builtinLodEnabled != enabled) {
+            builtinLodEnabled = enabled;
+            markDirty();
+        }
+    }
+
+    public static synchronized int getBuiltinLodDistanceChunks() {
+        return builtinLodDistanceChunks;
+    }
+
+    public static synchronized void setBuiltinLodDistanceChunks(int chunks) {
+        int clamped = Math.max(32, Math.min(256, (chunks / 16) * 16));
+        if (clamped < 32) {
+            clamped = 32;
+        }
+        if (builtinLodDistanceChunks != clamped) {
+            builtinLodDistanceChunks = clamped;
+            markDirty();
+        }
+    }
+
     public static synchronized float getPostBloomStrength() {
         return postBloomStrength;
     }
@@ -3217,6 +3247,10 @@ public final class RTXSettingsConfig {
             dynamicLightIntensity =
                     1.0f;
 
+            builtinLodEnabled = true;
+
+            builtinLodDistanceChunks = 96;
+
             cloudSettings = DEFAULT_CLOUD_SETTINGS;
 
             hdrEnabled =
@@ -3294,6 +3328,10 @@ public final class RTXSettingsConfig {
 
                 dynamicLightIntensity =
                         1.0f;
+
+                builtinLodEnabled = true;
+
+                builtinLodDistanceChunks = 96;
 
                 sunVisualSettings = DEFAULT_SUN_VISUAL_SETTINGS;
 
@@ -3548,6 +3586,9 @@ public final class RTXSettingsConfig {
                         1.0f;
 
             }
+
+            builtinLodEnabled = data.builtinLodEnabled == null || data.builtinLodEnabled;
+            builtinLodDistanceChunks = validSetting(data.builtinLodDistanceChunks, 96, 32, 256);
 
             if(data.postBloomStrength != null &&
                     Float.isFinite(data.postBloomStrength) &&
@@ -4153,6 +4194,10 @@ public final class RTXSettingsConfig {
             dynamicLightIntensity =
                     1.0f;
 
+            builtinLodEnabled = true;
+
+            builtinLodDistanceChunks = 96;
+
             cloudSettings = DEFAULT_CLOUD_SETTINGS;
 
             hdrEnabled =
@@ -4329,6 +4374,9 @@ public final class RTXSettingsConfig {
 
             data.dynamicLightIntensity =
                     dynamicLightIntensity;
+
+            data.builtinLodEnabled = builtinLodEnabled;
+            data.builtinLodDistanceChunks = builtinLodDistanceChunks;
 
             data.postBloomStrength =
                     postBloomStrength;
@@ -4743,6 +4791,9 @@ public final class RTXSettingsConfig {
 
         Float dynamicLightIntensity =
                 null;
+
+        Boolean builtinLodEnabled = null;
+        Integer builtinLodDistanceChunks = null;
 
         Float postBloomStrength =
                 null;

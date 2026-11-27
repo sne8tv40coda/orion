@@ -7,6 +7,7 @@ import com.example.client.ParticleRtCapture;import com.example.client.compat.Far
 import com.example.client.compat.VoxyLodManager;
 import com.example.client.compat.dh.DhBridge;
 import com.example.client.compat.dh.DhLodMeshSink;
+import com.example.client.lod.OrionLodManager;
 import com.mojang.blaze3d.vertex.PoseStack;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.SubmitNodeCollector;
@@ -197,6 +198,7 @@ public class LevelRendererMixin {
         VoxyLodManager.tick();
         long rtx$t0 = System.nanoTime();
         DhBridge.tick();
+        OrionLodManager.tick(cameraState != null ? cameraState.pos : null);
         long rtx$t1 = System.nanoTime();
         VoxyLodManager.perfAdd(VoxyLodManager.PERF_DH, rtx$t1 - rtx$t0);
         FarFieldGate.updateNearby(cameraState, viewArea);

@@ -372,7 +372,9 @@ def rtxRuntimeShaderFiles = [
 		"rt_direct_atrous.comp.spv",
 		"water_fft.comp.spv",
 		"water_caustic_resolve.comp.spv",
-		"rt_cloud_shadow.comp.spv"
+		"rt_cloud_shadow.comp.spv",
+		"orion_lod.vert.spv",
+		"orion_lod.frag.spv"
 ]
 
 // Check the actual JAR resource source, not only the distribution ZIP whitelist.

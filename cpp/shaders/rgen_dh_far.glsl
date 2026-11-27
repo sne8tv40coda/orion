@@ -15,6 +15,7 @@
 // =====================================================================
 layout(set = 0, binding = 96, rgba8) readonly uniform image2D dhLodRasterColorImage;
 layout(set = 0, binding = 97, r32f) readonly uniform image2D dhLodRasterDepthImage;
+layout(set = 0, binding = 101, rgba8) readonly uniform image2D orionLodNormalMatImage;
 
 // rasterLod 模式判据（mode=14 只会在 Java 侧 rasterLod=true 时被推送，
 // 所以它本身就是旗标的运行时载体，无需额外 UBO 位）。
@@ -27,6 +28,73 @@ bool dhLodRasterModeActive()
     // ⇒ mode∈{14,15} ⇒ 描述符已写，不存在未绑定读取。
     const int m = int(cam.dhFarFieldLight.x + 0.5);
     return m == 14 || m == 15;
+}
+
+// =====================================================================
+// Orion 内置自研远景 LOD（mode=16，不依赖外部 DH/Voxy）
+// 硬件光栅 RenderPass 已直接以 Vulkan 屏上坐标（像素 y=0 在顶）写入
+// binding 96 / 97 / 101，因此这里直接按 pixelCoord 做 1:1 imageLoad，无需翻转 Y。
+// =====================================================================
+bool orionBuiltinLodModeActive()
+{
+    return int(cam.dhFarFieldLight.x + 0.5) == 16;
+}
+
+ivec2 orionLodClampCoord(ivec2 pixelCoord, ivec2 imgSize)
+{
+    ivec2 outSize = max(imageSize(image), ivec2(1));
+    if (imgSize == outSize) {
+        return clamp(pixelCoord, ivec2(0), max(imgSize - ivec2(1), ivec2(0)));
+    }
+    vec2 uv = (vec2(pixelCoord) + 0.5) / vec2(outSize);
+    return clamp(ivec2(uv * vec2(max(imgSize, ivec2(1)))),
+                 ivec2(0), max(imgSize - ivec2(1), ivec2(0)));
+}
+
+float orionLodLinearDistAt(ivec2 pixelCoord)
+{
+    ivec2 sz = imageSize(dhLodRasterDepthImage);
+    if (sz.x <= 1 || sz.y <= 1) return 0.0;
+    return imageLoad(dhLodRasterDepthImage, orionLodClampCoord(pixelCoord, sz)).r;
+}
+
+vec4 orionLodColorAoAt(ivec2 pixelCoord)
+{
+    ivec2 sz = imageSize(dhLodRasterColorImage);
+    if (sz.x <= 1 || sz.y <= 1) return vec4(0.0, 0.0, 0.0, 1.0);
+    return imageLoad(dhLodRasterColorImage, orionLodClampCoord(pixelCoord, sz));
+}
+
+vec4 orionLodNormalMatAt(ivec2 pixelCoord)
+{
+    ivec2 sz = imageSize(orionLodNormalMatImage);
+    if (sz.x <= 1 || sz.y <= 1) return vec4(0.5, 0.5, 0.0, 0.0);
+    return imageLoad(orionLodNormalMatImage, orionLodClampCoord(pixelCoord, sz));
+}
+
+vec3 orionDecodeOctNormal(vec2 e01)
+{
+    vec2 f = e01 * 2.0 - 1.0;
+    vec3 n = vec3(f.x, f.y, 1.0 - abs(f.x) - abs(f.y));
+    float t = clamp(-n.z, 0.0, 1.0);
+    n.x += (n.x >= 0.0) ? -t : t;
+    n.y += (n.y >= 0.0) ? -t : t;
+    float lenSq = dot(n, n);
+    return (lenSq > 1.0e-8) ? n * inversesqrt(lenSq) : vec3(0.0, 1.0, 0.0);
+}
+
+vec3 orionLodWaterWaveNormal(vec2 worldXZ, float dist, float timeSec)
+{
+    float fade = (1.0 - smoothstep(100.0, 850.0, dist)) * 0.065;
+    if (fade <= 1.0e-4) {
+        return vec3(0.0, 1.0, 0.0);
+    }
+    float p1 = dot(worldXZ, vec2(0.37, 0.23)) + timeSec * 1.45;
+    float p2 = dot(worldXZ, vec2(-0.19, 0.41)) - timeSec * 1.15;
+    float p3 = dot(worldXZ, vec2(0.61, -0.53)) + timeSec * 1.95;
+    float dx = (cos(p1) * 0.37 - cos(p2) * 0.19 + cos(p3) * 0.30) * fade;
+    float dz = (cos(p1) * 0.23 + cos(p2) * 0.41 - cos(p3) * 0.26) * fade;
+    return normalize(vec3(-dx, 1.0, -dz));
 }
 
 // 前向声明：本文件的助手函数在 dhFarTextureUv 定义之前就要用它

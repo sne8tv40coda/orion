@@ -518,6 +518,12 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_updateCamera(
     ubo->dhFarFieldLight[1] = g_dhFarFieldStrength;
     ubo->dhFarFieldLight[2] = g_dhFarFieldGain;
     ubo->dhFarFieldLight[3] = g_dhFarFieldVariant;
+    if(orionBuiltinLodActive())
+    {
+        ubo->dhFarFieldLight[0] = 16.0f;
+        ubo->dhFarFieldLight[1] = 1.0f;
+        ubo->dhFarFieldLight[2] = 1.0f;
+    }
 
     const float farShadowExtent = sunShadowFarExtent();
     ubo->sunShadowFarParams[0] = farShadowExtent;
@@ -3207,6 +3213,10 @@ if(g_dlssOutputImage == VK_NULL_HANDLE ||
         renderWidth,
         renderHeight
     );
+    createOrionLodResources(
+        renderWidth,
+        renderHeight
+    );
 
 
     if(g_dlssDepthImage == VK_NULL_HANDLE ||
@@ -3790,6 +3800,7 @@ if(rrGuideBarrierCount > 0)
     // 旗标关闭时内部首行短路，不录任何命令，行为与改前逐位一致。
     // ===================================================================
     recordDhLodRasterPass(cmd);
+    recordOrionLodPass(cmd);
 
     recordSharcZeroFillIfNeeded(cmd);
     if(!k2DirectIndirectSplitEnabled())

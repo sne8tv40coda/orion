@@ -344,5 +344,7 @@
   "fogTintG": 1.0,
   "fogTintB": 1.0,
   "cloudTemporalMode": 2,
-  "customUpscalePercent": 0
+  "customUpscalePercent": 0,
+  "builtinLodEnabled": true,
+  "builtinLodDistanceChunks": 96
 }

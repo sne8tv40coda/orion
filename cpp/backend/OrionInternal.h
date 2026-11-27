@@ -5879,6 +5879,12 @@ extern uint64_t g_dhLodRasterTlasSkips;
 void createDhLodRasterResources(uint32_t renderWidth, uint32_t renderHeight);
 void recordDhLodRasterPass(VkCommandBuffer cmd);
 void destroyDhLodRasterResources();
+
+bool orionBuiltinLodActive();
+void createOrionLodResources(uint32_t renderWidth, uint32_t renderHeight);
+void recordOrionLodPass(VkCommandBuffer cmd);
+void destroyOrionLodResources();
+void clearOrionLodState();
 extern float g_dhFarFieldNear;
 extern float g_dhFarFieldFar;
 extern bool  g_dhFarFieldMatrixValid;

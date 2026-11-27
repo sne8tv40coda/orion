@@ -1102,6 +1102,7 @@ destroySharcUpdatePipeline();
     // 2026-11-19 DH LOD「G-buffer 光栅」资源（rasterLod 开启时非空；
     // 内部含等待空闲 + 全量重建，旗标关闭时同样是空操作）。
     destroyDhLodRasterResources();
+    destroyOrionLodResources();
 
     releaseSharedPipelineCache();
 

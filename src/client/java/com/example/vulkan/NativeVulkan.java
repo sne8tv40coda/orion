@@ -1033,6 +1033,30 @@ public final class NativeVulkan {
     /** 撤掉全部 DH 远场节（关开关 / 换世界）。 */
     public static native void clearDhLodSections();
 
+    /** 配置内置自研远景 LOD（不依赖 DH/Voxy）。 */
+    public static native void configureOrionLod(
+            boolean enabled, int maxDistanceChunks,
+            int seaLevel, int minY, int maxY, int dimKind, String cacheDir
+    );
+
+    /** 每帧更新内置远景 LOD 相机与原版渲染距离。 */
+    public static native void updateOrionLodCamera(
+            double camX, double camY, double camZ, int vanillaRenderDistanceChunks
+    );
+
+    /** 提交 16x16 真实区块柱状表面摘要（4096 bytes，高优先级实机探索数据）。 */
+    public static native void submitOrionLodRealChunk(
+            int chunkX, int chunkZ, byte[] columnData
+    );
+
+    /** 提交后台估算的多级远景 Tile（16x16 采样点 = 4096 bytes，仅填补未探索区域）。 */
+    public static native void submitOrionLodTile(
+            int lodLevel, int tileX, int tileZ, byte[] cellData, boolean isReal
+    );
+
+    /** 切换世界或关闭时清空内置远景 LOD。 */
+    public static native void clearOrionLod();
+
     /** One 4-state record per CUTOUT triangle; unknown records keep Any-Hit. */
     public static native void uploadCutoutOmmSection(
             int sectionX,
