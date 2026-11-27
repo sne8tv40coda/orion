@@ -55,6 +55,85 @@
 // 远处水底太阳/焦散整片消失。现在：吸收一律按真实水程 Beer-Lambert，
 // "最后一步完成出射即返回累积透射"（见函数尾），透射观感只由水深决定，
 // 与性能档位无关。
+// 2026-11-27: 空气侧半透明/树叶太阳可见性单发路径。
+// 完全不受“太阳透射距离”或 1 步循环限制；any-hit (RT_PURPOSE_GLASS_VISIBILITY)
+// 会自动累积沿途多层染色玻璃过滤并在不透明/镂空实体命中时终止。
+vec3 traceAirSunTransmittanceGlassVis(
+    vec3 startOrigin,
+    vec3 sunDir
+) {
+#ifndef ORION_K2I_COMPOSE_COMPUTE
+    const vec3 dir = normalize(sunDir);
+    hit.hitDistance = 1.0;
+    hit.albedoPacked = packAlbedoUnorm(vec3(1.0));
+    hit.parallaxRayTravel = 0.0;
+    hit.glassAlpha = 0.0;
+    hit.state = makeTraceState(RT_PURPOSE_GLASS_VISIBILITY);
+
+#if ORION_OPAQUE_VIS_FASTPATH
+    {
+        rayQueryEXT airSunVisQuery;
+        rayQueryInitializeEXT(
+            airSunVisQuery,
+            topLevelAS,
+            gl_RayFlagsTerminateOnFirstHitEXT,
+            g_secondaryCullMask,
+            startOrigin,
+            0.02,
+            dir,
+            10000.0
+        );
+        if(!rayQueryProceedEXT(airSunVisQuery))
+        {
+            #ifdef ORION_RT_STAGE_COUNTERS
+            rtCntRayIssued();
+            #endif
+            return (rayQueryGetIntersectionTypeEXT(airSunVisQuery, true) !=
+                    gl_RayQueryCommittedIntersectionNoneEXT)
+                ? vec3(0.0)
+                : vec3(1.0);
+        }
+        rayQueryTerminateEXT(airSunVisQuery);
+    }
+#endif
+    // 2026-11-27 (Batch AI): visibility-only glass shadow ray skips SER overhead.
+    {
+        #ifdef ORION_RT_STAGE_COUNTERS
+        rtCntRayIssued();
+        #endif
+        traceRayEXT(
+            topLevelAS,
+            gl_RayFlagsTerminateOnFirstHitEXT |
+            gl_RayFlagsSkipClosestHitShaderEXT,
+            g_secondaryCullMask,
+            0,
+            0,
+            0,
+            startOrigin,
+            0.02,
+            dir,
+            10000.0,
+            0
+        );
+    }
+    if(payload.hitDistance >= 0.0)
+    {
+        return vec3(0.0);
+    }
+    return clamp(unpackAlbedoUnorm(payload.albedoPacked), vec3(0.0), vec3(1.0));
+#else
+    return vec3(1.0);
+#endif
+}
+
+// 空气侧太阳透射入口：直接走单次 RT_PURPOSE_GLASS_VISIBILITY，零步数/距离钳制。
+vec3 traceSunTransmittanceAir(
+    vec3 startOrigin,
+    vec3 sunDir
+) {
+    return traceAirSunTransmittanceGlassVis(startOrigin, sunDir);
+}
+
 vec3 traceSunTransmittanceThroughWaterEx(
     vec3 startOrigin,
     vec3 rayDir,
@@ -91,8 +170,8 @@ const float WATER_EXTINCTION_DISTANCE =
         normalize(airSunDir);
 
     // 2026-11-15：标记"最后一步刚好完成 Water->Air 出射（人已在空中）"。
-    // 步数耗尽时用它决定返回累积透射还是保守 0 —— 见循环尾注释。
     bool exitedToAir = false;
+    bool crossedGlass = false;
 
 #if ORION_OPAQUE_VIS_FASTPATH && !defined(ORION_K2I_COMPOSE_COMPUTE)
     {
@@ -121,13 +200,16 @@ const float WATER_EXTINCTION_DISTANCE =
     }
 #endif
 
+    // UBO 掩蔽防编译展开膨胀；专责水下找水面出射，不再受旧 1 步距离设置钳制。
+    const int maxUnderwaterSunSteps =
+        (cam.frameCount != 0xFFFFFFFFu) ? 3 : 0;
+
     for(
         int step = 0;
-        step < perfL10MarchSteps(startOrigin);
+        step < maxUnderwaterSunSteps;
         ++step
     )
     {
-        // 每步重置：只有"本步完成出射"才算数；进入/玻璃步保持保守。
         exitedToAir = false;
 
         hit.hitDistance =
@@ -135,8 +217,18 @@ const float WATER_EXTINCTION_DISTANCE =
 
         hit.state = makeTraceState(RT_PURPOSE_CLASSIFY);
 
+#if defined(RT_ENABLE_SER) && ORION_SER_FUSED_ONLY
+        serTraceRay(
+            currentOrigin,
+            0.02,
+            currentDir,
+            10000.0,
+            secondaryTraverseFlags(),
+            0xcfu,
+            step
+        );
+#else
 #ifdef RT_ENABLE_SER
-        // Perf-L10.8: same ray, same flags; SER only reschedules the hit shader.
         if(cam.perfSerAb.y != 0u)
         {
             serTraceRay(
@@ -173,6 +265,7 @@ const float WATER_EXTINCTION_DISTANCE =
             payload.hitDistance = -1.0;
             #endif
         }
+#endif
 
         // 没有任何几何体阻挡。
         if(
@@ -185,153 +278,33 @@ const float WATER_EXTINCTION_DISTANCE =
         float hitMaterialId =
             getLegacyMaterialId(payload.state);
 
-
-        // =================================================
-        // T1/T9/T3 COMBINED
-        //
-        // payload:
-        //   0 = opaque
-        //   1 = Air -> Water
-        //   2 = Water -> Air
-        //   3 = exact glass / stained glass
-        //
-        // Glass uses straight transmission: NO refraction.
-        // One Orion boundary sheet per block.
-        // =================================================
 if(hitMaterialId >= 2.5)
 {
-    // ID 3 = entering / normal glass face.
-    // Apply the Orion sheet transmission once per block.
-    //
-    // ID 4 = exit or bottom face.
-    // Continue through it, but do not tint a second time.
     if(hitMaterialId < 3.5)
     {
-#if GLASS_CAUSTIC_LEVEL >= 1
-        // 2026-11-13 玻璃光学焦散（设计说明见文件顶部 GLASS_CAUSTIC_LEVEL 处）。
-        // 清玻璃：逐纹素覆盖率合成 mix(1, 薄片, a) —— 心部直通、边框/条纹
-        // 走薄片滤光；染色/致密体保持整片薄片（alpha 是透射率不是覆盖率）。
-        // 局部 IOR 表与 glass_dielectric_common.glsl 的 glassIorForProfile 同值
-        // （rgen TU 在本 include 点还没有那个头）：2 = 冰 1.309，其余 1.5。
-        const bool causticClearGlass =
-            (payload.state & RT_STATE_CLEAR_GLASS_BIT) != 0u &&
-            cam.glassCausticParams.x > 0.5;
-        if(causticClearGlass)
-        {
-            const float causticSheetAlpha =
-                clamp(payload.glassAlpha, 0.0, 1.0);
-            const vec3 causticSheetTint =
-                glassSheetTransmission(
-                    unpackAlbedoUnorm(payload.albedoPacked),
-                    payload.normal,
-                    currentDir
-                );
-            // 2026-11-13⑧：见顶部 GLASS_CAUSTIC_LIFT——保留阴影底 + 图案亮化，
-            // 替换此前的纯覆盖率 mix(1, tint, a)（心部直通 ⇒ 阴影消失）。
-            transmittance *=
-                causticSheetTint +
-                (vec3(1.0) - causticSheetTint) *
-                    ((1.0 - causticSheetAlpha) * GLASS_CAUSTIC_LIFT);
-        }
-        else
-        {
-            transmittance *=
-                glassSheetTransmission(
-                    unpackAlbedoUnorm(payload.albedoPacked),
-                    payload.normal,
-                    currentDir
-                );
-        }
-#else
         transmittance *=
             glassSheetTransmission(
                 unpackAlbedoUnorm(payload.albedoPacked),
                 payload.normal,
                 currentDir
             );
-#endif
 
-        // W2: below 1% the remaining march cannot contribute visible
-        // sun energy; stop tracing through stacked glass sheets.
         if(max(transmittance.r, max(transmittance.g, transmittance.b)) < 0.01)
         {
             return vec3(0.0);
         }
     }
 
-
     vec3 glassHitPos =
         currentOrigin +
         currentDir *
         payload.hitDistance;
 
-#if GLASS_CAUSTIC_LEVEL >= 1
-    // 2026-11-13②：染色玻璃光学焦散 —— 位移从"清玻璃专属 + 3cm 薄壁钳制"
-    // 升级为"全部玻璃族 + 真实板厚"。
-    //   物理依据：平板玻璃浓度 ≤1（能量守恒），室外透玻璃光 ≤ 直射阳光
-    //   ⇒ 焦散的可见形态 = 位移后的透光/染色光斑在**影子内部**偏移
-    //   （亮斑一侧出现、另一侧留出暗带）。位移量由真实板厚决定：玻璃块
-    //   （1 格）在 45° 太阳下横移 ≈0.3~0.4 格；玻璃板（1/8 格）≈3cm。
-    //   此前的 min(0.05/cos, 0.03) 是相机路径的伪影钳制，对太阳 march 的
-    //   块玻璃把位移钳到不可见。
-    //   板厚解析公式与 glass_dielectric_common.glsl 的 glassSlabThicknessFromFace
-    //   同口径（rgen TU 在本 include 点没有那个头，内联）：
-    //   2·|dot(fract(hitPos)-0.5, N)|，钳 [0.01, 1.0]（满方块最厚 1 格）。
-    //   染色玻璃的图案由 tint（sprite RGB × 桶装染料）携带，无需覆盖率项
-    //   ——它的 alpha 是整片透射率（102/255），不是二值覆盖率。
-    //   附带修正：位移后起点落在板/块出射面之外 ⇒ 跳过该面 ⇒ 竖直面玻璃
-    //   的"进出两面各 tint 一次"双计随之消失（每块/每板恰好一次，与 T1
-    //   注释的既定口径一致）。
-    // 折射位移**不受 UI 开关控制**（2026-11-13⑥ 用户澄清：开关只管焦散图案，
-    // 关掉也要有折射）。位移是玻璃的物理属性，对全部玻璃族常开。
-    if(hitMaterialId < 3.5)
-    {
-        const vec3 causticFaceNormal =
-            normalize(payload.normal);
-        const int causticProfile =
-            int(getTransparentProfile(payload.state));
-        const float causticIor =
-            causticProfile == 2 ? 1.309 : 1.5;
-        const vec3 causticInsideDir =
-            refract(
-                currentDir,
-                causticFaceNormal,
-                1.0 / max(causticIor, 1.0e-6));
-        if(dot(causticInsideDir, causticInsideDir) > 1.0e-8)
-        {
-            const vec3 causticInsideDirN =
-                normalize(causticInsideDir);
-            const float causticInsideCosine =
-                clamp(
-                    dot(causticInsideDirN, -causticFaceNormal),
-                    0.05,
-                    1.0);
-            const float causticSlabThickness =
-                clamp(
-                    2.0 * abs(
-                        dot(
-                            fract(glassHitPos) - vec3(0.5),
-                            causticFaceNormal)),
-                    0.01,
-                    1.0);
-            const float causticInsideTravel =
-                min(causticSlabThickness / causticInsideCosine, 1.0);
-            currentOrigin =
-                glassHitPos +
-                causticInsideDirN *
-                causticInsideTravel +
-                currentDir *
-                RAY_BIAS;
-            continue;
-        }
-    }
-#endif
-
+    crossedGlass = true;
     currentOrigin =
         glassHitPos +
         currentDir *
-        RAY_BIAS;
-
+        0.002;
 
     continue;
 }
@@ -340,30 +313,14 @@ if(hitMaterialId >= 2.5)
             hitMaterialId <= 0.5
         )
         {
-            // Opaque geometry still blocks the sun.
             return vec3(0.0);
         }
 
-
-        // =================================================
-        // Water only from this point onward.
-        //
-        // 1.0 = Air -> Water
-        // 2.0 = Water -> Air
-        // =================================================
-        // Water -> Air state.
         bool exitingWater =
             hitMaterialId > 1.5;
 
-        // The segment before this interface was travelled inside water.
-        // Keep absorption as Beer-Lambert attenuation and add a separate
-        // in-scattering term instead of replacing the transmitted light.
         if(exitingWater)
         {
-            // 2026-11-15：统一随水深。旧 stable 档钳 min(hitDistance, 2.0)
-            // ⇒ 水底直射太阳永远按 ≤2 格吸收，深水不清不浊。现在按真实
-            // 水程 Beer-Lambert：红 0.24/格（默认浓度）下 3 格 0.49、
-            // 10 格 0.09 —— 浅水清澈、深水自然压暗；<1% 由 W2 提前掐。
             float waterDistance =
                 payload.hitDistance;
 
@@ -394,51 +351,13 @@ if(hitMaterialId >= 2.5)
             currentDir *
             payload.hitDistance;
 
-        // rchit 已经保证 normal 朝向入射射线。
         vec3 hitNormal =
-            normalize(
-                payload.normal
-            );
-
-        hitNormal =
             stabilizeWaterInterfaceNormal(
-                hitNormal
+                normalize(
+                    payload.normal
+                )
             );
 
-        // =================================================
-        // FIX: Water -> Air classify stability
-        //
-        // The animated water-wave normal is desirable when entering water,
-        // but on the exit interface it produces triangle-dependent classify
-        // refraction and causes the reported flashing triangles.
-        //
-        // Keep full absorption/scatter on the underwater segment, but use a
-        // stable planar exit normal for the Water -> Air interface.
-        // =================================================
-        // =====================================================
-        // 2026-11-20：**恢复九月原档**（无条件水平出射法线）。
-        //
-        // 原档（见 .tmp/backup_20261026_pre_remix_align/shaders/rt_test.rgen
-        // 8889-8911）是：
-        //     interfaceNormal = exitingWater
-        //         ? vec3(0, hitNormal.y >= 0 ? 1 : -1, 0)
-        //         : hitNormal;
-        // 即从水出射到空气时**一律**用水平面法线，无任何门限。
-        //
-        // 2026-11-13 为了不把瀑布/水柱侧壁（法线 y ≈ 0）强制成 (0,±1,0)，
-        // 给它加了 `abs(hitNormal.y) > 0.5` 的条件。副作用：被抖陡的浪面
-        // （波浪法线的 y 分量掉到 0.5 以下）也一起退回波浪法线，于是从水底
-        // 打向太阳、穿出水面到空气的这条 march 又在出射界面按**逐三角形**
-        // 的折射/全反射判定 —— 太阳掠射时水底就闪成碎三角形。
-        //
-        // 这里把默认值改回原档（无条件），11-13 的竖直面保护降级为可选档：
-        //   WATER_SUN_VERTICAL_INTERFACE_NORMAL_PROTECT = 0 → 九月原档（默认）
-        //   WATER_SUN_VERTICAL_INTERFACE_NORMAL_PROTECT = 1 → 仅 |N.y| > 0.15 的面
-        // 若瀑布/水柱侧壁的太阳判定重新出问题（水面反射漏日盘、侧壁高光被压），
-        // 就是这一项的责任，把开关置 1。
-        // =====================================================
-        // Keep geometry-stable normal on BOTH Water->Air and Air->Water interfaces
-        // while preserving vertical side walls (waterfalls / water columns).
         vec3 interfaceNormal =
             (abs(hitNormal.y) > 0.15)
                 ? vec3(
@@ -458,7 +377,6 @@ if(hitMaterialId >= 2.5)
                 1.0
             );
 
-        // Fresnel transmission (scalar x^5 instead of pow).
         float fresnelX = 1.0 - cosTheta;
         float fresnelX2 = fresnelX * fresnelX;
         float fresnel =
@@ -471,9 +389,6 @@ if(hitMaterialId >= 2.5)
             1.0 -
             fresnel;
 
-        // W2: a deep water crossing can absorb the sun below any
-        // visible contribution; stop the march before its remaining
-        // interface traces.
         if(max(transmittance.r, max(transmittance.g, transmittance.b)) < 0.01)
         {
             return vec3(0.0);
@@ -481,18 +396,17 @@ if(hitMaterialId >= 2.5)
 
         if(exitingWater)
         {
-            // Exiting water into air: receiver->air sun direction is already given
-            // (targetAirDir); do not apply an inverse eta = 1/WATER_IOR bend on
-            // Water->Air, which skews shadows and causes false TIR flickering.
             exitedToAir = true;
             currentOrigin =
                 hitPos -
                 interfaceNormal *
-                RAY_BIAS;
+                0.005;
             currentDir = targetAirDir;
+            break;
         }
         else
         {
+            crossedGlass = false;
             exitedToAir = false;
             float eta =
                 1.0 / WATER_IOR;
@@ -513,94 +427,24 @@ if(hitMaterialId >= 2.5)
         }
     }
 
-    // 2026-11-15：步数耗尽语义。
-    // 2026-11-26 (Batch AC): once exited to air, run unified RT_PURPOSE_GLASS_VISIBILITY
-    // so cutouts/leaves (SBT 2), stained glass (SBT 3), and distant terrain match
-    // above-water sun visibility.
     if(!exitedToAir)
     {
+        if(crossedGlass)
+        {
+            return transmittance *
+                traceAirSunTransmittanceGlassVis(
+                    currentOrigin + targetAirDir * 0.02,
+                    targetAirDir
+                );
+        }
         return vec3(0.0);
     }
-#ifndef ORION_K2I_COMPOSE_COMPUTE
-    {
-        hit.hitDistance = 1.0;
-        hit.albedoPacked = packAlbedoUnorm(vec3(1.0));
-        hit.parallaxRayTravel = 0.0;
-        hit.glassAlpha = 0.0;
-        hit.state = makeTraceState(RT_PURPOSE_GLASS_VISIBILITY);
 
-        const vec3 airVisOrigin = currentOrigin + currentDir * 0.02;
-#if ORION_OPAQUE_VIS_FASTPATH
-        {
-            rayQueryEXT waterAirVisQuery;
-            rayQueryInitializeEXT(
-                waterAirVisQuery,
-                topLevelAS,
-                gl_RayFlagsTerminateOnFirstHitEXT,
-                g_secondaryCullMask,
-                airVisOrigin,
-                0.02,
-                currentDir,
-                10000.0
-            );
-            if(!rayQueryProceedEXT(waterAirVisQuery))
-            {
-                #ifdef ORION_RT_STAGE_COUNTERS
-                rtCntRayIssued();
-                #endif
-                if(rayQueryGetIntersectionTypeEXT(waterAirVisQuery, true) !=
-                   gl_RayQueryCommittedIntersectionNoneEXT)
-                {
-                    return vec3(0.0);
-                }
-                return transmittance;
-            }
-            rayQueryTerminateEXT(waterAirVisQuery);
-        }
-#endif
-#ifdef RT_ENABLE_SER
-        if(cam.perfSerAb.y != 0u)
-        {
-            serTraceRay(
-                airVisOrigin,
-                0.02,
-                currentDir,
-                10000.0,
-                gl_RayFlagsTerminateOnFirstHitEXT |
-                gl_RayFlagsSkipClosestHitShaderEXT,
-                g_secondaryCullMask,
-                1
-            );
-        }
-        else
-#endif
-        {
-            #ifdef ORION_RT_STAGE_COUNTERS
-            rtCntRayIssued();
-            #endif
-            traceRayEXT(
-                topLevelAS,
-                gl_RayFlagsTerminateOnFirstHitEXT |
-                gl_RayFlagsSkipClosestHitShaderEXT,
-                g_secondaryCullMask,
-                0,
-                0,
-                0,
-                airVisOrigin,
-                0.02,
-                currentDir,
-                10000.0,
-                0
-            );
-        }
-        if(payload.hitDistance >= 0.0)
-        {
-            return vec3(0.0);
-        }
-        transmittance *= clamp(unpackAlbedoUnorm(payload.albedoPacked), vec3(0.0), vec3(1.0));
-    }
-#endif
-    return transmittance;
+    return transmittance *
+        traceAirSunTransmittanceGlassVis(
+            currentOrigin + currentDir * 0.02,
+            currentDir
+        );
 }
 
 vec3 traceSunTransmittanceThroughWater(

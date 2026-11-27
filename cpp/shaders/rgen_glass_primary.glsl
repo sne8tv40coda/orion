@@ -6,18 +6,7 @@
 // bounce through Beer-Lambert water absorption.  Both the parameter and the
 // call it enables are guarded by GI_GLASS_RECEIVER_INDIRECT, so switching the
 // feature off reproduces the previous shader exactly.
-#ifndef ORION_K1_GLASS_ONLY
-vec3 tracePrimaryWaterReceiverIndirectReworked(
-    vec3 receiverPos,
-    vec3 receiverNormal,
-    vec3 receiverAlbedo,
-    float lodDistance,
-    vec3 sunDirection
-#if GI_GLASS_RECEIVER_INDIRECT
-    , bool startInsideWater
-#endif
-);
-#endif
+// 2026-11-27: 玻璃链已改为 100% 确定性零噪点着色，不再依赖随机 GI walker。
 
 // One straight continuation for exact clear/stained glass.  The dedicated
 // Any-Hit path skips later glass faces, so this trace reaches either the
@@ -48,6 +37,9 @@ vec3 tracePrimarySimpleGlassRadiance(
     transmissionInfo.reachedUnderwaterReceiver = 0.0;
     transmissionInfo.waterSunVisibility = 1.0;
     transmissionInfo.receiverSelfEmissionRadiance = vec3(0.0);
+    transmissionInfo.cameraWaterColumnTransmittance = vec3(-1.0);
+    transmissionInfo.receiverSunTransmittance = vec3(0.0);
+    transmissionInfo.receiverSunTransmittanceValid = 0.0;
 
     vec3 straightDirection = normalize(rayDirection);
     vec3 blockTransmission =
@@ -56,6 +48,17 @@ vec3 tracePrimarySimpleGlassRadiance(
     hit.hitDistance = 1.0;
     hit.state = makeTraceState(RT_PURPOSE_PASSTHROUGH);
 
+#if defined(RT_ENABLE_SER) && ORION_SER_FUSED_ONLY
+    serTraceRay(
+        glassSurfacePosition + straightDirection * 0.01,
+        0.01,
+        straightDirection,
+        10000.0,
+        secondaryTraverseFlags(),
+        0xcfu,
+        0u
+    );
+#else
 #ifdef RT_ENABLE_SER
     // Perf-L10.8: same ray, same flags; SER only reschedules the hit shader.
     if(cam.perfSerAb.z != 0u)
@@ -90,6 +93,7 @@ vec3 tracePrimarySimpleGlassRadiance(
             0
         );
     }
+#endif
 
     if(payload.hitDistance < 0.0)
     {
@@ -431,6 +435,9 @@ vec3 tracePrimaryDielectricGlassRadiance(
     transmissionInfo.reachedUnderwaterReceiver = 0.0;
     transmissionInfo.waterSunVisibility = 1.0;
     transmissionInfo.receiverSelfEmissionRadiance = vec3(0.0);
+    transmissionInfo.cameraWaterColumnTransmittance = vec3(-1.0);
+    transmissionInfo.receiverSunTransmittance = vec3(0.0);
+    transmissionInfo.receiverSunTransmittanceValid = 0.0;
 
     const vec3 viewDirection = normalize(rayDirection);
 
@@ -506,38 +513,21 @@ vec3 tracePrimaryDielectricGlassRadiance(
     // 掠射端就算 F 很小也保留这条射线：它是 RR 反射端点 guide 与
     // rrGlassReflectionHitDistance 的唯一来源。
 #ifndef VPT_GLASS_REFLECTION
-// 1 = 保留镜面反射瓣（**默认**）。0 = 关掉反射（A/B：用来分辨"三角形亮斑"
-//     到底是反射天空，还是透射的解析出射点越界）。
 #define VPT_GLASS_REFLECTION 1
-#endif
-#ifndef ORION_GLASS_FAR_LOWF_REFL_FASTPATH
-#define ORION_GLASS_FAR_LOWF_REFL_FASTPATH 1
 #endif
     vec3 reflectionRadiance = vec3(0.0);
     vec3 sunSpecularGlint = vec3(0.0);
 #if VPT_GLASS_REFLECTION
     if(entryFresnel > 1.0e-4)
     {
-        if(ORION_GLASS_FAR_LOWF_REFL_FASTPATH != 0 &&
-           glassCamDist >= 24.0 &&
-           entryFresnel < 0.07)
-        {
-            rrGlassReflectionHitDistance = 65504.0;
-            const vec3 cheapReflDir = normalize(reflect(viewDirection, entryNormal));
-            reflectionRadiance = mix(
-                getSurfaceAmbientRadiance(),
-                samplePhysicalClearSkyForAerialPerspective(cheapReflDir),
-                smoothstep(-0.05, 0.20, cheapReflDir.y));
-        }
-        else
-        {
-            reflectionRadiance =
-                traceGlassSceneReflectionOneRay(
-                    glassSurfacePosition,
-                    entryNormal,
-                    -viewDirection,
-                    sunDirection);
-        }
+        // 2026-11-27: 取消假天空短路，全距离/全角度统一走确定性极速反射射线，
+        // 保证玻璃反射永不消失。
+        reflectionRadiance =
+            traceGlassSceneReflectionOneRay(
+                glassSurfacePosition,
+                entryNormal,
+                -viewDirection,
+                sunDirection);
 
         // Narrow shadow-tested direct-sun GGX glint (gated by dot(R, L) > 0.92
         // so >98% of translucent pixels pay zero extra shadow rays).
@@ -557,7 +547,7 @@ vec3 tracePrimaryDielectricGlassRadiance(
                 (reflD * reflG * reflSunF) / max(4.0 * entryCosine * reflNdotL, 1.0e-4);
             if(reflSpecBrdf * reflNdotL > 1.0e-4)
             {
-                const vec3 sunTrans = traceSunTransmittanceThroughWater(
+                const vec3 sunTrans = traceSunTransmittanceAir(
                     glassSurfacePosition + entryNormal * 0.02,
                     reflL);
                 if(max(sunTrans.r, max(sunTrans.g, sunTrans.b)) > 0.0)
@@ -629,14 +619,16 @@ vec3 tracePrimaryDielectricGlassRadiance(
     vec3 opqHitEmission = vec3(0.0);
     float opqHitPomSelfShadow = 1.0;
 
+    const int baseGlassInterfaces =
+        (glassCamDist < 24.0)
+            ? 4
+            : ((glassCamDist < 64.0) ? 3 : 2);
     const int effectiveGlassMaxInterfaces =
-        (glassCamDist < 16.0)
-            ? min(VPT_GLASS_MAX_INTERFACES, 6)
-            : ((glassCamDist < 48.0)
-                ? min(VPT_GLASS_MAX_INTERFACES, 4)
-                : min(VPT_GLASS_MAX_INTERFACES, 2));
+        (cam.frameCount != 0xFFFFFFFFu)
+            ? min(VPT_GLASS_MAX_INTERFACES, baseGlassInterfaces)
+            : 0;
 
-    for(int slabStep = 0; slabStep <= effectiveGlassMaxInterfaces; ++slabStep)
+    for(int slabStep = 0; slabStep < effectiveGlassMaxInterfaces; ++slabStep)
     {
         if(max(throughput.r, max(throughput.g, throughput.b)) < 0.03)
         {
@@ -793,7 +785,11 @@ vec3 tracePrimaryDielectricGlassRadiance(
 
         hit.hitDistance = 1.0;
         hit.albedoPacked = packAlbedoUnorm(vec3(1.0));
-        hit.state = makeTraceState(RT_PURPOSE_FULL);
+        hit.state = makeTraceState(RT_PURPOSE_FULL) | RT_STATE_GI_NO_POM_BIT;
+        if(glassCamDist >= 32.0)
+        {
+            hit.state |= RT_STATE_GI_SKIP_CLOUDS_BIT;
+        }
 
 #if ORION_GLASS_REMIX_PSTR_GUIDES && !defined(ORION_K2_TRANSPORT) && ORION_GLASS_TWO_INTERFACE_REFRACT
         const uint stepCullMask = nextStepSkipGlass ? 0x04u : 0xcfu;
@@ -1075,64 +1071,135 @@ vec3 tracePrimaryDielectricGlassRadiance(
                 waterDirection = reflect(travelDirection, normalize(hit.normal));
             }
 #ifdef ORION_K1_GLASS_ONLY
-            const vec3 uwOrigin = hitPosition + waterDirection * 0.002;
-            hit.hitDistance = 1.0;
-            hit.albedoPacked = packAlbedoUnorm(vec3(1.0));
-            hit.state = makeTraceState(RT_PURPOSE_FULL);
-#ifdef RT_ENABLE_SER
-            if(cam.perfSerAb.z != 0u)
-            {
-                serTraceRay(
-                    uwOrigin, 0.01, waterDirection, 10000.0,
-                    secondaryTraverseFlags(), 0xcfu, 0u);
-            }
-            else
-#endif
-            {
-                #ifdef ORION_RT_STAGE_COUNTERS
-                rtCntRayIssued();
-                #endif
-                traceRayEXT(
-                    topLevelAS,
-                    secondaryTraverseFlags(),
-                    0xcfu,
-                    0, 0, 0,
-                    uwOrigin, 0.01, waterDirection, 10000.0, 0);
-            }
+            vec3 gwOrigin = hitPosition + waterDirection * 0.002;
+            vec3 gwDir = normalize(waterDirection);
+            bool gwInside = totalInternalReflection ? exitingWater : !exitingWater;
+            float gwPathLen = 0.0;
+            vec3 gwThroughput = vec3(1.0);
+            vec3 gwInscatter = vec3(0.0);
             vec3 waterRadiance = vec3(0.0);
-            if(hit.hitDistance < 0.0)
+            bool gwDone = false;
+            const int glassWaterMaxSteps =
+                (cam.frameCount != 0xFFFFFFFFu) ? 2 : 0;
+
+            for(int gwStep = 0; gwStep < glassWaterMaxSteps; ++gwStep)
             {
-                waterRadiance = unpackAlbedoUnorm(hit.albedoPacked);
-                transmissionInfo.waterPathLength = 60.0;
-                transmissionInfo.reachedUnderwaterReceiver = 0.0;
+                hit.hitDistance = 1.0;
+                hit.albedoPacked = packAlbedoUnorm(vec3(1.0));
+                hit.state = makeTraceState(gwInside ? RT_PURPOSE_WATER_MEDIUM : RT_PURPOSE_FULL) |
+                    RT_STATE_GI_SKIP_CLOUDS_BIT |
+                    RT_STATE_GI_NO_POM_BIT;
+#if defined(RT_ENABLE_SER) && ORION_SER_FUSED_ONLY
+                serTraceRay(
+                    gwOrigin, 0.01, gwDir, 10000.0,
+                    secondaryTraverseFlags(), 0xcfu, uint(gwStep));
+#else
+#ifdef RT_ENABLE_SER
+                if(cam.perfSerAb.z != 0u)
+                {
+                    serTraceRay(
+                        gwOrigin, 0.01, gwDir, 10000.0,
+                        secondaryTraverseFlags(), 0xcfu, uint(gwStep));
+                }
+                else
+#endif
+                {
+                    #ifdef ORION_RT_STAGE_COUNTERS
+                    rtCntRayIssued();
+                    #endif
+                    traceRayEXT(
+                        topLevelAS,
+                        secondaryTraverseFlags(),
+                        0xcfu,
+                        0, 0, 0,
+                        gwOrigin, 0.01, gwDir, 10000.0, 0);
+                }
+#endif
+
+                if(hit.hitDistance < 0.0)
+                {
+                    waterRadiance = gwInscatter + gwThroughput * unpackAlbedoUnorm(hit.albedoPacked);
+                    transmissionInfo.waterPathLength = gwInside ? max(gwPathLen, 60.0) : max(gwPathLen, 0.0);
+                    transmissionInfo.reachedUnderwaterReceiver = 0.0;
+                    gwDone = true;
+                    break;
+                }
+
+                const float segDist = hit.hitDistance;
+                const vec3 segPos = gwOrigin + gwDir * segDist;
+                if(gwInside)
+                {
+                    gwPathLen += segDist;
+                    const vec3 wAbs = exp(-waterAbsorptionColor() * max(segDist - 1.5, 0.0));
+                    gwInscatter += gwThroughput * (vec3(1.0) - wAbs) * waterScatterColor() *
+                        (getSurfaceAmbientRadiance() + getTimeDrivenSkyLightColor() * 0.35);
+                    gwThroughput *= wAbs;
+                }
+
+                const float segMat = getLegacyMaterialId(hit.state);
+                if(segMat <= 0.5)
+                {
+                    const vec3 uwNormal = normalize(hit.normal);
+                    const vec3 uwAlbedo = unpackAlbedoUnorm(hit.albedoPacked);
+                    const float uwCamDist = length(segPos - cam.viewInverse[3].xyz);
+                    const vec3 uwSurface =
+                        evaluateOpaqueSurfaceRadianceInMedium(
+                            segPos, uwNormal, -gwDir, uwAlbedo,
+                            max(hit.roughness, 0.05), hit.f0Metal,
+                            hit.emission + evaluateVLIEmitterRadianceAtHit(segPos, uwNormal, uwAlbedo),
+                            hit.pomSelfShadow, sunDirection, gwInside) +
+                        evaluateVPTExactFaceDirectLighting(segPos, uwNormal, uwAlbedo) +
+                        evaluateDynamicLightDeterministicDirect(segPos, uwNormal, uwAlbedo, uwCamDist) +
+                        uwAlbedo * evaluateDeterministicIndirectAmbient(uwNormal, 1.0);
+                    waterRadiance = gwInscatter + gwThroughput * uwSurface;
+                    transmissionInfo.waterPathLength = max(gwPathLen, 0.0);
+                    transmissionInfo.receiverWorldPos = segPos;
+                    transmissionInfo.receiverNormal = uwNormal;
+                    transmissionInfo.receiverViewDirection = -gwDir;
+                    transmissionInfo.receiverAlbedo = uwAlbedo;
+                    transmissionInfo.receiverRoughness = hit.roughness;
+                    transmissionInfo.receiverF0Metal = hit.f0Metal;
+                    transmissionInfo.reachedUnderwaterReceiver = 1.0;
+                    transmissionInfo.waterSunVisibility = 1.0;
+                    transmissionInfo.receiverSelfEmissionRadiance = vec3(0.0);
+                    gwDone = true;
+                    break;
+                }
+                else if(segMat < 2.5)
+                {
+                    if(gwInside)
+                    {
+                        vec3 wExitN = normalize(hit.normal);
+                        if(dot(wExitN, gwDir) > 0.0)
+                        {
+                            wExitN = -wExitN;
+                        }
+                        vec3 wExitDir = refract(gwDir, wExitN, 1.33);
+                        if(dot(wExitDir, wExitDir) < 1.0e-6)
+                        {
+                            wExitDir = gwDir;
+                        }
+                        gwDir = normalize(wExitDir);
+                        gwInside = false;
+                        gwOrigin = segPos - wExitN * 0.004;
+                    }
+                    else
+                    {
+                        gwInside = true;
+                        gwOrigin = segPos + gwDir * 0.004;
+                    }
+                    continue;
+                }
+                else
+                {
+                    gwThroughput *= clamp(unpackAlbedoUnorm(hit.albedoPacked), vec3(0.0), vec3(1.0));
+                    gwOrigin = segPos + gwDir * 0.004;
+                    continue;
+                }
             }
-            else
+            if(!gwDone)
             {
-                const float uwDist = hit.hitDistance;
-                const vec3 uwPos = uwOrigin + waterDirection * uwDist;
-                const vec3 uwNormal = normalize(hit.normal);
-                const vec3 uwAlbedo = unpackAlbedoUnorm(hit.albedoPacked);
-                const vec3 waterAbs = exp(-waterAbsorptionColor() * max(uwDist - 3.0, 0.0));
-                const vec3 waterInscatter = (vec3(1.0) - waterAbs) * waterScatterColor() *
-                    (getSurfaceAmbientRadiance() + getTimeDrivenSkyLightColor() * 0.35);
-                const vec3 uwSurface = (getLegacyMaterialId(hit.state) <= 0.5)
-                    ? (evaluateOpaqueSurfaceRadiance(
-                            uwPos, uwNormal, -waterDirection, uwAlbedo,
-                            max(hit.roughness, 0.05), hit.f0Metal, hit.emission,
-                            hit.pomSelfShadow, sunDirection) +
-                       uwAlbedo * getSurfaceAmbientRadiance())
-                    : (uwAlbedo * (getSurfaceAmbientRadiance() + getTimeDrivenSkyLightColor() * 0.35));
-                waterRadiance = waterInscatter + waterAbs * uwSurface;
-                transmissionInfo.waterPathLength = max(uwDist, 0.0);
-                transmissionInfo.receiverWorldPos = uwPos;
-                transmissionInfo.receiverNormal = uwNormal;
-                transmissionInfo.receiverViewDirection = -waterDirection;
-                transmissionInfo.receiverAlbedo = uwAlbedo;
-                transmissionInfo.receiverRoughness = hit.roughness;
-                transmissionInfo.receiverF0Metal = hit.f0Metal;
-                transmissionInfo.reachedUnderwaterReceiver = 1.0;
-                transmissionInfo.waterSunVisibility = 1.0;
-                transmissionInfo.receiverSelfEmissionRadiance = vec3(0.0);
+                waterRadiance = gwInscatter + gwThroughput * evaluateDeterministicIndirectAmbient(-gwDir, 1.0);
             }
             rrGlassPaneTransmissionFilter = clamp(throughput, vec3(0.0), vec3(1.0));
 #if GI_GLASS_DOMINANT_GUIDE
@@ -1188,8 +1255,13 @@ vec3 tracePrimaryDielectricGlassRadiance(
         transmissionInfo.waterSunVisibility = 1.0;
         transmissionInfo.receiverSelfEmissionRadiance = vec3(0.0);
 
+        const float receiverCameraDist = length(
+            opqHitPos - cam.viewInverse[3].xyz);
+
+        // 2026-11-27: 100% 确定性零噪点着色（空气侧单发太阳可见性 + 确定性 VPT 局部光 +
+        // 确定性动态光源 + 确定性半球环境光；彻底消除 1-spp RIS 与随机 GI 噪点）。
         vec3 receiverRadiance =
-            evaluateOpaqueSurfaceRadiance(
+            evaluateOpaqueSurfaceRadianceInMedium(
                 opqHitPos,
                 opqHitNormal,
                 -travelDirection,
@@ -1200,168 +1272,18 @@ vec3 tracePrimaryDielectricGlassRadiance(
                     evaluateVLIEmitterRadianceAtHit(
                         opqHitPos, opqHitNormal, opqHitAlbedo),
                 opqHitPomSelfShadow,
-                sunDirection);
-
-#if !defined(ORION_K2_TRANSPORT) && ORION_GLASS_FAR_NOISE_FIX
-        {
-            uint receiverRisState =
-                uint(gl_LaunchIDEXT.x) * 1973u +
-                uint(gl_LaunchIDEXT.y) * 9277u ^
-                cam.frameCount * 26699u;
-            pcg_hash(receiverRisState);
-            const vec3 receiverGeoNormal =
-                vptGeometricFaceNormalFromRay(opqHitPos, travelDirection);
-            const float receiverCameraDist = length(
-                opqHitPos - (cam.viewInverse * vec4(0.0, 0.0, 0.0, 1.0)).xyz);
-            const int glassRisSamples =
-                (receiverCameraDist < 32.0) ? max(ORION_GLASS_LOCAL_RIS_SAMPLES, 1) : 1;
-            vec3 receiverLocalVoxelDirect = vec3(0.0);
-            for(int risSampleIdx = 0;
-                risSampleIdx < glassRisSamples;
-                ++risSampleIdx)
-            {
-                receiverLocalVoxelDirect += evaluateVPTRISDirectLightingSingle(
-                    opqHitPos,
-                    opqHitNormal,
-                    opqHitAlbedo,
-                    receiverGeoNormal,
-                    false,
-                    true,
-                    receiverRisState);
-            }
-            receiverLocalVoxelDirect *=
-                1.0 / float(glassRisSamples);
-            vec3 receiverLocalDirect =
-                receiverLocalVoxelDirect +
-                evaluateDynamicLightRISDirect(
-                    opqHitPos,
-                    opqHitNormal,
-                    opqHitAlbedo,
-                    receiverCameraDist,
-                    vec3(-1.0),
-                    -1.0,
-                    1.0,
-                    receiverRisState);
-            const float localDirectLuma = dot(
-                max(receiverLocalDirect, vec3(0.0)),
-                vec3(0.2126, 0.7152, 0.0722));
-            if(localDirectLuma > 4.0)
-            {
-                receiverLocalDirect *= 4.0 / localDirectLuma;
-            }
-            receiverRadiance += receiverLocalDirect;
-        }
-
-        receiverRadiance +=
-            opqHitAlbedo * getSurfaceAmbientRadiance();
-
-#ifndef VPT_GLASS_RECEIVER_GI
-#define VPT_GLASS_RECEIVER_GI 1
-#endif
-#if VPT_GLASS_RECEIVER_GI
-        {
-            const float receiverGILodDistance =
-                length(opqHitPos - cam.viewInverse[3].xyz);
-            if(receiverGILodDistance < 40.0 * perfL10TierScale() &&
-               max(throughput.r, max(throughput.g, throughput.b)) > 0.12)
-            {
-#ifdef ORION_K1_GLASS_ONLY
-                vec3 receiverGiBounce =
-                    traceTransparentLowCostGI(
-                        opqHitPos,
-                        opqHitNormal,
-                        opqHitAlbedo);
-#else
-                const float clampedGiLodDist =
-                    min(receiverGILodDistance, 31.0 * perfL10TierScale());
-#if GI_GLASS_RECEIVER_INDIRECT
-                vec3 receiverGiBounce =
-                    tracePrimaryWaterReceiverIndirectReworked(
-                        opqHitPos,
-                        opqHitNormal,
-                        opqHitAlbedo,
-                        clampedGiLodDist,
-                        sunDirection,
-                        false);
-#else
-                vec3 receiverGiBounce =
-                    tracePrimaryWaterReceiverIndirectReworked(
-                        opqHitPos,
-                        opqHitNormal,
-                        opqHitAlbedo,
-                        clampedGiLodDist,
-                        sunDirection);
-#endif
-#endif
-                const float giBounceLuma = dot(
-                    max(receiverGiBounce, vec3(0.0)),
-                    vec3(0.2126, 0.7152, 0.0722));
-                if(giBounceLuma > 2.5)
-                {
-                    receiverGiBounce *= 2.5 / giBounceLuma;
-                }
-                receiverRadiance += receiverGiBounce;
-            }
-        }
-#endif
-#else
-        {
-            uint receiverRisState =
-                uint(gl_LaunchIDEXT.x) * 1973u +
-                uint(gl_LaunchIDEXT.y) * 9277u ^
-                cam.frameCount * 26699u;
-            pcg_hash(receiverRisState);
-            receiverRadiance +=
-                evaluateVPTRISDirectLighting(
-                    opqHitPos,
-                    opqHitNormal,
-                    opqHitAlbedo,
-                    vptGeometricFaceNormalFromRay(opqHitPos, travelDirection),
-                    vec3(-1.0), -1.0, 1.0,
-                    receiverRisState);
-        }
-
-        receiverRadiance +=
-            opqHitAlbedo * getSurfaceAmbientRadiance();
-
-#ifndef VPT_GLASS_RECEIVER_GI
-#define VPT_GLASS_RECEIVER_GI 1
-#endif
-#if VPT_GLASS_RECEIVER_GI
-        {
-            const float receiverGILodDistance =
-                length(opqHitPos - cam.viewInverse[3].xyz);
-            if(receiverGILodDistance < 40.0 * perfL10TierScale() &&
-               max(throughput.r, max(throughput.g, throughput.b)) > 0.12)
-            {
-#ifdef ORION_K1_GLASS_ONLY
-                receiverRadiance +=
-                    traceTransparentLowCostGI(
-                        opqHitPos,
-                        opqHitNormal,
-                        opqHitAlbedo);
-#elif GI_GLASS_RECEIVER_INDIRECT
-                receiverRadiance +=
-                    tracePrimaryWaterReceiverIndirectReworked(
-                        opqHitPos,
-                        opqHitNormal,
-                        opqHitAlbedo,
-                        receiverGILodDistance,
-                        sunDirection,
-                        false);
-#else
-                receiverRadiance +=
-                    tracePrimaryWaterReceiverIndirectReworked(
-                        opqHitPos,
-                        opqHitNormal,
-                        opqHitAlbedo,
-                        receiverGILodDistance,
-                        sunDirection);
-#endif
-            }
-        }
-#endif
-#endif
+                sunDirection,
+                false) +
+            evaluateVPTExactFaceDirectLighting(
+                opqHitPos,
+                opqHitNormal,
+                opqHitAlbedo) +
+            evaluateDynamicLightDeterministicDirect(
+                opqHitPos,
+                opqHitNormal,
+                opqHitAlbedo,
+                receiverCameraDist) +
+            opqHitAlbedo * evaluateDeterministicIndirectAmbient(opqHitNormal, 1.0);
 
         rrGlassPaneTransmissionFilter =
             clamp(throughput, vec3(0.0), vec3(1.0));

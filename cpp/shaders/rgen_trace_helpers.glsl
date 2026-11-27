@@ -30,6 +30,34 @@ vec3 stabilizeWaterInterfaceNormal(
     return normalize(normal);
 }
 
+// 2026-11-27 (Batch AE): Shared frame-load and adaptive distance scale helpers
+// placed early so glass reflection/primary and water receiver can all throttle
+// smoothly under close-up load spikes.
+bool g_waterWalkerSkipClouds = false;
+
+float perfL10WaterLoad()
+{
+    const float frameMs = cam.rtSampleParams.w;
+    if(frameMs <= 0.0)
+    {
+        return 0.0;
+    }
+    return clamp((frameMs - 16.0) / 14.0, 0.0, 1.0);
+}
+
+float perfL10WaterAdaptiveScale()
+{
+    // 2026-11-27: 重构后水体/半透明链已确定性轻量，不再随帧时间抖动收紧距离闸。
+    return 1.0;
+}
+
+// 2026-11-27: 零射线、零噪点确定性间接环境光近似（用于替代水底/玻璃后 1-spp 随机 GI）。
+vec3 evaluateDeterministicIndirectAmbient(vec3 hitNormal, float skyOpenFactor)
+{
+    float hemi = 0.65 + 0.35 * clamp(normalize(hitNormal).y * 0.5 + 0.5, 0.0, 1.0);
+    return getSurfaceAmbientRadiance() * mix(0.45, 1.0, clamp(skyOpenFactor, 0.0, 1.0)) * hemi;
+}
+
 // ===========================================================================
 // 2026-11-20：**水面 Fresnel 的稳定余弦**（针对"水底闪烁黑三角"）
 //

@@ -58,6 +58,9 @@ vec3 tracePrimaryGenericTransparentRadiance(
     transmissionInfo.reachedUnderwaterReceiver = 0.0;
     transmissionInfo.waterSunVisibility = 1.0;
     transmissionInfo.receiverSelfEmissionRadiance = vec3(0.0);
+    transmissionInfo.cameraWaterColumnTransmittance = vec3(-1.0);
+    transmissionInfo.receiverSunTransmittance = vec3(0.0);
+    transmissionInfo.receiverSunTransmittanceValid = 0.0;
 
     // 2026-11-02 半透明重写：本函数后半（alpha blend / 玻璃链 / 剖面不透明度 /
     // 清玻璃当空气）在重写档下整段不执行。旧代码保留，供 -DVPT_GLASS_DIELECTRIC_REWRITE=0
@@ -264,6 +267,17 @@ vec3 tracePrimaryGenericTransparentRadiance(
 #endif
 
 
+#if defined(RT_ENABLE_SER) && ORION_SER_FUSED_ONLY
+    serTraceRay(
+        startOrigin,
+        0.01,
+        straightDirection,
+        10000.0,
+        secondaryTraverseFlags(),
+        0xcfu,
+        0u
+    );
+#else
 #ifdef RT_ENABLE_SER
     // Perf-L10.8: same ray, same flags; SER only reschedules the hit shader.
     if(cam.perfSerAb.z != 0u)
@@ -298,6 +312,7 @@ vec3 tracePrimaryGenericTransparentRadiance(
             0
         );
     }
+#endif
 
 
     vec3 behindRadiance =
@@ -1546,7 +1561,7 @@ vec3 localEntityIrradiance =
         surfaceSceneReflection =
             textureLod(
                 skyScatteringTex,
-                directionToEquirect(glassMirrorDirection),
+                skyLutDirectionToUv(glassMirrorDirection),
                 0.0
             ).rgb *
             glassReflection;

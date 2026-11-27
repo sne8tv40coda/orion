@@ -31,13 +31,10 @@ vec3 traceGlassSceneReflectionOneRay(
 
     const float glassReflCamDist =
         length(glassSurfacePosition - cam.viewInverse[3].xyz);
-#ifdef ORION_K1_GLASS_ONLY
+    // 2026-11-27: 确定性极速反射（UBO 掩蔽防展开）：最多 1 次有效反射命中，
+    // 若首跳擦到 coplanar 玻璃（hitDist < 0.02）或穿过 1 层玻璃，最多续追 1 步。
     const int maxGlassReflectSteps =
-        (glassReflCamDist < 16.0) ? 2 : 1;
-#else
-    const int maxGlassReflectSteps =
-        (glassReflCamDist < 24.0) ? 3 : ((glassReflCamDist < 64.0) ? 2 : 1);
-#endif
+        (cam.frameCount != 0xFFFFFFFFu) ? 2 : 0;
 
     vec3 currentOrigin =
         glassSurfacePosition + N * 0.002 + reflectionDirection * 0.001;
@@ -55,12 +52,21 @@ vec3 traceGlassSceneReflectionOneRay(
         hit.albedoPacked = packAlbedoUnorm(vec3(1.0));
         hit.state = makeTraceState(RT_PURPOSE_FULL) |
             RT_STATE_NO_SUN_DISK_BIT |
-            RT_STATE_NO_SUN_GLOW_BIT;
-        if(secondaryRayPomSkipEnabled())
-        {
-            hit.state |= RT_STATE_GI_NO_POM_BIT;
-        }
+            RT_STATE_NO_SUN_GLOW_BIT |
+            RT_STATE_GI_NO_POM_BIT |
+            RT_STATE_GI_SKIP_CLOUDS_BIT;
 
+#if defined(RT_ENABLE_SER) && ORION_SER_FUSED_ONLY
+        serTraceRay(
+            currentOrigin,
+            0.01,
+            currentDirection,
+            10000.0,
+            secondaryTraverseFlags(),
+            0xcfu,
+            0u
+        );
+#else
 #ifdef RT_ENABLE_SER
         // Perf-L10.8: same ray, same flags; SER only reschedules the hit shader.
         if(cam.perfSerAb.z != 0u)
@@ -95,6 +101,7 @@ vec3 traceGlassSceneReflectionOneRay(
                 0
             );
         }
+#endif
 
         if(payload.hitDistance < 0.0)
         {
@@ -136,35 +143,38 @@ vec3 traceGlassSceneReflectionOneRay(
 
             vec3 reflectionHitEmission =
                 hitEmission +
-                (GI_GLASS_REFLECTION_LEGACY != 0
-                    ? evaluateVLIEmitterRadianceAtHit(
+                evaluateVLIEmitterRadianceAtHit(
+                    hitPos,
+                    hitNormal,
+                    hitAlbedo
+                );
+
+            // 2026-11-27: 玻璃反射禁用 SHaRC 短窗有噪缓存查询，统一走 100% 确定性着色，
+            // 彻底消除倒影沸腾闪动。
+            reflectedSceneRadiance +=
+                throughput * (
+                    reflectionHitEmission +
+                    evaluateDirectSunLightingDiffuseInMedium(
+                        hitPos,
+                        hitNormal,
+                        hitAlbedo,
+                        hitF0Metal,
+                        hitPomSelfShadow,
+                        sunDirection,
+                        false
+                    ) +
+                    evaluateVPTExactFaceDirectLighting(
                         hitPos,
                         hitNormal,
                         hitAlbedo
-                    )
-                    : vec3(0.0));
-
-            reflectedSceneRadiance +=
-                throughput * (
-                    evaluateOpaqueSurfaceRadiance(
+                    ) +
+                    evaluateDynamicLightDeterministicDirect(
                         hitPos,
                         hitNormal,
-                        -currentDirection,
                         hitAlbedo,
-                        hitRoughness,
-                        hitF0Metal,
-                        reflectionHitEmission,
-                        hitPomSelfShadow,
-                        sunDirection
+                        glassReflCamDist
                     ) +
-                    ((GI_GLASS_REFLECTION_LEGACY != 0 && glassReflCamDist < 32.0)
-                        ? evaluateVPTExactFaceDirectLighting(
-                            hitPos,
-                            hitNormal,
-                            hitAlbedo
-                        )
-                        : vec3(0.0)) +
-                    hitAlbedo * getSurfaceAmbientRadiance()
+                    hitAlbedo * evaluateDeterministicIndirectAmbient(hitNormal, 1.0)
                 );
 
             reachedTerminus = true;
@@ -179,33 +189,22 @@ vec3 traceGlassSceneReflectionOneRay(
             float waterCos =
                 clamp(-dot(currentDirection, waterNormal), 0.0, 1.0);
             float waterF = fresnelSchlickScalar(waterCos, 0.02);
+            vec3 waterMirrorDir =
+                normalize(reflect(currentDirection, waterNormal));
+            vec3 waterReflSky = mix(
+                waterScatterColorAt(hitPos.xz) * getSurfaceAmbientRadiance() * 0.6,
+                samplePhysicalClearSkyForAerialPerspective(waterMirrorDir),
+                smoothstep(-0.05, 0.25, waterMirrorDir.y)
+            );
+            vec3 waterTransBase =
+                hitAlbedo * evaluateDeterministicIndirectAmbient(waterNormal, 0.85);
 
             reflectedSceneRadiance +=
-                throughput * (1.0 - waterF) * hitAlbedo * (
-                    getSurfaceAmbientRadiance() +
-                    evaluateDirectSunLighting(
-                        hitPos,
-                        waterNormal,
-                        -currentDirection,
-                        vec3(1.0),
-                        0.9,
-                        0.0,
-                        1.0,
-                        sunDirection
-                    ) * 0.18
-                );
+                throughput * mix(waterTransBase, waterReflSky, waterF);
 
             rrGlassReflectionHitDistance = accumulatedDistance;
-            if(waterF < 0.02)
-            {
-                reachedTerminus = true;
-                break;
-            }
-
-            throughput *= waterF;
-            currentOrigin = hitPos + waterNormal * 0.002;
-            currentDirection = normalize(reflect(currentDirection, waterNormal));
-            continue;
+            reachedTerminus = true;
+            break;
         }
         else
         {
@@ -247,7 +246,8 @@ vec3 traceGlassSceneReflectionOneRay(
     {
         rrGlassReflectionHitDistance =
             accumulatedDistance > 0.0 ? accumulatedDistance : 65504.0;
-        reflectedSceneRadiance += throughput * getSurfaceAmbientRadiance();
+        reflectedSceneRadiance +=
+            throughput * evaluateDeterministicIndirectAmbient(-currentDirection, 1.0);
     }
 
     return reflectedSceneRadiance;

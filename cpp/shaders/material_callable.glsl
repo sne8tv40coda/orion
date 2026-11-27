@@ -111,7 +111,7 @@ void matCallableResolveToLanding(
     payload.state             = result.c.y;
     payload.emission          = result.d.xyz;
     payload.pomMicroOcclusion = result.d.w;
-    payload.parallaxRayTravel = result.e.x;
+    payload.parallaxRayTravel = uintBitsToFloat(result.c.z);
 }
 #endif // ORION_K2_NO_CALLABLE
 #endif // !ORION_MATERIAL_CALLABLE

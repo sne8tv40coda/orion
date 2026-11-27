@@ -185,7 +185,8 @@ vec3 directionForPixel(ivec2 pixel, ivec2 size)
 {
     vec2 uv = (vec2(pixel) + 0.5) / vec2(size);
     float azimuth = uv.x * 2.0 * PI;
-    float elevation = (uv.y - 0.5) * PI;
+    // 2026-11-27：仰角走 sky_model_common.glsl 的地平线加密映射（与读端同源）。
+    float elevation = skyLutElevationFromV(uv.y);
     float cosElevation = cos(elevation);
     return vec3(cos(azimuth) * cosElevation, sin(elevation),
         sin(azimuth) * cosElevation);

@@ -2406,7 +2406,7 @@ inline constexpr VkDeviceSize SECTION_MEMORY_POOL_HOST_KEEP_BYTES =
 //    旧 adopt 每建一块大的就销毁一块空闲小的，配合每 2 帧的实体重建在飞
 //    ⇒ 反复 vkAllocateMemory 16/32MB（[PERF L10 ALLOC] 3~5ms/次）。
 inline constexpr bool CPUPERF_STAGING_POOL_KEEP = true;
-inline constexpr size_t CPUPERF_STAGING_POOL_KEEP_SLOTS = 12u;
+inline constexpr size_t CPUPERF_STAGING_POOL_KEEP_SLOTS = 16u;
 // ④ 热路径日志不再逐条 flush（[RT SECTION SLOW]/[RT BLD BREAKDOWN]/
 //    [RT OMM GATE]），RTLogWrite 的时间戳按秒缓存（省掉每行 localtime+put_time）。
 inline constexpr bool CPUPERF_QUIET_HOT_LOGS = true;
@@ -2710,7 +2710,7 @@ static_assert(WATER_FFT_RESOLUTION == 512u, "shader WATER_FFT_N is 512");
 inline constexpr uint32_t WATER_FFT_LOG2 = 9u;
 inline constexpr uint32_t WATER_FFT_LOCAL_SIZE = 8u;
 inline constexpr uint32_t WATER_FFT_SLOPE_MIPS = WATER_FFT_LOG2 + 1u;
-inline constexpr uint32_t WATER_FFT_STATE_LAYERS = 4u;
+inline constexpr uint32_t WATER_FFT_STATE_LAYERS = 3u;
 inline constexpr float kWATER_FFT_DETAIL_TILE = 32.0f;
 inline constexpr float kWATER_FFT_DETAIL_MIN_WAVE_RADIUS = 32.0f;
 inline constexpr float kWATER_FFT_DETAIL_BOOST = 1.5f;
@@ -2764,8 +2764,8 @@ inline constexpr float WATER_CAUSTIC_MAP_REFERENCE_DEPTH = 1.0f;
 // 16 格，消费端再按实际高度补偿（见 rt_test.rgen 的 reflection 采样点）。
 inline constexpr float WATER_REFLECT_CAUSTIC_MAP_HEIGHT = 16.0f;
 inline constexpr uint32_t WATER_CAUSTIC_MAP_LAYER_REFRACT = 0u;
-inline constexpr uint32_t WATER_CAUSTIC_MAP_LAYER_REFLECT = 1u;
-inline constexpr uint32_t WATER_CAUSTIC_MAP_LAYERS = 2u;
+inline constexpr uint32_t WATER_CAUSTIC_MAP_LAYER_REFLECT = 0u;
+inline constexpr uint32_t WATER_CAUSTIC_MAP_LAYERS = 1u;
 
 // 与 water_caustic_map.vert / .frag 的 push 块逐字对应（2 × vec4 = 32 B）。
 struct WaterCausticMapPushConstants
@@ -4312,6 +4312,8 @@ inline constexpr const char* const RT_PIPELINE_SPV_FILES[] = {
     "shaders\\rt_test_k2sunA_ser.rgen.spv",
     "shaders\\rt_test_k2sunB.rgen.spv",
     "shaders\\rt_test_k2sunB_ser.rgen.spv",
+    "shaders\\rt_test_sharc_update.rgen.spv",
+    "shaders\\rt_test_sharc_update_ser.rgen.spv",
     // D1：材质层 callable（gen_material_callable.py 从 rt_test.rchit 生成）
     "shaders\\rt_test_material.spv",
     "shaders\\rt_test.rchit.spv",
@@ -6074,6 +6076,12 @@ extern bool g_rainPuddleLoggedGeometry;
 extern std::unordered_map<uint64_t, std::vector<uint8_t>>
     g_chunkRawPayloads;
 extern std::unordered_map<uint64_t, ChunkUploadDigest> g_chunkUploadDigests;
+inline constexpr uint64_t CHUNK_SECTION_XZ_MASK = (1ull << 44) - 1ull;
+extern std::unordered_map<uint64_t, std::unordered_set<uint64_t>> g_chunkColumnKeys;
+inline void registerChunkColumnKeyLocked(uint64_t key)
+{
+    g_chunkColumnKeys[key & CHUNK_SECTION_XZ_MASK].insert(key);
+}
 extern std::mutex g_visibleSectionKeysMutex;
 extern std::vector<uint64_t> g_visibleSectionKeys;
 extern std::atomic<uint32_t> g_visibleSectionKeyCount;
@@ -6115,6 +6123,11 @@ extern std::unordered_map<
     uint64_t,
     std::vector<LocalLightRecord>
 > g_lightSections;
+extern std::unordered_map<uint64_t, std::unordered_set<uint64_t>> g_lightColumnKeys;
+inline void registerLightColumnKeyLocked(uint64_t key)
+{
+    g_lightColumnKeys[key & CHUNK_SECTION_XZ_MASK].insert(key);
+}
 
 
 extern size_t
@@ -6688,6 +6701,7 @@ extern VkDescriptorPool g_waterFftDescriptorPool;
 extern VkDescriptorSet g_waterFftDescriptorSet;
 extern VkPipelineLayout g_waterFftPipelineLayout;
 extern VkPipeline g_waterFftPipeline;
+extern VkPipeline g_waterFftFusedPipeline;
 extern bool g_waterFftLayoutReady;
 extern int32_t g_waterFftWorkingLayer;
 extern std::chrono::steady_clock::time_point g_waterFftLastUpdate;

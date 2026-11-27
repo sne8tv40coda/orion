@@ -25,15 +25,14 @@
 
 struct PTLandingRecord
 {
-    // a: x=valid(1/0) y=hitDistance z=identityBaryX w=identityBaryY
+    // a: x=valid(1/0/0.25) y=hitDistance z=identityBaryX w=identityBaryY
     vec4 a;
-    // b: xyz=(资源槽位, primitiveIndex, baryX)，w=state（原位整数，不走 float 保真）
+    // b: xy=(资源槽位, primitiveIndex), z=packHalf2x16(dbgMotion), w=state（原位整数，不走 float 保真）
     uvec4 b;
-    // c..e: 预留（B③ landing 扩容候选槽），当前恒 0
+    // c: spatial material (Batch T)
     uvec4 c;
+    // d: glossyRaw.xyz + specHitDist
     vec4 d;
-    // e: zw = dbgMotion.xy（主变体在 depth/MV 写入处留下的调试图值）
-    vec4 e;
 };
 
 layout(std430, binding = 88) buffer PTLandingSSBO
@@ -65,8 +64,8 @@ void ptLandingInvalidate(uint index)
 void ptLandingMarkGlass(uint index, vec2 dbgMotion)
 {
     ptLandingRecords[index].a.x = 0.25;
+    ptLandingRecords[index].b.z = packHalf2x16(clamp(dbgMotion, vec2(-65000.0), vec2(65000.0)));
     ptLandingRecords[index].c.w = 0u;
-    ptLandingRecords[index].e.zw = dbgMotion;
 }
 
 // 切点身份快照。payload 此刻 = K1 精简 rchit 播种的身份五元组：
@@ -81,12 +80,11 @@ void ptLandingStore(uint index, vec2 dbgMotion)
     r.b = uvec4(
         floatBitsToUint(payload.normal.x),
         floatBitsToUint(payload.normal.y),
-        0u,
+        packHalf2x16(clamp(dbgMotion, vec2(-65000.0), vec2(65000.0))),
         payload.state
     );
     r.c = uvec4(0u);
     r.d = vec4(0.0);
-    r.e = vec4(0.0, 0.0, dbgMotion);
     ptLandingRecords[index] = r;
 }
 
@@ -111,7 +109,7 @@ bool ptLandingLoad(uint index, out vec2 dbgMotion)
     );
     payload.roughness = ra.w;
     payload.state = rb.w;
-    dbgMotion = ptLandingRecords[index].e.zw;
+    dbgMotion = unpackHalf2x16(rb.z);
     return true;
 }
 
@@ -210,16 +208,24 @@ void ptLandingStoreSpatialMaterial(
 // ============================================================================
 #if defined(ORION_K2_TRANSPORT)
 
+vec3 ptOctDecode(vec2 e)
+{
+    vec3 n = vec3(e.x, e.y, 1.0 - abs(e.x) - abs(e.y));
+    if(n.z < 0.0)
+    {
+        vec2 sgn = vec2(n.x >= 0.0 ? 1.0 : -1.0, n.y >= 0.0 ? 1.0 : -1.0);
+        n.xy = (1.0 - abs(n.yx)) * sgn;
+    }
+    return normalize(n);
+}
+
 struct MatReuseRecord
 {
-    // a: hitDistance / roughness / f0Metal / glassAlpha（浮点按位序存）
+    // a: hitDistance(f32), state(u32), albedoPacked(u32), packHalf2x16(roughness, f0Metal)
     uvec4 a;
-    // b: state / albedoPacked / parallaxRayTravelBits / pomSelfShadowBits
+    // b: octNormal(snorm2x16), packHalf2x16(emission.rg), packHalf2x16(emission.b, parallaxRayTravel),
+    //    [0..23]=unorm8x3(pomSelfShadow, pomMicroOcclusion, glassAlpha) | [24..31]=frameTag8(1..255)
     uvec4 b;
-    // c: normal.xyz 位序 / pomMicroOcclusionBits
-    uvec4 c;
-    // d: emission.xyz 位序 / valid(1=本帧生产者已写)
-    uvec4 d;
 };
 
 layout(std430, binding = 94) buffer MatReuseSSBO
@@ -233,38 +239,36 @@ uint matReuseRecordIndex(uint pixelLinear, int s)
     return pixelLinear * ptLandingSlotCount() + uint(s);
 }
 
-// 本帧标记。0 = 无生产者（缓冲初值），所以用 frameCount + 1。
-// 2026-11-17 修复：此前 d.w 恒写 1，消费者无法区分"本帧写的"与"上一帧留下的"，
-// 于是 SUN 腿在某类像素上没有产出时，LOC/I 会灌回上一帧的旧材质（已知不正确项）。
-// 现在必须标记相等才算有效，否则消费者退回原地解析 ⇒ 与无复用逐位同值。
+// 本帧标记。0 = 无生产者（缓冲初值），所以用 (frameCount % 255) + 1 ∈ [1..255]。
 uint matReuseFrameTag()
 {
-    return cam.frameCount + 1u;
+    return (cam.frameCount % 255u) + 1u;
 }
 
-// 把当前 payload 打进记录（浮点一律走位序，保证灌回时逐位同值）。
+// 把当前 payload 紧凑打包进 32 字节（2 x uvec4，对齐 L1/L2 32B sector）。
 void matReusePackRecord(out MatReuseRecord r, uint frameTag)
 {
+    const vec3 safeN = dot(payload.normal, payload.normal) > 1.0e-8
+        ? normalize(payload.normal)
+        : vec3(0.0, 1.0, 0.0);
+    const vec3 safeEm = clamp(payload.emission, vec3(0.0), vec3(65000.0));
+    const float safeParallax = clamp(payload.parallaxRayTravel, -65000.0, 65000.0);
+    const uint pomPacked = packUnorm4x8(vec4(
+        clamp(payload.pomSelfShadow, 0.0, 1.0),
+        clamp(payload.pomMicroOcclusion, 0.0, 1.0),
+        clamp(payload.glassAlpha, 0.0, 1.0),
+        0.0));
+
     r.a = uvec4(
         floatBitsToUint(payload.hitDistance),
-        floatBitsToUint(payload.roughness),
-        floatBitsToUint(payload.f0Metal),
-        floatBitsToUint(payload.glassAlpha));
-    r.b = uvec4(
         payload.state,
         payload.albedoPacked,
-        floatBitsToUint(payload.parallaxRayTravel),
-        floatBitsToUint(payload.pomSelfShadow));
-    r.c = uvec4(
-        floatBitsToUint(payload.normal.x),
-        floatBitsToUint(payload.normal.y),
-        floatBitsToUint(payload.normal.z),
-        floatBitsToUint(payload.pomMicroOcclusion));
-    r.d = uvec4(
-        floatBitsToUint(payload.emission.x),
-        floatBitsToUint(payload.emission.y),
-        floatBitsToUint(payload.emission.z),
-        frameTag);
+        packHalf2x16(vec2(payload.roughness, payload.f0Metal)));
+    r.b = uvec4(
+        packSnorm2x16(ptOctEncode(safeN)),
+        packHalf2x16(safeEm.rg),
+        packHalf2x16(vec2(safeEm.b, safeParallax)),
+        (pomPacked & 0x00FFFFFFu) | ((frameTag & 0xFFu) << 24u));
 }
 
 // 生产者：解析完成后落盘整条材质快照。
@@ -279,40 +283,31 @@ void matReuseStore(uint index)
 bool matReuseLoad(uint index, out MatReuseRecord r)
 {
     r = matReuseRecords[index];
-    return r.d.w == matReuseFrameTag();
+    return (r.b.w >> 24u) == matReuseFrameTag();
 }
 
-// 消费者：把记录字段灌回 payload（逐位还原）。
+// 消费者：把记录字段灌回 payload。
 void matReuseApply(in MatReuseRecord r)
 {
     payload.hitDistance = uintBitsToFloat(r.a.x);
-    payload.roughness = uintBitsToFloat(r.a.y);
-    payload.f0Metal = uintBitsToFloat(r.a.z);
-    payload.glassAlpha = uintBitsToFloat(r.a.w);
-    payload.state = r.b.x;
-    payload.albedoPacked = r.b.y;
-    payload.parallaxRayTravel = uintBitsToFloat(r.b.z);
-    payload.pomSelfShadow = uintBitsToFloat(r.b.w);
-    payload.normal = vec3(
-        uintBitsToFloat(r.c.x),
-        uintBitsToFloat(r.c.y),
-        uintBitsToFloat(r.c.z));
-    payload.pomMicroOcclusion = uintBitsToFloat(r.c.w);
-    payload.emission = vec3(
-        uintBitsToFloat(r.d.x),
-        uintBitsToFloat(r.d.y),
-        uintBitsToFloat(r.d.z));
+    payload.state = r.a.y;
+    payload.albedoPacked = r.a.z;
+    const vec2 rf = unpackHalf2x16(r.a.w);
+    payload.roughness = rf.x;
+    payload.f0Metal = rf.y;
+
+    payload.normal = ptOctDecode(unpackSnorm2x16(r.b.x));
+    const vec2 emRG = unpackHalf2x16(r.b.y);
+    const vec2 emBP = unpackHalf2x16(r.b.z);
+    payload.emission = vec3(emRG, emBP.x);
+    payload.parallaxRayTravel = emBP.y;
+
+    const vec4 pomU = unpackUnorm4x8(r.b.w & 0x00FFFFFFu);
+    payload.pomSelfShadow = pomU.x;
+    payload.pomMicroOcclusion = pomU.y;
+    payload.glassAlpha = pomU.z;
 }
 
-// 校验臂：把"原地解析后的当前 payload"与缓存记录逐位比对；不一致累加 reservedLane6。
-// 仅在计数器编译档（ORION_RT_STAGE_COUNTERS）下才有落盘缓冲；非计数器档本函数
-// 只做打包比对、不写任何缓冲。
-//
-// 2026-11-17 晚：再加一条诊断通道 —— reservedLane7 当**字段位图**累积（atomicOr）。
-// 位序：0-3 = a（hitDistance/roughness/f0Metal/glassAlpha）、4-7 = b（state/
-// albedoPacked/parallaxRayTravel/pomSelfShadow）、8-11 = c（normal.xyz/pomMicroOcclusion）、
-// 12-14 = d（emission.xyz）。跑完一局看这个 mask 就知道分歧落在哪个字段，
-// 不用再猜"是不是读到上一帧"。
 uint matReuseFieldDiffMask(in MatReuseRecord fresh, in MatReuseRecord cached)
 {
     uint mask = 0u;
@@ -333,22 +328,6 @@ uint matReuseFieldDiffMask(in MatReuseRecord fresh, in MatReuseRecord cached)
         }
     }
 
-    for(uint i = 0u; i < 4u; ++i)
-    {
-        if(fresh.c[i] != cached.c[i])
-        {
-            mask |= (1u << (8u + i));
-        }
-    }
-
-    for(uint i = 0u; i < 3u; ++i)
-    {
-        if(fresh.d[i] != cached.d[i])
-        {
-            mask |= (1u << (12u + i));
-        }
-    }
-
     return mask;
 }
 
@@ -358,9 +337,7 @@ void matReuseAssertCompare(in MatReuseRecord cached)
     matReusePackRecord(fresh, matReuseFrameTag());
     const bool same =
         fresh.a == cached.a &&
-        fresh.b == cached.b &&
-        fresh.c == cached.c &&
-        fresh.d.xyz == cached.d.xyz;
+        fresh.b == cached.b;
 #ifdef ORION_RT_STAGE_COUNTERS
     if(!same)
     {

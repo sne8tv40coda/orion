@@ -50,6 +50,17 @@ vec3 traceTransparentLowCostGI(
     }
 
 
+#if defined(RT_ENABLE_SER) && ORION_SER_FUSED_ONLY
+    serTraceRay(
+        hitPos + giDirection * 0.001,
+        0.02,
+        giDirection,
+        10000.0,
+        secondaryTraverseFlags(),
+        g_secondaryCullMask,
+        0u
+    );
+#else
 #ifdef RT_ENABLE_SER
     // Perf-L10.8: same ray, same flags; SER only reschedules the hit shader.
     if(cam.perfSerAb.z != 0u)
@@ -84,6 +95,7 @@ vec3 traceTransparentLowCostGI(
             0
         );
     }
+#endif
 
 
     vec3 incomingRadiance =
@@ -140,6 +152,34 @@ vec3 traceTransparentLowCostGI(
 }
 
 
+vec3 evaluateOpaqueSurfaceRadianceInMedium(
+    vec3 hitPos,
+    vec3 hitNormal,
+    vec3 viewDir,
+    vec3 hitAlbedo,
+    float hitRoughness,
+    float hitF0Metal,
+    vec3 hitEmission,
+    float pomSelfShadow,
+    vec3 sunDirection,
+    bool startInWater
+)
+{
+    return
+        hitEmission +
+        evaluateDirectSunLightingInMedium(
+            hitPos,
+            hitNormal,
+            viewDir,
+            hitAlbedo,
+            hitRoughness,
+            hitF0Metal,
+            pomSelfShadow,
+            sunDirection,
+            startInWater
+        );
+}
+
 vec3 evaluateOpaqueSurfaceRadiance(
     vec3 hitPos,
     vec3 hitNormal,
@@ -152,18 +192,18 @@ vec3 evaluateOpaqueSurfaceRadiance(
     vec3 sunDirection
 )
 {
-    return
-        hitEmission +
-        evaluateDirectSunLighting(
-            hitPos,
-            hitNormal,
-            viewDir,
-            hitAlbedo,
-            hitRoughness,
-            hitF0Metal,
-            pomSelfShadow,
-            sunDirection
-        );
+    return evaluateOpaqueSurfaceRadianceInMedium(
+        hitPos,
+        hitNormal,
+        viewDir,
+        hitAlbedo,
+        hitRoughness,
+        hitF0Metal,
+        hitEmission,
+        pomSelfShadow,
+        sunDirection,
+        false
+    );
 }
 // =====================================================
 // T1-2 Generic translucent straight transmission
@@ -209,6 +249,10 @@ struct WaterTransmissionInfo {
     // 算一次存这里，焦散不再重算。哨兵：负值 = 本 walker 未提供（消费端回退
     // 到旧的单发公式，逐位旧档）。
     vec3 cameraWaterColumnTransmittance;
+    // 2026-11-27 (Batch AE): Reuse direct-sun water transmittance captured by
+    // the water receiver path so underwater caustics avoid a duplicate sun trace.
+    vec3 receiverSunTransmittance;
+    float receiverSunTransmittanceValid;
 };
 
 // RR has one guide record per pixel.  When transmission contributes most of

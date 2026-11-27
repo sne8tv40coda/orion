@@ -700,7 +700,7 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_updateCamera(
     // 改成每 300 帧（约 5 秒）刷一条，用 Flushed 保证落盘。只读 env / 已缓存开关。
     if((static_cast<uint32_t>(nextFrame) % 300u) == 0u)
     {
-        RTLogFlushed(std::string("[SPARSE-DIAG] frame=") +
+        RTLog(std::string("[SPARSE-DIAG] frame=") +
             std::to_string(nextFrame) +
             " request=" + std::to_string(sparseRatePercent()) +
             "% effective=" + std::to_string(sparseRateForMask) +
@@ -891,7 +891,8 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_updateCamera(
 
     g_perfL10SppForLog.store(ubo->rtSampleParams[0], std::memory_order_relaxed);
     ubo->rtSampleParams[1] = g_giRoulette.load() != 0u ? 1.0f : 0.0f;
-    ubo->rtSampleParams[2] = static_cast<float>(g_sunMarchFarDistance.load());
+    // 2026-11-27: 太阳透射距离钳制已彻底移除（空气侧走单次 RT_PURPOSE_GLASS_VISIBILITY）。
+    ubo->rtSampleParams[2] = 0.0f;
     ubo->rtSampleParams[3] = waterAdaptiveEnabled()
         ? static_cast<float>(smoothedGpuFrameMs())
         : 0.0f;
@@ -951,7 +952,7 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_updateCamera(
         static uint32_t gateProbeCounter = 0u;
         if((gateProbeCounter++ % 300u) == 0u)
         {
-            RTLogFlushed(std::string("[GODRAY GATE] master=") +
+            RTLog(std::string("[GODRAY GATE] master=") +
                 std::to_string(ubo->godRayParams[0]) +
                 " dimension=" + std::to_string(ubo->weatherParams[2]) +
                 " godRayParams0z=" + std::to_string(ubo->godRayParams[2]));
@@ -3005,6 +3006,257 @@ if(!g_dlssGFeatureInitialized)
         renderWidth = customW;
         renderHeight = customH;
     }
+
+    // =====================================================
+    // 2026-11-27 显存准入守卫：「DLSS RR 拉到最高极其容易爆显存」（用户报告）
+    //
+    // 根因：本管线几乎所有中间量都按**渲染分辨率**逐像素分配，且单像素很重：
+    //   K1 landing 80 B×spp + 材质复用 64 B×spp + VPT 直射历史 2×48 B +
+    //   RR G-buffer 41 B + 紧凑槽 24 B + GI 时域 2×8 B（玻璃 alpha-blend 已由 Batch AE 回收）
+    //   + k2GiTrace/k2Direct 各 8 B + RT 输出/motion/hitOffset/深度 …
+    //   ⇒ spp=1 时约 300+144 B/渲染像素（静态估算，见交接文档）。
+    // 2122×1129 下 超性能(707×376) → DLAA(2122×1129) 像素数 ×9：约 110 MB → ~1.06 GB，
+    // 再加 DLSS-RR 自身（实测 UP 114.8 MB，按模型 DLAA ≈ 215 MB）。日志里复杂地图
+    // 常态 used 5.5~5.9 GB / budget 6.8~7.0 GB，余量只有 ~1.1 GB ⇒ 一拉 DLAA 必超。
+    //
+    // 做法：仅在「请求的渲染尺寸 / 档位 / 输出尺寸」变化时评估一次（不是每帧）：
+    //   预计占用 = 当前 used − 当前渲染分辨率估算 − 当前 RR 实测
+    //            + 新渲染分辨率估算 + 新 RR 估算
+    // 超过 budget − 预留(max(512 MB, 7%)) 就按 DLAA→质量→平衡→性能→超性能
+    // 逐档下探，取第一个放得下的档位（都放不下取超性能），并打 [VRAM GUARD]。
+    // 不改用户存档里的档位：显存宽裕（换小地图/降分辨率/重进）后再动一次设置即恢复。
+    // A/B：-DORION_RR_VRAM_GUARD=0 逐位回到旧行为。
+    // =====================================================
+#ifndef ORION_RR_VRAM_GUARD
+#define ORION_RR_VRAM_GUARD 1
+#endif
+#if ORION_RR_VRAM_GUARD
+    if(!useSR && g_dlssRRReady && g_slDLSSDGetOptimalSettings != nullptr)
+    {
+        struct RrVramGuardDecision
+        {
+            bool valid = false;
+            uint32_t outW = 0u;
+            uint32_t outH = 0u;
+            int rrMode = -1;
+            int customPct = -1;
+            uint32_t reqW = 0u;
+            uint32_t reqH = 0u;
+            bool downgraded = false;
+            sl::DLSSMode mode = sl::DLSSMode::eOff;
+            uint32_t renderW = 0u;
+            uint32_t renderH = 0u;
+        };
+        static RrVramGuardDecision s_rrVramGuard{};
+
+        const bool guardKeyChanged =
+            !s_rrVramGuard.valid ||
+            s_rrVramGuard.outW != outputWidth ||
+            s_rrVramGuard.outH != outputHeight ||
+            s_rrVramGuard.rrMode != rrMode ||
+            s_rrVramGuard.customPct != customUpscalePct ||
+            s_rrVramGuard.reqW != renderWidth ||
+            s_rrVramGuard.reqH != renderHeight;
+
+        if(guardKeyChanged)
+        {
+            s_rrVramGuard = RrVramGuardDecision{};
+            s_rrVramGuard.valid = true;
+            s_rrVramGuard.outW = outputWidth;
+            s_rrVramGuard.outH = outputHeight;
+            s_rrVramGuard.rrMode = rrMode;
+            s_rrVramGuard.customPct = customUpscalePct;
+            s_rrVramGuard.reqW = renderWidth;
+            s_rrVramGuard.reqH = renderHeight;
+
+            VramBudgetSample vram{};
+            if(queryVramBudget(vram) && vram.budgetMb > 0.0)
+            {
+                const float sppNow = std::clamp(g_perfRtSpp.load(), 0.5f, 4.0f);
+                const double slots =
+                    static_cast<double>(std::max(1, static_cast<int>(sppNow + 0.5f)));
+                const double bytesPerRenderPixel = 300.0 + 96.0 * slots;
+                const double outPixels =
+                    static_cast<double>(outputWidth) * static_cast<double>(outputHeight);
+
+                // DLSS-RR 自身显存模型：≈ 10 MB + 43 B ×（输入像素 + 输出像素）
+                // （由 854×480 UP = 29.2 MB 与 2122×1129 UP = 114.8 MB 两点拟合）。
+                auto rrModelMb = [&](double inPixels) -> double {
+                    return 10.0 + 43.0 * (inPixels + outPixels) / 1048576.0;
+                };
+
+                const double curPixels =
+                    (g_rtOutputImage != VK_NULL_HANDLE)
+                        ? static_cast<double>(g_rtOutputWidth) *
+                              static_cast<double>(g_rtOutputHeight)
+                        : 0.0;
+                const double curRenderMb = curPixels * bytesPerRenderPixel / 1048576.0;
+                const double curRrMeasuredMb =
+                    static_cast<double>(g_slVramDlssdBytes.load()) / 1048576.0;
+                const double curRrMb =
+                    curPixels > 0.0 ? curRrMeasuredMb : 0.0;
+                // 用实测校准模型（实测缺失时按 1.0），钳到 0.5..3 防异常值。
+                const double rrCalib =
+                    (curPixels > 0.0 && curRrMeasuredMb > 1.0)
+                        ? std::clamp(curRrMeasuredMb / rrModelMb(curPixels), 0.5, 3.0)
+                        : 1.0;
+
+                const double baseMb =
+                    std::max(0.0, vram.usedMb - curRenderMb - curRrMb);
+                const double reserveMb = std::max(512.0, vram.budgetMb * 0.07);
+                const double limitMb = vram.budgetMb - reserveMb;
+
+                auto projectedMb = [&](uint32_t w, uint32_t h) -> double {
+                    const double px = static_cast<double>(w) * static_cast<double>(h);
+                    return baseMb + px * bytesPerRenderPixel / 1048576.0 +
+                        rrModelMb(px) * rrCalib;
+                };
+
+                const double requestedMb = projectedMb(renderWidth, renderHeight);
+                if(requestedMb > limitMb)
+                {
+                    const sl::DLSSMode ladder[] = {
+                        sl::DLSSMode::eDLAA,
+                        sl::DLSSMode::eMaxQuality,
+                        sl::DLSSMode::eBalanced,
+                        sl::DLSSMode::eMaxPerformance,
+                        sl::DLSSMode::eUltraPerformance
+                    };
+                    int start = 0;
+                    for(int i = 0; i < 5; ++i)
+                    {
+                        if(ladder[i] == rrOptions.mode)
+                        {
+                            start = i + 1;
+                            break;
+                        }
+                    }
+
+                    sl::DLSSMode chosenMode = rrOptions.mode;
+                    uint32_t chosenW = renderWidth;
+                    uint32_t chosenH = renderHeight;
+                    double chosenMb = requestedMb;
+                    bool found = false;
+                    for(int i = start; i < 5 && !found; ++i)
+                    {
+                        sl::DLSSDOptions probe = rrOptions;
+                        probe.mode = ladder[i];
+                        sl::DLSSDOptimalSettings probeOptimal{};
+                        if(g_slDLSSDGetOptimalSettings(probe, probeOptimal) != sl::Result::eOk ||
+                           probeOptimal.optimalRenderWidth == 0u ||
+                           probeOptimal.optimalRenderHeight == 0u)
+                        {
+                            continue;
+                        }
+                        chosenMode = ladder[i];
+                        chosenW = probeOptimal.optimalRenderWidth;
+                        chosenH = probeOptimal.optimalRenderHeight;
+                        chosenMb = projectedMb(chosenW, chosenH);
+                        // 循环跑完仍放不下时停在最后一个有效档（超性能）。
+                        found = chosenMb <= limitMb;
+                    }
+
+                    if(chosenMode != rrOptions.mode)
+                    {
+                        s_rrVramGuard.downgraded = true;
+                        s_rrVramGuard.mode = chosenMode;
+                        s_rrVramGuard.renderW = chosenW;
+                        s_rrVramGuard.renderH = chosenH;
+                    }
+
+                    std::ostringstream guardLog;
+                    guardLog << "[VRAM GUARD] RR request "
+                             << renderWidth << "x" << renderHeight
+                             << " mode=" << static_cast<int>(rrOptions.mode)
+                             << " projected=" << static_cast<int>(requestedMb) << "MB"
+                             << " limit=" << static_cast<int>(limitMb) << "MB"
+                             << " (used=" << static_cast<int>(vram.usedMb)
+                             << " budget=" << static_cast<int>(vram.budgetMb)
+                             << " curRender=" << static_cast<int>(curRenderMb)
+                             << " curRR=" << static_cast<int>(curRrMb)
+                             << " B/px=" << static_cast<int>(bytesPerRenderPixel)
+                             << ") -> "
+                             << (s_rrVramGuard.downgraded ? "downgrade " : "keep ")
+                             << chosenW << "x" << chosenH
+                             << " mode=" << static_cast<int>(chosenMode)
+                             << " projected=" << static_cast<int>(chosenMb) << "MB"
+                             << (found ? "" : " (still over, smallest tier)");
+                    RTLog(guardLog.str());
+                }
+            }
+        }
+
+        if(s_rrVramGuard.downgraded)
+        {
+            rrOptions.mode = s_rrVramGuard.mode;
+            renderWidth = s_rrVramGuard.renderW;
+            renderHeight = s_rrVramGuard.renderH;
+        }
+    }
+#endif
+
+    // =====================================================
+    // 2026-11-27 切档/改尺寸时立即归还旧的 DLSS 特性显存。
+    //
+    // 旧代码只对 DLSS-G 调 slFreeResources；DLSS-RR / DLSS-SR 换档、改输出尺寸、
+    // RR↔SR 互切时，旧 NGX 特性由插件延迟回收，新特性又同帧创建 ⇒ 切换瞬间
+    // 新旧两份 + 新渲染分辨率资源同时在显存里，正是"一拉就爆"的峰值。
+    // 这里在**有效渲染配置**变化的那一帧先 WaitIdle、再释放上一配置所属特性，
+    // 下一次 Evaluate 由 Streamline 按新 options 惰性重建。逐帧无成本。
+    // A/B：-DORION_RR_FREE_ON_RESIZE=0。
+    // =====================================================
+#ifndef ORION_RR_FREE_ON_RESIZE
+#define ORION_RR_FREE_ON_RESIZE 1
+#endif
+#if ORION_RR_FREE_ON_RESIZE
+    {
+        static bool s_upscaleCfgValid = false;
+        static bool s_upscaleCfgSR = false;
+        static int s_upscaleCfgMode = -1;
+        static uint32_t s_upscaleCfgOutW = 0u;
+        static uint32_t s_upscaleCfgOutH = 0u;
+        static uint32_t s_upscaleCfgRenderW = 0u;
+        static uint32_t s_upscaleCfgRenderH = 0u;
+
+        const int cfgModeNow = static_cast<int>(useSR ? srOptions.mode : rrOptions.mode);
+        const bool cfgChanged =
+            s_upscaleCfgValid &&
+            (s_upscaleCfgSR != useSR ||
+             s_upscaleCfgMode != cfgModeNow ||
+             s_upscaleCfgOutW != outputWidth ||
+             s_upscaleCfgOutH != outputHeight ||
+             s_upscaleCfgRenderW != renderWidth ||
+             s_upscaleCfgRenderH != renderHeight);
+
+        if(cfgChanged && g_slFreeResources != nullptr)
+        {
+            FGDeviceWaitIdle(g_device);
+            const sl::Feature previousFeature =
+                s_upscaleCfgSR ? sl::kFeatureDLSS : sl::kFeatureDLSS_RR;
+            const sl::Result freeResult =
+                g_slFreeResources(previousFeature, g_dlssViewport);
+            RTLog(
+                std::string("[UPSCALER FREE] ") +
+                (s_upscaleCfgSR ? "SR" : "RR") +
+                " mode=" + std::to_string(s_upscaleCfgMode) +
+                " render=" + std::to_string(s_upscaleCfgRenderW) + "x" +
+                std::to_string(s_upscaleCfgRenderH) +
+                " -> " + (useSR ? "SR" : "RR") +
+                " mode=" + std::to_string(cfgModeNow) +
+                " render=" + std::to_string(renderWidth) + "x" +
+                std::to_string(renderHeight) +
+                " result=" + std::to_string(static_cast<int>(freeResult)));
+        }
+
+        s_upscaleCfgValid = true;
+        s_upscaleCfgSR = useSR;
+        s_upscaleCfgMode = cfgModeNow;
+        s_upscaleCfgOutW = outputWidth;
+        s_upscaleCfgOutH = outputHeight;
+        s_upscaleCfgRenderW = renderWidth;
+        s_upscaleCfgRenderH = renderHeight;
+    }
+#endif
 
     static bool rr53Printed =
     false;
@@ -6383,13 +6635,13 @@ vkCmdPipelineBarrier(
 
                     (
                         g_dlssOutputWidth +
-                        63
-                    ) / 64,
+                        31
+                    ) / 32,
 
                     (
                         g_dlssOutputHeight +
-                        63
-                    ) / 64,
+                        31
+                    ) / 32,
 
                     1
                 );

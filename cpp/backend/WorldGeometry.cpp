@@ -689,15 +689,14 @@ bool rebuildWorldGeometry(
         {
             static size_t sSelfHealPhase = 0u;
 
-            std::lock_guard<std::timed_mutex> lock(g_chunkMutex);
-
             const size_t total = g_sectionBLAS.size();
             const size_t stride = std::max<size_t>(
                 1u,
                 total / std::max<size_t>(1u, sSelfHealPerSecond));
 
+            std::vector<uint64_t> healKeys;
+            healKeys.reserve(sSelfHealPerSecond + 2u);
             size_t index = 0u;
-            size_t healed = 0u;
 
             for(auto it = g_sectionBLAS.begin();
                 it != g_sectionBLAS.end();
@@ -719,20 +718,28 @@ bool rebuildWorldGeometry(
                     continue;
                 }
 
-                const uint64_t spatialKey =
-                    it->second.sectionKey & SPATIAL_SECTION_KEY_MASK;
-
-                if(g_dirtySectionKeys.insert(spatialKey).second)
-                {
-                    ++healed;
-                }
+                healKeys.push_back(
+                    it->second.sectionKey & SPATIAL_SECTION_KEY_MASK
+                );
             }
 
             sSelfHealPhase = (sSelfHealPhase + 1u) % stride;
 
-            if(healed > 0u)
+            if(!healKeys.empty())
             {
-                markWorldGeometryDirty();
+                std::lock_guard<std::timed_mutex> lock(g_chunkMutex);
+                size_t healed = 0u;
+                for(const uint64_t spatialKey : healKeys)
+                {
+                    if(g_dirtySectionKeys.insert(spatialKey).second)
+                    {
+                        ++healed;
+                    }
+                }
+                if(healed > 0u)
+                {
+                    markWorldGeometryDirty();
+                }
             }
         }
 
@@ -1978,10 +1985,19 @@ bool rebuildWorldGeometry(
     size_t terrainCountNow = 0u;
     uint64_t dynamicFingerprintNow = 0xcbf29ce484222325ull;
     size_t dynamicCountNow = 0u;
+    bool hasAnyLodInBlas = false;
     s_dynamicSectionsScratch.clear();
 
     for(auto& fingerprintEntry : g_sectionBLAS)
     {
+        const uint64_t entrySpatialKey =
+            fingerprintEntry.first & SPATIAL_SECTION_KEY_MASK;
+        if(!hasAnyLodInBlas &&
+           (((fingerprintEntry.first & VOXY_LOD_RESERVED_Y) == VOXY_LOD_RESERVED_Y) ||
+            isDhLodSpatialKey(entrySpatialKey)))
+        {
+            hasAnyLodInBlas = true;
+        }
         uint64_t entryHash = 0xcbf29ce484222325ull;
         entryHash = (entryHash ^ fingerprintEntry.first) * 0x100000001b3ull;
         entryHash =
@@ -2183,10 +2199,22 @@ bool rebuildWorldGeometry(
         }
 
 
-        rebuildLodCoverage(
-            orderedSections
-        );
+        static bool s_lodCoverageClearedWhenEmpty = false;
+        if(hasAnyLodInBlas)
+        {
+            s_lodCoverageClearedWhenEmpty = false;
+            rebuildLodCoverage(
+                orderedSections
+            );
+        }
+        else if(!s_lodCoverageClearedWhenEmpty)
+        {
+            s_lodCoverageClearedWhenEmpty = true;
+            rebuildLodCoverage({});
+        }
     } // end of sectionSetChanged
+
+    rtxPreCmdAfterOrdered = std::chrono::steady_clock::now();
 
 
     constexpr size_t MAX_TLAS_CUSTOM_INDEX_COUNT =
@@ -2689,11 +2717,9 @@ bool rebuildWorldGeometry(
             float distanceSq = 0.0f;
         };
 
-        rtxPreCmdAfterOrdered = std::chrono::steady_clock::now();
-
         // 2026-11-12：evict 内部分段打点（只计时）。
         const std::chrono::steady_clock::time_point evictBlockStart =
-            rtxPreCmdAfterOrdered;
+            std::chrono::steady_clock::now();
 
         // 2026-11-06：候选容器改成静态复用。
         // 段数驱动驱逐让这段每 4 帧就跑一次，每次重建 ~4000 个哈希节点
@@ -3082,6 +3108,24 @@ bool rebuildWorldGeometry(
         }
 
 
+        static int diagBandCount[7] = {};
+        static uint64_t diagBandTriangles[7] = {};
+        static uint64_t diagTotalTriangles = 0;
+        static int diagCulledCount = 0;
+        static int diagFrustumCulled = 0;
+        static int diagCasterCulled = 0;
+        static std::chrono::steady_clock::time_point diagLastPrint{};
+        static bool diagLastPrintValid = false;
+        const int diagCullLimit = g_tlasCullDistance.load();
+        const CameraUBO* diagUbo =
+            g_cameraUboMapped != nullptr
+                ? static_cast<const CameraUBO*>(g_cameraUboMapped)
+                : nullptr;
+        const float diagCenterX = diagUbo ? diagUbo->playerX : 0.0f;
+        const float diagCenterZ = diagUbo ? diagUbo->playerZ : 0.0f;
+        const float diagCenterY = diagUbo ? diagUbo->playerY : 0.0f;
+        const bool entityInstancesEmpty = g_entityMeshInstances.empty();
+
         for(
             uint32_t instanceIndex = 0;
             instanceIndex <
@@ -3114,30 +3158,11 @@ bool rebuildWorldGeometry(
                 const float sectionWorldY = static_cast<float>(
                     signExtend((spatialKey >> 44) & 0xFFFFull, 16)) * 16.0f + 8.0f;
 
-                const CameraUBO* diagUbo =
-                    g_cameraUboMapped != nullptr
-                        ? static_cast<const CameraUBO*>(g_cameraUboMapped)
-                        : nullptr;
-                const float diagCenterX = diagUbo ? diagUbo->playerX : 0.0f;
-                const float diagCenterZ = diagUbo ? diagUbo->playerZ : 0.0f;
-                const float diagCenterY = diagUbo ? diagUbo->playerY : 0.0f;
-
                 const float diagDx = sectionWorldX - diagCenterX;
                 const float diagDy = sectionWorldY - diagCenterY;
                 const float diagDz = sectionWorldZ - diagCenterZ;
                 diagDistance = std::sqrt(
                     diagDx * diagDx + diagDy * diagDy + diagDz * diagDz);
-
-                static int diagBandCount[7] = {};
-                static uint64_t diagBandTriangles[7] = {};
-                static uint64_t diagTotalTriangles = 0;
-                static int diagCulledCount = 0;
-                static int diagFrustumCulled = 0;
-                static int diagCasterCulled = 0;
-                static int diagCullLimit = 0;
-                static std::chrono::steady_clock::time_point diagLastPrint{};
-                static bool diagLastPrintValid = false;
-                diagCullLimit = g_tlasCullDistance.load();
 
                 int diagBand =
                     diagDistance < 32.0f ? 0 :
@@ -3150,55 +3175,6 @@ bool rebuildWorldGeometry(
                 diagBandCount[diagBand] += 1;
                 diagBandTriangles[diagBand] += section.triangleCount;
                 diagTotalTriangles += section.triangleCount;
-
-                const auto diagNow = std::chrono::steady_clock::now();
-                if(!diagLastPrintValid ||
-                   std::chrono::duration<float>(diagNow - diagLastPrint).count() > 5.0f)
-                {
-                    if(diagLastPrintValid)
-                    {
-                        RTLogFlushed(std::string("[CULL DIAG]") +
-                            " total=" + std::to_string(
-                                diagBandCount[0] + diagBandCount[1] + diagBandCount[2] +
-                                diagBandCount[3] + diagBandCount[4] + diagBandCount[5] +
-                                diagBandCount[6]) +
-                            " d<32=" + std::to_string(diagBandCount[0]) +
-                            " 32-64=" + std::to_string(diagBandCount[1]) +
-                            " 64-96=" + std::to_string(diagBandCount[2]) +
-                            " 96-128=" + std::to_string(diagBandCount[3]) +
-                            " 128-192=" + std::to_string(diagBandCount[4]) +
-                            " 192-256=" + std::to_string(diagBandCount[5]) +
-                            " >=256=" + std::to_string(diagBandCount[6]) +
-                            " tris=" + std::to_string(diagTotalTriangles) +
-                            " culled=" + std::to_string(diagCulledCount) +
-                            " frustumCulled=" + std::to_string(diagFrustumCulled) +
-                            " casterCulled=" + std::to_string(diagCasterCulled) +
-                            " primaryMasked=" + std::to_string(s_cullPrimaryMaskedCount) +
-                            " visKeys=" + std::to_string(
-                                g_visibleSectionKeyCount.load()) +
-                            " visCand=" + std::to_string(s_visCullCandidateCount) +
-                            " visMode=" + std::to_string(visibleSectionCullMode()) +
-                            " cullDist=" + std::to_string(diagCullLimit) +
-                            " mode=" + std::to_string(tlasCullModeValue) +
-                            " casterPlanes=" + std::to_string(s_casterPlaneCount) +
-                            " keepBox=" + std::to_string(cullKeepBoxEnabled ? 1 : 0) +
-                            " nearGuard=" + std::to_string(
-                                static_cast<int>(cullNearGuardBlocks)) +
-                            " planes=" + std::to_string(s_tlasFrustumPlanesValid ? 1 : 0) +
-                            " base=" + std::to_string(s_tlasBasePlanesValid ? 1 : 0) +
-                            " sun=" + std::to_string(s_sunShadowKeepValid ? 1 : 0));
-                    }
-                    diagLastPrint = diagNow;
-                    diagLastPrintValid = true;
-                    std::fill(std::begin(diagBandCount), std::end(diagBandCount), 0);
-                    std::fill(std::begin(diagBandTriangles), std::end(diagBandTriangles), 0);
-                    diagTotalTriangles = 0;
-                    diagCulledCount = 0;
-                    diagFrustumCulled = 0;
-                    diagCasterCulled = 0;
-                    s_cullPrimaryMaskedCount = 0;
-                    s_visCullCandidateCount = 0;
-                }
 
                 const int32_t diagSectionY =
                     static_cast<int32_t>(
@@ -3511,8 +3487,9 @@ bool rebuildWorldGeometry(
             // 2026-11-12 实例化第 2 步：该 mesh 若登记了 N 组变换，就发 N 个实例
             // （共享同一个 BLAS / vertexAddressSlot，只是实例矩阵不同）。
             // 命中着色器已用 gl_ObjectToWorldEXT 把局部顶点变回世界（第 1 步）。
-            const auto instanceIt =
-                g_entityMeshInstances.find(section.sectionKey);
+            const auto instanceIt = entityInstancesEmpty
+                ? g_entityMeshInstances.end()
+                : g_entityMeshInstances.find(section.sectionKey);
 
             if(instanceIt != g_entityMeshInstances.end() &&
                instanceIt->second.size() >= 12u)
@@ -3560,6 +3537,66 @@ bool rebuildWorldGeometry(
                     instance
                 );
             }
+        }
+
+        const auto diagNow = std::chrono::steady_clock::now();
+        if(!diagLastPrintValid ||
+           std::chrono::duration<float>(diagNow - diagLastPrint).count() > 5.0f)
+        {
+            if(diagLastPrintValid)
+            {
+                RTLog(std::string("[CULL DIAG]") +
+                    " total=" + std::to_string(
+                        diagBandCount[0] + diagBandCount[1] + diagBandCount[2] +
+                        diagBandCount[3] + diagBandCount[4] + diagBandCount[5] +
+                        diagBandCount[6]) +
+                    " d<32=" + std::to_string(diagBandCount[0]) +
+                    " 32-64=" + std::to_string(diagBandCount[1]) +
+                    " 64-96=" + std::to_string(diagBandCount[2]) +
+                    " 96-128=" + std::to_string(diagBandCount[3]) +
+                    " 128-192=" + std::to_string(diagBandCount[4]) +
+                    " 192-256=" + std::to_string(diagBandCount[5]) +
+                    " >=256=" + std::to_string(diagBandCount[6]) +
+                    " tris=" + std::to_string(diagTotalTriangles) +
+                    " culled=" + std::to_string(diagCulledCount) +
+                    " frustumCulled=" + std::to_string(diagFrustumCulled) +
+                    " casterCulled=" + std::to_string(diagCasterCulled) +
+                    " primaryMasked=" + std::to_string(s_cullPrimaryMaskedCount) +
+                    " visKeys=" + std::to_string(
+                        g_visibleSectionKeyCount.load()) +
+                    " visCand=" + std::to_string(s_visCullCandidateCount) +
+                    " visMode=" + std::to_string(visibleSectionCullMode()) +
+                    " cullDist=" + std::to_string(diagCullLimit) +
+                    " mode=" + std::to_string(tlasCullModeValue) +
+                    " casterPlanes=" + std::to_string(s_casterPlaneCount) +
+                    " keepBox=" + std::to_string(cullKeepBoxEnabled ? 1 : 0) +
+                    " nearGuard=" + std::to_string(
+                        static_cast<int>(cullNearGuardBlocks)) +
+                    " planes=" + std::to_string(s_tlasFrustumPlanesValid ? 1 : 0) +
+                    " base=" + std::to_string(s_tlasBasePlanesValid ? 1 : 0) +
+                    " sun=" + std::to_string(s_sunShadowKeepValid ? 1 : 0));
+            }
+            diagLastPrint = diagNow;
+            diagLastPrintValid = true;
+            std::fill(std::begin(diagBandCount), std::end(diagBandCount), 0);
+            std::fill(std::begin(diagBandTriangles), std::end(diagBandTriangles), 0);
+            diagTotalTriangles = 0;
+            diagCulledCount = 0;
+            diagFrustumCulled = 0;
+            diagCasterCulled = 0;
+            s_cullPrimaryMaskedCount = 0;
+            s_visCullCandidateCount = 0;
+        }
+        else
+        {
+            std::fill(std::begin(diagBandCount), std::end(diagBandCount), 0);
+            std::fill(std::begin(diagBandTriangles), std::end(diagBandTriangles), 0);
+            diagTotalTriangles = 0;
+            diagCulledCount = 0;
+            diagFrustumCulled = 0;
+            diagCasterCulled = 0;
+            s_cullPrimaryMaskedCount = 0;
+            s_visCullCandidateCount = 0;
         }
     }
 
@@ -4522,7 +4559,7 @@ bool rebuildWorldGeometry(
                 s_tlasUpdateLastValid = true;
                 s_tlasUpdateLastPrint = tlasUpdateNow;
 
-                RTLogFlushed(std::string("[TLAS UPDATE] mode=") +
+                RTLog(std::string("[TLAS UPDATE] mode=") +
                     (updateTlas ? "UPDATE" : "BUILD") +
                     " reason=" + tlasUpdateRejectReason +
                     " instances=" + std::to_string(instances.size()));
@@ -4772,7 +4809,7 @@ bool rebuildWorldGeometry(
         if(!s_tlasSkipLastValid ||
            std::chrono::duration<float>(skipNow - s_tlasSkipLastPrint).count() > 5.0f)
         {
-            RTLogFlushed(std::string("[TLAS SKIP]") +
+            RTLog(std::string("[TLAS SKIP]") +
                 (tlasInstancesUnchanged ? " skipped=true" : " skipped=false") +
                 " instances=" + std::to_string(instances.size()));
             s_tlasSkipLastPrint = skipNow;

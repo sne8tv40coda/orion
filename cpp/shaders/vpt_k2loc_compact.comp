@@ -20,7 +20,6 @@ struct PTLandingRecord
     uvec4 b;
     uvec4 c;
     vec4 d;
-    vec4 e;
 };
 
 layout(std430, binding = 88, set = 0) buffer PTLandingSSBO
@@ -34,8 +33,6 @@ struct MatReuseRecord
 {
     uvec4 a;
     uvec4 b;
-    uvec4 c;
-    uvec4 d;
 };
 
 layout(std430, binding = 94, set = 0) readonly buffer MatReuseSSBO
@@ -63,6 +60,17 @@ layout(std430, binding = 100, set = 0) buffer K2iSparseCompactSSBO
 
 const float SOLAR_LATITUDE_35_SIN = 0.57357643635;
 const float SOLAR_LATITUDE_35_COS = 0.81915204429;
+
+vec3 ptOctDecode(vec2 e)
+{
+    vec3 n = vec3(e.x, e.y, 1.0 - abs(e.x) - abs(e.y));
+    if(n.z < 0.0)
+    {
+        vec2 sgn = vec2(n.x >= 0.0 ? 1.0 : -1.0, n.y >= 0.0 ? 1.0 : -1.0);
+        n.xy = (1.0 - abs(n.yx)) * sgn;
+    }
+    return normalize(n);
+}
 
 uint pcgHash(inout uint state)
 {
@@ -147,14 +155,14 @@ void main()
                     {
                         const MatReuseRecord mr = matReuseRecords[linearIdx];
                         const bool matReuseValid =
-                            (cam.matReuseAb.x != 0u) && (mr.d.w == (cam.frameCount + 1u));
+                            (cam.matReuseAb.x != 0u) && ((mr.b.w >> 24u) == ((cam.frameCount % 255u) + 1u));
                         if(!matReuseValid)
                         {
                             activePixel = true;
                         }
                         else
                         {
-                            const uint hitClass = (mr.b.x >> 3u) & 0x3u;
+                            const uint hitClass = (mr.a.y >> 3u) & 0x3u;
                             activePixel = (hitClass != 1u);
                         }
                     }
@@ -169,24 +177,21 @@ void main()
             {
                 const MatReuseRecord mr = matReuseRecords[linearIdx];
                 const bool matReuseValid =
-                    (cam.matReuseAb.x != 0u) && (mr.d.w == (cam.frameCount + 1u));
+                    (cam.matReuseAb.x != 0u) && ((mr.b.w >> 24u) == ((cam.frameCount % 255u) + 1u));
                 if(!matReuseValid)
                 {
                     activePixel = true;
                 }
                 else
                 {
-                    const uint hitClass = (mr.b.x >> 3u) & 0x3u;
+                    const uint hitClass = (mr.a.y >> 3u) & 0x3u;
                     if(hitClass != 1u)
                     {
                         const float primaryHitDistance = max(uintBitsToFloat(mr.a.x), 0.0);
-                        const float roughness = uintBitsToFloat(mr.a.y);
-                        const float f0Metal = uintBitsToFloat(mr.a.z);
-                        const vec3 hitNormal = vec3(
-                            uintBitsToFloat(mr.c.x),
-                            uintBitsToFloat(mr.c.y),
-                            uintBitsToFloat(mr.c.z)
-                        );
+                        const vec2 rf = unpackHalf2x16(mr.a.w);
+                        const float roughness = rf.x;
+                        const float f0Metal = rf.y;
+                        const vec3 hitNormal = ptOctDecode(unpackSnorm2x16(mr.b.x));
                         const float normalY = hitNormal.y;
                         const int f0MetalCode = int(round(clamp(f0Metal, 0.0, 1.0) * 255.0));
                         const float tierScale = (cam.perfAblationStage.x == 13u) ? 0.5 : 1.0;
@@ -355,14 +360,20 @@ void main()
         {
             s_wgBase = atomicAdd(k2iCompact.headers[2].activeCount, s_wgCount);
             const uint compactHeight = max(k2iCompact.headers[2].height, 1u);
-            const uint neededCols = (s_wgBase + s_wgCount + compactHeight - 1u) / compactHeight;
+            const uint endCount = s_wgBase + s_wgCount;
+            const uint neededCols = (compactHeight == 1u)
+                ? endCount
+                : ((endCount + compactHeight - 1u) / compactHeight);
             atomicMax(k2iCompact.headers[2].width, neededCols);
         }
         else
         {
             s_wgBase = atomicAdd(k2iCompact.headers[3].activeCount, s_wgCount);
             const uint compactHeight = max(k2iCompact.headers[3].height, 1u);
-            const uint neededCols = (s_wgBase + s_wgCount + compactHeight - 1u) / compactHeight;
+            const uint endCount = s_wgBase + s_wgCount;
+            const uint neededCols = (compactHeight == 1u)
+                ? endCount
+                : ((endCount + compactHeight - 1u) / compactHeight);
             atomicMax(k2iCompact.headers[3].width, neededCols);
         }
     }

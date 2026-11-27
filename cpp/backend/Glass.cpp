@@ -1107,17 +1107,58 @@ void ensureGlassAlphaBlendPipelines()
     }
 }
 
+// 2026-11-27 (Batch AE): Active shaders use VPT_GLASS_DIELECTRIC_REWRITE=1 and
+// never write or composite the 5 full-screen glassAlphaBlend RGBA16F images.
+// Keep 1x1 dummy images unless legacy/debug mode is explicitly requested (-37..147 MB VRAM,
+// -2 full-screen compute dispatches and -4 image barriers per frame).
+static bool glassAlphaBlendLegacyPassActive()
+{
+    static const bool legacyActive = []() -> bool
+    {
+        const char* legacyRaw = std::getenv("ORION_GLASS_ALPHA_BLEND_LEGACY");
+        if(legacyRaw != nullptr && legacyRaw[0] != '\0' && legacyRaw[0] != '0')
+        {
+            return true;
+        }
+        const char* dbgRaw = std::getenv("ORION_GLASS_ALPHA_BLEND_DBG");
+        if(dbgRaw != nullptr && std::atoi(dbgRaw) != 0)
+        {
+            return true;
+        }
+        if(volDiagMode() != 0u)
+        {
+            return true;
+        }
+        static const uint32_t candidates[] = {1u, 6u, 9u, 10u, 11u, 12u, 13u, 14u, 15u};
+        for(uint32_t value : candidates)
+        {
+            const std::string name = "glass_dbg_" + std::to_string(value) + ".flag";
+            std::ifstream marker(ResolveRTXRuntimePath(name.c_str()));
+            if(marker.good())
+            {
+                return true;
+            }
+        }
+        return false;
+    }();
+    return legacyActive;
+}
+
 // 每帧建图（渲染分辨率）。alreadyValid 判据照 createRRGBufferImages：
 // 句柄齐全且尺寸一致就直接返回；否则等设备空闲后整张重建。
 void createGlassAlphaBlendImages(uint32_t width, uint32_t height)
 {
+    const bool legacyActive = glassAlphaBlendLegacyPassActive();
+    const uint32_t allocW = legacyActive ? width : 1u;
+    const uint32_t allocH = legacyActive ? height : 1u;
+
     if(g_alphaBlendGbufferImage != VK_NULL_HANDLE &&
        g_alphaBlendMetaImage != VK_NULL_HANDLE &&
        g_alphaBlendLightImage != VK_NULL_HANDLE &&
        g_alphaBlendVolumeImage != VK_NULL_HANDLE &&
        g_alphaBlendRadianceImage != VK_NULL_HANDLE &&
-       g_alphaBlendWidth == width &&
-       g_alphaBlendHeight == height)
+       g_alphaBlendWidth == allocW &&
+       g_alphaBlendHeight == allocH)
     {
         return;
     }
@@ -1160,21 +1201,21 @@ void createGlassAlphaBlendImages(uint32_t width, uint32_t height)
         g_alphaBlendRadianceLayout);
 
     createRRGuideImage(
-        width, height, VK_FORMAT_R16G16B16A16_SFLOAT,
+        allocW, allocH, VK_FORMAT_R16G16B16A16_SFLOAT,
         g_alphaBlendGbufferImage,
         g_alphaBlendGbufferMemory,
         g_alphaBlendGbufferView,
         g_alphaBlendGbufferLayout);
 
     createRRGuideImage(
-        width, height, VK_FORMAT_R16G16B16A16_SFLOAT,
+        allocW, allocH, VK_FORMAT_R16G16B16A16_SFLOAT,
         g_alphaBlendMetaImage,
         g_alphaBlendMetaMemory,
         g_alphaBlendMetaView,
         g_alphaBlendMetaLayout);
 
     createRRGuideImage(
-        width, height, VK_FORMAT_R16G16B16A16_SFLOAT,
+        allocW, allocH, VK_FORMAT_R16G16B16A16_SFLOAT,
         g_alphaBlendLightImage,
         g_alphaBlendLightMemory,
         g_alphaBlendLightView,
@@ -1231,21 +1272,21 @@ void createGlassAlphaBlendImages(uint32_t width, uint32_t height)
     }
 
     createRRGuideImage(
-        width, height, VK_FORMAT_R16G16B16A16_SFLOAT,
+        allocW, allocH, VK_FORMAT_R16G16B16A16_SFLOAT,
         g_alphaBlendVolumeImage,
         g_alphaBlendVolumeMemory,
         g_alphaBlendVolumeView,
         g_alphaBlendVolumeLayout);
 
     createRRGuideImage(
-        width, height, VK_FORMAT_R16G16B16A16_SFLOAT,
+        allocW, allocH, VK_FORMAT_R16G16B16A16_SFLOAT,
         g_alphaBlendRadianceImage,
         g_alphaBlendRadianceMemory,
         g_alphaBlendRadianceView,
         g_alphaBlendRadianceLayout);
 
-    g_alphaBlendWidth = width;
-    g_alphaBlendHeight = height;
+    g_alphaBlendWidth = allocW;
+    g_alphaBlendHeight = allocH;
 
     g_glassAlphaBlendBoundSet = VK_NULL_HANDLE;
     g_glassAlphaBlendBoundGbuffer = VK_NULL_HANDLE;
@@ -1253,8 +1294,10 @@ void createGlassAlphaBlendImages(uint32_t width, uint32_t height)
     updateGlassAlphaBlendRayDescriptors();
     updateGlassAlphaBlendPassDescriptors();
 
-    std::cerr << "[GLASS ALPHA BLEND] images created "
-              << width << "x" << height << std::endl;
+    RTLog(std::string("[GLASS ALPHA BLEND] ") +
+          (legacyActive
+              ? ("images created " + std::to_string(allocW) + "x" + std::to_string(allocH))
+              : "1x1 dummy images created (dielectric rewrite active)"));
 }
 
 // trace 之前：把图转到 GENERAL，并把 74 号图清 0。
@@ -1272,6 +1315,11 @@ void recordGlassAlphaBlendPrepare(VkCommandBuffer cmd)
     }
 
     prepareGlassAlphaBlendImages(cmd);
+
+    if(!glassAlphaBlendLegacyPassActive())
+    {
+        return;
+    }
 
     VkImageSubresourceRange range{};
     range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -1338,6 +1386,17 @@ void recordGlassAlphaBlend(
         createGlassBlueNoiseBuffer();
     }
 
+    if(g_glassAlphaBlendBoundRayGbuffer != g_alphaBlendGbufferView ||
+       g_glassAlphaBlendBoundSet != g_rayTracingDescriptorSet)
+    {
+        updateGlassAlphaBlendRayDescriptors();
+    }
+
+    if(!glassAlphaBlendLegacyPassActive())
+    {
+        return;
+    }
+
     ensureGlassAlphaBlendPipelines();
 
     if(g_glassAlphaBlendPipeline == VK_NULL_HANDLE ||
@@ -1346,12 +1405,6 @@ void recordGlassAlphaBlend(
        g_glassAlphaBlendPipelineLayout == VK_NULL_HANDLE)
     {
         return;
-    }
-
-    if(g_glassAlphaBlendBoundRayGbuffer != g_alphaBlendGbufferView ||
-       g_glassAlphaBlendBoundSet != g_rayTracingDescriptorSet)
-    {
-        updateGlassAlphaBlendRayDescriptors();
     }
 
     if(g_glassAlphaBlendBoundColor != g_rtOutputView ||

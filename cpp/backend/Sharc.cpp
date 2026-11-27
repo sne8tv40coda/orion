@@ -1699,11 +1699,18 @@ void ensureSharcResolvePipeline()
         return;
     }
 
+    VkPushConstantRange resolvePushRange{};
+    resolvePushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    resolvePushRange.offset = 0u;
+    resolvePushRange.size = 8u;
+
     VkPipelineLayoutCreateInfo pipelineLayoutInfo{
         VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO
     };
     pipelineLayoutInfo.setLayoutCount = 1u;
     pipelineLayoutInfo.pSetLayouts = &g_rayTracingDescriptorSetLayout;
+    pipelineLayoutInfo.pushConstantRangeCount = 1u;
+    pipelineLayoutInfo.pPushConstantRanges = &resolvePushRange;
 
     try
     {
@@ -1787,7 +1794,29 @@ void ensureSharcUpdatePipeline()
 
     try
     {
-        auto updateRgen = loadSpv("shaders/rt_test_sharc_update.rgen.spv");
+        const bool k1k2NoSer =
+            [](){
+                const char* raw = std::getenv("ORION_K1K2_NO_SER");
+                return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
+            }();
+        const bool serShaderRequested =
+            !k1k2NoSer && serShaderVariantWanted();
+        std::vector<uint8_t> updateRgen;
+        if(serShaderRequested)
+        {
+            try
+            {
+                updateRgen = loadSpv("shaders/rt_test_sharc_update_ser.rgen.spv");
+            }
+            catch(const std::exception&)
+            {
+                RTLog("[SHARC] ser spv 加载失败，回退 plain: shaders/rt_test_sharc_update_ser.rgen.spv");
+            }
+        }
+        if(updateRgen.empty())
+        {
+            updateRgen = loadSpv("shaders/rt_test_sharc_update.rgen.spv");
+        }
         auto chit = loadSpv("shaders/rt_test.rchit.spv");
         auto miss = loadSpv("shaders/rt_test_nocloud.rmiss.spv");
         auto ahit = loadSpv("shaders/rt_test.rahit.spv");
@@ -2170,8 +2199,19 @@ static void recordSharcResolveImpl(VkCommandBuffer cmd, bool skipLeadingBarrier)
             0u, 1u, &g_rayTracingDescriptorSet,
             0u, nullptr);
 
+        const uint32_t sliceStride = (parity <= 1u) ? 2u : 1u;
+        const uint32_t sliceOffset = (sliceStride > 1u)
+            ? static_cast<uint32_t>(g_perfL10FrameSerial & 1u)
+            : 0u;
+        const uint32_t sharcPush[2] = { sliceStride, sliceOffset };
+        vkCmdPushConstants(
+            cmd, g_sharcResolvePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+            0u, sizeof(sharcPush), sharcPush);
+
+        const uint32_t sliceEntries =
+            (g_sharcEntryCountResolved + sliceStride - 1u) / sliceStride;
         const uint32_t sharcResolveGroups =
-            (g_sharcEntryCountResolved + 255u) / 256u;
+            (sliceEntries + 255u) / 256u;
 
         vkCmdDispatch(cmd, sharcResolveGroups, 1u, 1u);
     }
@@ -2552,7 +2592,7 @@ void ensureK1LandingBuffer(uint32_t width, uint32_t height, uint32_t slots)
     destroyK1LandingBuffer();
 
     const VkDeviceSize bytes =
-        (VkDeviceSize)width * height * slots * 80ull;
+        (VkDeviceSize)width * height * slots * 64ull;
     createBuffer(g_device, g_physicalDevice, bytes,
                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
@@ -2665,7 +2705,7 @@ void ensureMatReuseBuffer(uint32_t width, uint32_t height, uint32_t slots)
     destroyMatReuseBuffer();
 
     const VkDeviceSize bytes =
-        (VkDeviceSize)width * height * slots * 64ull;
+        (VkDeviceSize)width * height * slots * 32ull;
     createBuffer(g_device, g_physicalDevice, bytes,
                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
@@ -3348,8 +3388,10 @@ void ensureK1K2Pipelines()
             }
             return loadSpv(plainPath);
         };
-        auto k1Code = loadRgen("shaders/rt_test_k1_ser.rgen.spv",
-                               "shaders/rt_test_k1.rgen.spv");
+        // 2026-11-27 (Batch AI): Per-leg SER assignment:
+        //   Coherent primary / visibility-only legs (k1, k2sunB, k2loc_nee) -> plain
+        //   Divergent shading legs (k1_glass, k2sunA, k2loc_glossy, k2i) -> fused-only SER
+        auto k1Code = loadSpv("shaders/rt_test_k1.rgen.spv");
         auto k1GlassCode = loadRgen("shaders/rt_test_k1_glass_ser.rgen.spv",
                                     "shaders/rt_test_k1_glass.rgen.spv");
         // 2026-11-05 设备丢失二分：ORION_K2_VARIANT=1 → nocall 桩版（不执行
@@ -3386,16 +3428,14 @@ void ensureK1K2Pipelines()
                        "shaders/rt_test_k2sunA.rgen.spv")
             : std::vector<uint8_t>{};
         auto k2sunBCode = k2Four
-            ? loadRgen("shaders/rt_test_k2sunB_ser.rgen.spv",
-                       "shaders/rt_test_k2sunB.rgen.spv")
+            ? loadSpv("shaders/rt_test_k2sunB.rgen.spv")
             : std::vector<uint8_t>{};
         auto k2locCode = (k2Three && !k2Four)
             ? loadRgen("shaders/rt_test_k2loc_ser.rgen.spv",
                        "shaders/rt_test_k2loc.rgen.spv")
             : std::vector<uint8_t>{};
         auto k2locNeeCode = k2Four
-            ? loadRgen("shaders/rt_test_k2loc_nee_ser.rgen.spv",
-                       "shaders/rt_test_k2loc_nee.rgen.spv")
+            ? loadSpv("shaders/rt_test_k2loc_nee.rgen.spv")
             : std::vector<uint8_t>{};
         auto k2locGlossyCode = k2Four
             ? loadRgen("shaders/rt_test_k2loc_glossy_ser.rgen.spv",
@@ -4163,8 +4203,8 @@ void recordCompactIndirectTrace(
     {
         const uint32_t cap = g_k2iCompactCapacityPixels;
         const CompactSlotHeaderHost pairHdr[2] = {
-            { 0u, height, 1u, (slotIndex == 2u) ? compactMode : 0u, 0u, 2u * cap, 0u, 0u },
-            { 0u, height, 1u, (slotIndex == 3u) ? compactMode : 0u, 0u, 3u * cap, 0u, 0u },
+            { 0u, 1u, 1u, (slotIndex == 2u) ? compactMode : 0u, 0u, 2u * cap, 0u, 0u },
+            { 0u, 1u, 1u, (slotIndex == 3u) ? compactMode : 0u, 0u, 3u * cap, 0u, 0u },
         };
         vkCmdUpdateBuffer(
             cmd, g_k2iCompactBuffer,
@@ -4173,7 +4213,7 @@ void recordCompactIndirectTrace(
     else
     {
         const CompactSlotHeaderHost hdr{
-            0u, height, 1u, compactMode, 0u,
+            0u, 1u, 1u, compactMode, 0u,
             slotIndex * g_k2iCompactCapacityPixels, 0u, 0u
         };
         vkCmdUpdateBuffer(
@@ -4474,7 +4514,7 @@ void recordK2iComposePass(VkCommandBuffer cmd, uint32_t width, uint32_t height)
             cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
             s_k2iCompactPipelineLayout, 0u, 1u, &g_rayTracingDescriptorSet,
             0u, nullptr);
-        vkCmdDispatch(cmd, (width + 7u) / 8u, (height + 7u) / 8u, 1u);
+        vkCmdDispatch(cmd, (width + 15u) / 16u, (height + 15u) / 16u, 1u);
 
         VkMemoryBarrier composeToDownstream{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         composeToDownstream.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
@@ -4798,18 +4838,14 @@ bool traceK1K2(VkCommandBuffer cmd, uint32_t width, uint32_t height)
                 const uint32_t giMode = (giBounces == 0u)
                     ? 0u
                     : ((sparsePct > 0 && sparsePct < 100) ? 1u : 2u);
-                const uint32_t sharcBlock =
-                    sharcUpdateBlockForResolution(width, height);
-                const uint32_t sharcH =
-                    std::max(1u, (height + sharcBlock - 1u) / sharcBlock);
                 const uint32_t cap = g_k2iCompactCapacityPixels;
 
                 const CompactSlotHeaderHost megaHdrs[5] = {
-                    { 0u, height, 1u, 1u, 0u, 1u * cap, 0u, 0u },
-                    { 0u, height, 1u, neeMode, 0u, 2u * cap, 0u, 0u },
-                    { 0u, height, 1u, 1u, 0u, 3u * cap, 0u, 0u },
-                    { 0u, height, 1u, giMode, 0u, 4u * cap, 0u, 0u },
-                    { 0u, sharcH, 1u, sharcActive ? 1u : 0u, 0u, 5u * cap, 0u, 0u },
+                    { 0u, 1u, 1u, 1u, 0u, 1u * cap, 0u, 0u },
+                    { 0u, 1u, 1u, neeMode, 0u, 2u * cap, 0u, 0u },
+                    { 0u, 1u, 1u, 1u, 0u, 3u * cap, 0u, 0u },
+                    { 0u, 1u, 1u, giMode, 0u, 4u * cap, 0u, 0u },
+                    { 0u, 1u, 1u, sharcActive ? 1u : 0u, 0u, 5u * cap, 0u, 0u },
                 };
 
                 VkMemoryBarrier preUpdateBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};

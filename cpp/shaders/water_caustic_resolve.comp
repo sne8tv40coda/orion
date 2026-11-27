@@ -23,7 +23,7 @@
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 layout(set = 0, binding = 0) uniform usampler2DArray causticAccum;
-layout(rgba16f, set = 0, binding = 1) uniform writeonly image2DArray causticOutput;
+layout(r16f, set = 0, binding = 1) uniform writeonly image2DArray causticOutput;
 
 layout(push_constant) uniform WaterCausticMapPush
 {
@@ -63,7 +63,7 @@ void main()
     const ivec2 texel = ivec2(gl_GlobalInvocationID.xy);
     const int layer = int(gl_GlobalInvocationID.z);
 
-    if(texel.x >= RES_I || texel.y >= RES_I || layer >= 2)
+    if(texel.x >= RES_I || texel.y >= RES_I || layer >= 1)
     {
         return;
     }
@@ -84,5 +84,5 @@ void main()
     imageStore(
         causticOutput,
         ivec3(texel, layer),
-        vec4(max(density, 0.20)));
+        vec4(max(density, 0.20), 0.0, 0.0, 1.0));
 }

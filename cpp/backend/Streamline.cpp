@@ -615,6 +615,7 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_clearWorldGeometry(J
         g_chunkRawPayloads.clear();
         g_chunkUploadDigests.clear();
         g_cutoutOmmInputs.clear();
+        g_chunkColumnKeys.clear();
         g_voxyLodSources.clear();
         g_voxyLodSpatialOwners.clear();
 
@@ -642,6 +643,7 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_clearWorldGeometry(J
             );
 
         g_lightSections.clear();
+        g_lightColumnKeys.clear();
 
         g_totalLocalLights =
             0;
@@ -755,6 +757,8 @@ uint32_t ResolveFgBaseFrameLimitHz()
 }
 
 
+static std::atomic<uint64_t> g_reflexOptionsEpoch{1u};
+
 bool ApplyReflexMode(
     int mode)
 {
@@ -833,6 +837,21 @@ bool ApplyReflexMode(
         baseLimitHz
     );
 
+    // 2026-11-27 Batch AG: skip redundant slReflexSetOptions calls (e.g. toggling
+    // fullscreen/ESC menu with limitHz=0) which caused 163ms main-thread menuMs stalls.
+    static bool s_reflexOptionsApplied = false;
+    static uint64_t s_lastAppliedReflexEpoch = 0u;
+    static int s_lastAppliedReflexMode = -1;
+    static uint32_t s_lastAppliedFrameLimitUs = 0u;
+    const uint64_t epochNow = g_reflexOptionsEpoch.load(std::memory_order_relaxed);
+    if(s_reflexOptionsApplied &&
+       s_lastAppliedReflexEpoch == epochNow &&
+       mode == s_lastAppliedReflexMode &&
+       options.frameLimitUs == s_lastAppliedFrameLimitUs)
+    {
+        g_reflexMode = mode;
+        return true;
+    }
 
     sl::Result result =
         g_slReflexSetOptions(
@@ -862,6 +881,11 @@ bool ApplyReflexMode(
         return false;
     }
 
+
+    s_reflexOptionsApplied = true;
+    s_lastAppliedReflexEpoch = epochNow;
+    s_lastAppliedReflexMode = mode;
+    s_lastAppliedFrameLimitUs = options.frameLimitUs;
 
     g_reflexMode =
         mode;
@@ -955,7 +979,7 @@ bool SetCurrentPCLMarker(
 #ifdef _WIN32
             tid = GetCurrentThreadId();
 #endif
-            RTLogFlushed(
+            RTLog(
                 "[PCL MARK] marker=" + std::to_string(
                     static_cast<unsigned int>(marker)) +
                 " frame=" + std::to_string(frameForLog) +
@@ -1387,7 +1411,7 @@ bool BeginStreamlineFrame()
 
         if((slSplitFrames % 60u) == 0u)
         {
-            RTLogFlushed(
+            RTLog(
                 "[SL FRAME SPLIT] n=" + std::to_string(slSplitFrames) +
                 " tokenAvgMs=" + std::to_string(slSplitTokenSumMs / 60.0) +
                 " tokenMaxMs=" + std::to_string(slSplitTokenMaxMs) +
@@ -1866,6 +1890,7 @@ fflush(stderr);
 
     g_reflexSupported =
         reflexSupport == sl::Result::eOk;
+    g_reflexOptionsEpoch.fetch_add(1u, std::memory_order_relaxed);
 
     g_pclSupported =
         pclSupport == sl::Result::eOk;

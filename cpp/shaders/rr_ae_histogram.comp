@@ -15,7 +15,7 @@
 //   · Unity URP Exposure（log2 直方图 + 百分位修剪）
 //   · UE 用 Exposure Metering Mask 做中心加权；这里程序化生成等价权重。
 
-layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
 layout(binding = 0, set = 0, rgba16f)
 uniform image2D rrOutputImage;
@@ -86,39 +86,24 @@ float meterWeight(vec2 uv, float depth, float cloudAlpha)
 
 void main()
 {
-    // 注意：下面的 barrier() 要求全组线程都到达，因此边界外线程必须走完整流程，
-    // 只是不采集样本（旧版在这里直接 return，改成分块共享直方图后会死锁）。
-    for(uint i = gl_LocalInvocationIndex; i < AE_BIN_COUNT; i += 64u)
-    {
-        tileBins[i] = 0u;
-    }
+    // 16x16 线程组恰好 1:1 映射 256 bins；所有线程同步通过 barrier() 防死锁。
+    tileBins[gl_LocalInvocationIndex] = 0u;
 
     barrier();
     memoryBarrierShared();
 
     ivec2 size = imageSize(rrOutputImage);
-    ivec2 origin = ivec2(gl_GlobalInvocationID.xy) * 8;
-    vec2 invSize = 1.0 / vec2(size);
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy) * 2;
 
-    for(int y = 0; y < 8; ++y)
+    if(p.x < size.x && p.y < size.y)
     {
-        for(int x = 0; x < 8; ++x)
+        vec3 rawC = imageLoad(rrOutputImage, p).rgb;
+        if(!any(isnan(rawC)) && !any(isinf(rawC)))
         {
-            ivec2 p = origin + ivec2(x, y);
-
-            if(p.x >= size.x || p.y >= size.y)
-            {
-                continue;
-            }
-
-            vec3 rawC = imageLoad(rrOutputImage, p).rgb;
-            if(any(isnan(rawC)) || any(isinf(rawC)))
-            {
-                continue;
-            }
             vec3 c = max(rawC, vec3(0.0));
             float luma = dot(c, AE_LUMA_WEIGHTS);
 
+            vec2 invSize = 1.0 / vec2(size);
             vec2 uv = (vec2(p) + vec2(0.5)) * invSize;
 
             ivec2 depthSize = textureSize(sceneDepth, 0);
@@ -128,46 +113,39 @@ void main()
                 max(depthSize - ivec2(1), ivec2(0))
             );
             float depth = texelFetch(sceneDepth, depthCoord, 0).r;
-            float cloudAlpha = textureLod(cloudResolvedImage, uv, 0.0).a;
+            float cloudAlpha = (depth <= ae.skyDepthEps)
+                ? textureLod(cloudResolvedImage, uv, 0.0).a
+                : 1.0;
 
             float w = meterWeight(uv, depth, cloudAlpha);
-
-            if(w <= 1.0e-4)
+            if(w > 1.0e-4)
             {
-                continue;
+                // 直方图 bin 是 uint 计数，权重按 1/16 步长量化（避免低权重天空气泡被 max(1u) 放大）。
+                uint add = uint(w * 16.0 + 0.5);
+                if(add != 0u)
+                {
+                    float lumaFloor = max(exp2(ae.logMin), AE_LUMA_FLOOR);
+                    float logLuma = log2(max(luma, lumaFloor));
+
+                    float t = clamp(
+                        (logLuma - ae.logMin) / max(ae.logMax - ae.logMin, 1.0e-3),
+                        0.0,
+                        1.0);
+
+                    uint bin = clamp(uint(t * float(AE_BIN_COUNT)), 0u, AE_BIN_COUNT - 1u);
+
+                    atomicAdd(tileBins[bin], add);
+                }
             }
-
-            // 直方图 bin 是 uint 计数，权重按 1/16 步长量化（避免低权重天空气泡被 max(1u) 放大）。
-            uint add = uint(w * 16.0 + 0.5);
-            if(add == 0u)
-            {
-                continue;
-            }
-
-            float lumaFloor = max(exp2(ae.logMin), AE_LUMA_FLOOR);
-            float logLuma = log2(max(luma, lumaFloor));
-
-            float t = clamp(
-                (logLuma - ae.logMin) / max(ae.logMax - ae.logMin, 1.0e-3),
-                0.0,
-                1.0);
-
-            uint bin = clamp(uint(t * float(AE_BIN_COUNT)), 0u, AE_BIN_COUNT - 1u);
-
-            atomicAdd(tileBins[bin], add);
         }
     }
 
     barrier();
     memoryBarrierShared();
 
-    for(uint i = gl_LocalInvocationIndex; i < AE_BIN_COUNT; i += 64u)
+    uint c = tileBins[gl_LocalInvocationIndex];
+    if(c != 0u)
     {
-        uint c = tileBins[i];
-
-        if(c != 0u)
-        {
-            atomicAdd(bins[i], c);
-        }
+        atomicAdd(bins[gl_LocalInvocationIndex], c);
     }
 }

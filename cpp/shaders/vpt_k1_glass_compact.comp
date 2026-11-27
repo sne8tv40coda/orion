@@ -18,7 +18,6 @@ struct PTLandingRecord
     uvec4 b;
     uvec4 c;
     vec4 d;
-    vec4 e;
 };
 
 layout(std430, binding = 88, set = 0) readonly buffer PTLandingSSBO
@@ -88,7 +87,10 @@ void main()
     {
         s_wgBase = atomicAdd(k2iCompact.headers[0].activeCount, s_wgCount);
         const uint compactHeight = max(k2iCompact.headers[0].height, 1u);
-        const uint neededCols = (s_wgBase + s_wgCount + compactHeight - 1u) / compactHeight;
+        const uint endCount = s_wgBase + s_wgCount;
+        const uint neededCols = (compactHeight == 1u)
+            ? endCount
+            : ((endCount + compactHeight - 1u) / compactHeight);
         atomicMax(k2iCompact.headers[0].width, neededCols);
     }
     barrier();

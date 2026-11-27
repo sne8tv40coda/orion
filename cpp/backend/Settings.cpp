@@ -489,6 +489,16 @@ bool serRequireReorderHint()
 // 差异只出现在报 MODE_NONE 的设备上（那里现在会用 hitObject 但重排是 no-op）。
 bool serShaderVariantWanted()
 {
+    static const int serModeEnvPinned = []()
+    {
+        const char* raw = std::getenv("ORION_SER_MODE");
+        return (raw != nullptr && raw[0] != '\0') ? std::atoi(raw) : -1;
+    }();
+    if(serModeEnvPinned == 0)
+    {
+        return false;
+    }
+
     if(!g_serEnabled.load() || !g_serFeatureSupported)
     {
         return false;

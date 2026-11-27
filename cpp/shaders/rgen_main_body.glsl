@@ -267,6 +267,14 @@ void main() {
     const int SAMPLES_PER_FRAME =
         max(1, int(rtUserSpp + 0.5));
 
+#ifdef ORION_K2I_COMPOSE_COMPUTE
+    if(SAMPLES_PER_FRAME == 1 &&
+       ptLandingRecords[uint(pixelCoord.y) * uint(size.x) + uint(pixelCoord.x)].a.x <= 0.5)
+    {
+        return;
+    }
+#endif
+
     vec3 accumulatedSampleColor =
         vec3(0.0);
 #ifdef ORION_K2_INDIRECT_TRACE_ONLY
@@ -491,6 +499,18 @@ hit.state = makeTraceState(RT_PURPOSE_PRIMARY_SKY);
 const uint k1PrimarySbtOffset = 0u;
 #endif
 
+#if defined(RT_ENABLE_SER) && ORION_SER_FUSED_ONLY
+serTraceRayOffset(
+    origin.xyz,
+    0.001,
+    worldDir.xyz,
+    10000.0,
+    gl_RayFlagsCullBackFacingTrianglesEXT,
+    0x21u,
+    s,
+    k1PrimarySbtOffset
+);
+#else
 #ifdef RT_ENABLE_SER
 // Perf-L10.8: same ray, same flags; SER only reschedules the hit shader.
 if(cam.perfSerAb.y != 0u)
@@ -524,6 +544,7 @@ else
         0
     );
 }
+#endif
 
 
 // =====================================================
@@ -618,6 +639,12 @@ primaryViewDirectionForWater = worldDir.xyz;
         rtDebugPrimaryMotion
     ))
     {
+#ifdef ORION_K2I_COMPOSE_COMPUTE
+        if(SAMPLES_PER_FRAME == 1)
+        {
+            return;
+        }
+#endif
         continue;
     }
     ptLandingActive = true;
@@ -1463,11 +1490,11 @@ if (s == 0)
 #elif defined(ORION_K1_GLASS_ONLY)
 if(s == 0)
 {
-    rtDebugPrimaryMotion = ptLandingRecords[
+    rtDebugPrimaryMotion = unpackHalf2x16(ptLandingRecords[
         ptLandingRecordIndex(
             uint(pixelCoord.y) * uint(size.x) + uint(pixelCoord.x), 0
         )
-    ].e.zw;
+    ].b.z);
 }
 #endif // ORION_K2_TRANSPORT（重开的 K1 独占段：G-buffer / depth / MV 写入）
 
@@ -1722,156 +1749,9 @@ if (matId > 0.5 && matId < 2.5) {
 
 #if !defined(ORION_K2_INDIRECT_STAGE) && !defined(ORION_K2_DIRECT_LOCAL_STAGE) \
     && !defined(ORION_K2_DIRECT_SUN_STAGE_B)
-                    vec3 rrWaterReflectionDir =
-                        normalize(
-                            reflect(
-                                worldDir.xyz,
-                                normal
-                            )
-                        );
-
-                    vec3 rrWaterReflectionOrigin =
-                        hitPos +
-                        normal *
-                        0.01;
-
-                    hit.hitDistance =
-                        1.0;
-
-                    hit.state = makeTraceState(RT_PURPOSE_DISTANCE_ONLY);
-
-#ifdef RT_ENABLE_SER
-                    // Perf-L10.8: same ray, same flags; SER only reschedules the hit shader.
-                    if(cam.perfSerAb.z == 6u)
-                    {
-                        // Probe arm 6 (2026-10-07): rgen-side hit-object
-                        // query.  The hit-shader dispatch is skipped
-                        // entirely and the one payload field the consumer
-                        // reads is written here:
-                        //
-                        // 2026-11-07 更正（此前这里写的是 "Traversal is
-                        // identical (same flags and cull mask)"，与代码不符）：
-                        // 本臂传的是裸 gl_RayFlagsNoneEXT，而对照路径
-                        // （下面的 secondaryTraverseFlags()，见 rt_test.rgen
-                        // SECONDARY_TRAVERSE_FLAGS_4STATE）是
-                        // None | CullBackFacingTrianglesEXT ⇒ 探针**丢掉了
-                        // 背面剔除**，双面几何（cross 模型、水面双面）命中的
-                        // 那一面因此可能不同。cull mask 0xff 与 tMin/tMax 一致。
-                        // 这一臂又是 Perf.cpp 现网 pin 的 mode 6 的实际执行
-                        // 分支，不再是"只测性能"的备用臂 ⇒ 若要回到与对照路径
-                        // 逐位一致的 flags，把下面的 gl_RayFlagsNoneEXT 换成
-                        // secondaryTraverseFlags() 并做一次 A/B。
-                        //   hit  -> hitDistance = committed t.  This equals
-                        //            the rchit DISTANCE_ONLY fast path's
-                        //            gl_HitTEXT, and that fast path's
-                        //            makeHitState(...) composes to exactly
-                        //            the value makeTraceState already left
-                        //            in payload.state, so the hit payload
-                        //            is bit-identical.
-                        //            ⚠ 2026-11-07：hitObjectGetRayTMaxEXT 在
-                        //            GL_EXT_shader_invocation_reorder 里的描述只
-                        //            写着 "the parametric value"（RayTMin/RayTMax
-                        //            两句都缺 min/max 字样），"等于 gl_HitTEXT"
-                        //            是本工程的推断，不是规范原文 ⇒ 需要一次
-                        //            mode 1 对 mode 6 的 guide 距离逐像素比对来
-                        //            自证；或改用 hitObjectGetAttributesEXT /
-                        //            hitObjectRecordFromQueryEXT 这条有明确定义
-                        //            的属性来源。
-                        //   miss -> hitDistance = -1, what rt_test.rmiss
-                        //            writes; the consumer's "< 0" test and
-                        //            the 65504 fallback below read only
-                        //            this field.
-                        // PIXEL-UNEQUAL by construction where the plain
-                        // path's any-hit would have altered acceptance:
-                        // alpha-cutout foliage and glass sheets no longer
-                        // filter the probe, so a cut-out texel now stops
-                        // the ray and shortens the guide distance.  It used
-                        // to be a perf-only arm; mode 6 is what Perf.cpp
-                        // pins today, so this difference ships unless the
-                        // guide is restored to the any-hit-filtered path.
-                        // 2026-11-07 A/B：探针的遍历 flags。现在传裸
-                        // gl_RayFlagsNoneEXT（比对照路径少了 CullBackFacingTriangles，
-                        // 双面几何的命中面可能不同）；置 1 则改用
-                        // secondaryTraverseFlags()，与普通 trace 逐位同 flags。
-                        // 默认 0 = 现行为；A/B 用 -DSER_PROBE_SECONDARY_FLAGS=1 编第二份。
-#ifndef SER_PROBE_SECONDARY_FLAGS
-#define SER_PROBE_SECONDARY_FLAGS 0
-#endif
-                        hitObjectEXT probeObject;
-                        #ifdef ORION_RT_STAGE_COUNTERS
-                        rtCntRayIssued();
-                        #endif
-                        hitObjectTraceRayEXT(
-                            probeObject,
-                            topLevelAS,
-                            ((SER_PROBE_SECONDARY_FLAGS != 0) ||
-                                perfL10SerProbeSecondaryFlags())
-                                ? secondaryTraverseFlags() : gl_RayFlagsNoneEXT,
-                            0xcfu,
-                            0,
-                            0,
-                            0,
-                            rrWaterReflectionOrigin,
-                            0.01,
-                            rrWaterReflectionDir,
-                            10000.0,
-                            0
-                        );
-                        hit.hitDistance = hitObjectIsMissEXT(probeObject)
-                            ? -1.0
-                            : hitObjectGetRayTMaxEXT(probeObject);
-                    }
-                    else if(cam.perfSerAb.y != 0u)
-                    {
-                        serTraceRay(
-                            rrWaterReflectionOrigin,
-                            0.01,
-                            rrWaterReflectionDir,
-                            10000.0,
-                            secondaryTraverseFlags(),
-                            0xcfu,
-                            s
-                        );
-                    }
-                    else
-#endif
-                    {
-                        #ifdef ORION_RT_STAGE_COUNTERS
-                        rtCntRayIssued();
-                        #endif
-                        traceRayEXT(
-                            topLevelAS,
-                            secondaryTraverseFlags(),
-                            0xcfu,
-                            0,
-                            0,
-                            0,
-                            rrWaterReflectionOrigin,
-                            0.01,
-                            rrWaterReflectionDir,
-                            10000.0,
-                            0
-                        );
-                    }
-
-                    if(payload.hitDistance >= 0.0)
-                    {
-                        vec3 rrWaterReflectionHitPos =
-                            rrWaterReflectionOrigin +
-                            rrWaterReflectionDir *
-                            payload.hitDistance;
-
-                        rrSpecularHitDistance =
-                            length(
-                                rrWaterReflectionHitPos -
-                                hitPos
-                            );
-                    }
-                    else
-                    {
-                        rrSpecularHitDistance =
-                            65504.0;
-                    }
+                    // 2026-11-27: 删除冗余的 RR-6.2 DISTANCE_ONLY 探针射线，
+                    // 改由下方反射瓣直接导出 rrSpecularHitDistance。
+                    rrSpecularHitDistance = 65504.0;
 #elif defined(ORION_K2_INDIRECT_STAGE)
                     rrSpecularHitDistance = ptLandingRecords[
                         ptLandingRecordIndex(
@@ -1903,6 +1783,7 @@ if (matId > 0.5 && matId < 2.5) {
 #endif
 bool underwaterExit = false;
 bool underwaterTir = false;
+bool underwaterColumnWall = false;
 float exitFresnel = 0.0;
 vec3 waterSurfaceSunTransmittance = vec3(0.0);
 float waterSurfaceCloudShadow = 0.0;
@@ -1927,46 +1808,70 @@ bool lobe1IsRefl = false;
 if(matId > 1.5 && cam.waterSimState.w != 0u)
 {
     underwaterExit = true;
-    // Water -> Air interface viewed from underwater: exact Snell's Window + TIR mirror.
-    vec3 exitRefrDir = refract(worldDir.xyz, normal, 1.33);
-    vec3 exitReflDir = normalize(reflect(worldDir.xyz, normal));
-
-    if(dot(exitRefrDir, exitRefrDir) < 1.0e-6)
+    const bool isVerticalWaterColumnWall = abs(waterGeoN.y) <= 0.5;
+    if(isVerticalWaterColumnWall)
     {
-        underwaterTir = true;
-        waterLobeCount = 1;
-        lobe0Origin = hitPos + waterGeoN * 0.015;
-        lobe0Dir = exitReflDir;
-        lobe0InsideWater = true;
-        lobe0AllowGi = false;
-        lobe0SuppressSun = true;
-        lobe0IsRefl = true;
-    }
-    else
-    {
-        vec3 exitRefrDirN = normalize(exitRefrDir);
-        float cosExitAir = clamp(dot(exitRefrDirN, -normal), 0.0, 1.0);
-        float efX = 1.0 - cosExitAir;
-        float efX2 = efX * efX;
-        exitFresnel = R0 + (1.0 - R0) * (efX2 * efX2) * efX;
+        // 2026-11-27: 站在水柱内部向四周看竖直水柱侧壁：温和透射穿出空气，
+        // 彻底消除四面 48.75° 全内反射黑/白牢笼。
+        underwaterTir = false;
+        underwaterColumnWall = true;
+        vec3 colExitRefr = refract(worldDir.xyz, waterGeoN, 1.18);
+        vec3 colExitDir = (dot(colExitRefr, colExitRefr) >= 1.0e-6)
+            ? normalize(colExitRefr)
+            : normalize(worldDir.xyz);
+        exitFresnel = min(geoFresnel, 0.25);
 
         waterLobeCount = 1;
         lobe0Origin = hitPos - waterGeoN * 0.015;
-        lobe0Dir = exitRefrDirN;
+        lobe0Dir = colExitDir;
         lobe0InsideWater = false;
         lobe0AllowGi = false;
         lobe0SuppressSun = false;
         lobe0IsRefl = false;
+    }
+    else
+    {
+        // Water -> Air horizontal surface viewed from underwater: Snell's Window + TIR.
+        vec3 exitRefrDir = refract(worldDir.xyz, normal, 1.33);
+        vec3 exitReflDir = normalize(reflect(worldDir.xyz, normal));
 
-        if(exitFresnel > 0.03)
+        if(dot(exitRefrDir, exitRefrDir) < 1.0e-6)
         {
-            waterLobeCount = 2;
-            lobe1Origin = hitPos + waterGeoN * 0.015;
-            lobe1Dir = exitReflDir;
-            lobe1InsideWater = true;
-            lobe1AllowGi = false;
-            lobe1SuppressSun = true;
-            lobe1IsRefl = true;
+            underwaterTir = true;
+            waterLobeCount = 1;
+            lobe0Origin = hitPos + waterGeoN * 0.015;
+            lobe0Dir = exitReflDir;
+            lobe0InsideWater = true;
+            lobe0AllowGi = false;
+            lobe0SuppressSun = true;
+            lobe0IsRefl = true;
+        }
+        else
+        {
+            vec3 exitRefrDirN = normalize(exitRefrDir);
+            float cosExitAir = clamp(dot(exitRefrDirN, -normal), 0.0, 1.0);
+            float efX = 1.0 - cosExitAir;
+            float efX2 = efX * efX;
+            exitFresnel = R0 + (1.0 - R0) * (efX2 * efX2) * efX;
+
+            waterLobeCount = 1;
+            lobe0Origin = hitPos - waterGeoN * 0.015;
+            lobe0Dir = exitRefrDirN;
+            lobe0InsideWater = false;
+            lobe0AllowGi = false;
+            lobe0SuppressSun = false;
+            lobe0IsRefl = false;
+
+            if(exitFresnel > 0.06)
+            {
+                waterLobeCount = 2;
+                lobe1Origin = hitPos + waterGeoN * 0.015;
+                lobe1Dir = exitReflDir;
+                lobe1InsideWater = true;
+                lobe1AllowGi = false;
+                lobe1SuppressSun = true;
+                lobe1IsRefl = true;
+            }
         }
     }
 }
@@ -1978,7 +1883,7 @@ if(!underwaterExit)
     if(sunDir.y > 0.0)
     {
         waterSurfaceSunTransmittance =
-            traceSunTransmittanceThroughWater(
+            traceSunTransmittanceAir(
                 hitPos + waterGeoN * 0.02 + sunDir * 0.001,
                 sunDir
             );
@@ -2019,21 +1924,18 @@ if(!underwaterExit)
         lobe1Origin = hitPos - waterGeoN * 0.015;
         lobe1Dir = refrDir;
         lobe1InsideWater = true;
-#if WATER_RECEIVER_GI_ADAPTIVE_GATE
-        lobe1AllowGi = (fresnel < 0.88);
-#else
-        lobe1AllowGi = true;
-#endif
+        lobe1AllowGi = false;
         lobe1SuppressSun = false;
         lobe1IsRefl = false;
     }
 }
 
-// Unified single-site water lobe loop (eliminates 5x tracePrimaryTransparentRadiance
-// CPS/SSA blowup in k2sunA/k1 while preserving 100% bit-identical semantics and 0 arrays).
+// Unified single-site water lobe loop: reflection never disappears and both lobes
+// stay 100% deterministic and zero-noise.
 vec3 lobe0Radiance = vec3(0.0);
 vec3 lobe1Radiance = vec3(0.0);
 WaterTransmissionInfo transmittedTransmissionInfo;
+float reflHitDistFromLobe0 = 65504.0;
 for(int waterLobe = 0; waterLobe < waterLobeCount; ++waterLobe)
 {
     vec3 lobeOrigin = (waterLobe == 0) ? lobe0Origin : lobe1Origin;
@@ -2043,6 +1945,7 @@ for(int waterLobe = 0; waterLobe < waterLobeCount; ++waterLobe)
     bool lobeSuppressSun = (waterLobe == 0) ? lobe0SuppressSun : lobe1SuppressSun;
     bool lobeIsRefl = (waterLobe == 0) ? lobe0IsRefl : lobe1IsRefl;
     bool setEntrySun = (!underwaterExit && waterLobe == 1);
+    g_waterWalkerSkipClouds = lobeIsRefl;
     if(setEntrySun)
     {
         g_waterEntrySunValid = true;
@@ -2062,6 +1965,7 @@ for(int waterLobe = 0; waterLobe < waterLobeCount; ++waterLobe)
         lobeIsRefl,
         lobeInfo
     );
+    g_waterWalkerSkipClouds = false;
     if(setEntrySun)
     {
         g_waterEntrySunValid = false;
@@ -2069,6 +1973,10 @@ for(int waterLobe = 0; waterLobe < waterLobeCount; ++waterLobe)
     if(waterLobe == 0)
     {
         lobe0Radiance = lobeRad;
+        if(lobeIsRefl)
+        {
+            reflHitDistFromLobe0 = lobeInfo.waterPathLength;
+        }
     }
     else
     {
@@ -2077,11 +1985,29 @@ for(int waterLobe = 0; waterLobe < waterLobeCount; ++waterLobe)
     }
 }
 
+if(!underwaterExit && s == 0)
+{
+    rrSpecularHitDistance = reflHitDistFromLobe0;
+}
+
 if(underwaterExit)
 {
-    sampleColor = underwaterTir
-        ? lobe0Radiance
-        : mix(lobe0Radiance, lobe1Radiance, exitFresnel);
+    if(underwaterTir)
+    {
+        sampleColor = lobe0Radiance;
+    }
+    else if(underwaterColumnWall || waterLobeCount <= 1)
+    {
+        sampleColor = mix(
+            lobe0Radiance,
+            waterScatterColorAt(hitPos.xz) * getSurfaceAmbientRadiance() * 0.65,
+            exitFresnel
+        );
+    }
+    else
+    {
+        sampleColor = mix(lobe0Radiance, lobe1Radiance, exitFresnel);
+    }
 }
 else
 {
@@ -3153,11 +3079,7 @@ if(!vptPixelActive)
 // 整体跳过（perfSerAb.w 恒 1，见 VulkanCore.cpp 的 PERF_L10_ENABLE_RTAO_SKIP_AB
 // = false ⇒ 永不做 A/B）。于是日志里 aoPixPct 显示 82% 而 aoRayPerPix 恒 0，
 // 两个字段口径相反，读起来像"AO 在工作"。这里让两者同源。
-if(aoSamples > 0
-#ifdef RT_ENABLE_SER
-   && cam.perfSerAb.w == 0u
-#endif
-)
+if(aoSamples > 0 && cam.perfSerAb.w == 0u)
 {
     perfRayStatAdd(8u, 1u);
 }
@@ -3242,18 +3164,8 @@ for(
     }
     else
 #endif
-#ifdef RT_ENABLE_SER
-    // Perf-L10.10: this AO ray's result is discarded, so the trace itself is
-    // pure cost.  Nothing writes hit.hitDistance for a SkipClosestHitShader
-    // ray - the any-hit shaders only touch albedo/glassAlpha/parallaxRayTravel,
-    // and the closest hit never runs - so the "> 0.0" test below can never
-    // fire, occlusion stays 0 and rtaoFactor stays exactly 1.0.  Skipping the
-    // trace is therefore pixel-identical, provided the sampling call above is
-    // kept: seed is inout, so dropping it would shift the whole downstream RNG
-    // stream.  perfSerAb.w rotates the skip so the saving can be measured
-    // in-session; 0 keeps today's behaviour.
+    // 2026-11-27 (Batch AI): decoupled from RT_ENABLE_SER so plain legs also skip dead RTAO rays.
     if(cam.perfSerAb.w == 0u)
-#endif
     {
         // [9] 真实发出的 AO 射线（perfSerAb.w=1 时整条 trace 被跳过，不计）
         perfRayStatAdd(9u, 1u);
@@ -3995,59 +3907,25 @@ for (int si = 0;
     hit.albedoPacked = packAlbedoUnorm(vec3(1.0));
 
     bool sunShadowHandledByQuery = false;
-#if ORION_OPAQUE_VIS_FASTPATH
+#if ORION_OPAQUE_VIS_FASTPATH && !defined(ORION_K2I_COMPOSE_COMPUTE)
     if(!sunVisibilityFilterActive)
     {
-        rayQueryEXT sunVisQuery;
-        rayQueryInitializeEXT(
-            sunVisQuery,
-            topLevelAS,
-            gl_RayFlagsTerminateOnFirstHitEXT,
-            g_secondaryCullMask,
+        float queryHitDist = 1.0;
+        if(tryOpaqueSunVisibilityQuery(
             shadowOrigin,
-            SUN_SHADOW_RAY_TMIN,
             shadowDir,
-            shadowRayMaxDistance
-        );
-        if(!rayQueryProceedEXT(sunVisQuery))
+            shadowRayMaxDistance,
+            queryHitDist))
         {
-            #ifdef ORION_RT_STAGE_COUNTERS
-            rtCntRayIssued();
-            #endif
-            hit.hitDistance = (rayQueryGetIntersectionTypeEXT(sunVisQuery, true) !=
-                               gl_RayQueryCommittedIntersectionNoneEXT)
-                ? rayQueryGetIntersectionTEXT(sunVisQuery, true)
-                : -1.0;
+            hit.hitDistance = queryHitDist;
             sunShadowHandledByQuery = true;
-        }
-        else
-        {
-            rayQueryTerminateEXT(sunVisQuery);
         }
     }
 #endif
 
     if(!sunShadowHandledByQuery)
     {
-#ifdef RT_ENABLE_SER
-    // Perf-L10.8: same ray, same flags; SER only reschedules the hit shader.
-    if(cam.perfSerAb.y != 0u)
-    {
-        serTraceRay(
-            shadowOrigin,
-            SUN_SHADOW_RAY_TMIN,
-            shadowDir,
-            shadowRayMaxDistance,
-            gl_RayFlagsTerminateOnFirstHitEXT |
-            (sunVisibilityFilterActive
-                ? 0u
-                : gl_RayFlagsSkipClosestHitShaderEXT),
-            g_secondaryCullMask,
-            si
-        );
-    }
-    else
-#endif
+    // 2026-11-27 (Batch AI): visibility-only sun shadow skips SER.
     {
         #ifdef ORION_RT_STAGE_COUNTERS
         rtCntRayIssued();
@@ -4372,25 +4250,7 @@ if(
     // 上一条射线的残留 albedo，逐帧不同 ⇒ 静止时被 DLSS-RR 当信号累积。
     hit.albedoPacked = packAlbedoUnorm(vec3(1.0));
 
-#ifdef RT_ENABLE_SER
-    // Perf-L10.8: same ray, same flags; SER only reschedules the hit shader.
-    if(cam.perfSerAb.y != 0u)
-    {
-        serTraceRay(
-            rainExposureOrigin,
-            0.02,
-            vec3(0.0, 1.0, 0.0),
-            rainExposureTMax,
-            rainExposureSoftFlags,
-            // 0x08 = "除粒子/天气层以外的世界"：雨丝不该把自己上面那片天挡住
-            // （物理上雨滴不会阻止雨落下）。粒子实例清掉这一位，见
-            // VulkanCore.cpp 的 SECTION_AS_CLASS_PARTICLE 遮罩分支。
-            RAIN_EXPOSURE_RAY_MASK,
-            0u
-        );
-    }
-    else
-#endif
+    // 2026-11-27 (Batch AI): visibility-only rain exposure skips SER.
     {
         #ifdef ORION_RT_STAGE_COUNTERS
         rtCntRayIssued();
@@ -4483,21 +4343,7 @@ if(
             // 上一条射线的残留 albedo，逐帧不同 ⇒ 静止时被 DLSS-RR 当信号累积。
             hit.albedoPacked = packAlbedoUnorm(vec3(1.0));
 
-#ifdef RT_ENABLE_SER
-            if(cam.perfSerAb.y != 0u)
-            {
-                serTraceRay(
-                    tapOrigin,
-                    0.02,
-                    vec3(0.0, 1.0, 0.0),
-                    rainExposureTMax,
-                    rainExposureSoftFlags,
-                    RAIN_EXPOSURE_RAY_MASK,
-                    ti
-                );
-            }
-            else
-#endif
+            // 2026-11-27 (Batch AI): visibility-only rain exposure ring skips SER.
             {
                 #ifdef ORION_RT_STAGE_COUNTERS
                 rtCntRayIssued();
@@ -6249,14 +6095,34 @@ if(cam.giRayParams.z > 0.5f && giBounceLimit > 0)
         uint orionGateCellLightCount = 0u;
 
         // currentOrigin 在 :4938 初始化为主命中点世界坐标（GI 回路第一跳的起点）。
-        // 打空（cell 未建 / 越界）按"无光源"处理：与光照采样侧
-        // "查不到灯即无贡献"的口径一致，不会多减能量。
-        const bool orionCellHasLight =
-            localLightGridLookupCell(
-                localLightGridCellCoord(currentOrigin),
-                orionGateFirstLightIndex,
-                orionGateCellLightCount) &&
-            orionGateCellLightCount > 0u;
+        // 按局部光最大半径检查相邻 64³ 网格 cell，消除跨越 64 格边界时的 GI 硬截断；
+        // 打空（cell 未建 / 越界）按"无光源"处理，不会多减能量。
+        const ivec3 orionGateCenterCell = localLightGridCellCoord(currentOrigin);
+        const int minCellX = localLightGridNeighborMinOffset(currentOrigin.x);
+        const int maxCellX = localLightGridNeighborMaxOffset(currentOrigin.x);
+        const int minCellY = localLightGridNeighborMinOffset(currentOrigin.y);
+        const int maxCellY = localLightGridNeighborMaxOffset(currentOrigin.y);
+        const int minCellZ = localLightGridNeighborMinOffset(currentOrigin.z);
+        const int maxCellZ = localLightGridNeighborMaxOffset(currentOrigin.z);
+        bool orionCellHasLight = false;
+        for(int dy = minCellY; dy <= maxCellY && !orionCellHasLight; ++dy)
+        {
+            for(int dz = minCellZ; dz <= maxCellZ && !orionCellHasLight; ++dz)
+            {
+                for(int dx = minCellX; dx <= maxCellX; ++dx)
+                {
+                    if(localLightGridLookupCell(
+                           orionGateCenterCell + ivec3(dx, dy, dz),
+                           orionGateFirstLightIndex,
+                           orionGateCellLightCount) &&
+                       orionGateCellLightCount > 0u)
+                    {
+                        orionCellHasLight = true;
+                        break;
+                    }
+                }
+            }
+        }
 
         if(!orionCellHasLight)
         {
@@ -6557,12 +6423,13 @@ while(
                     else
 #endif
                     {
-#ifdef RT_ENABLE_SER
-                    // Perf-L10.7: the host alternates this every window so SER can
-                    // be measured against a plain trace taken moments apart.  The
-                    // flag lives in perfSerAb.x, a tail lane this shader never
-                    // reads as anything else; perfPrimary.y must stay the RTAO
-                    // mid-distance sample count or the A/B would bias that too.
+#if defined(RT_ENABLE_SER) && ORION_SER_FUSED_ONLY
+                    traceDiffuseSer(
+                        currentOrigin,
+                        currentDir,
+                        uint(diffuseBounceCount) & 0x3u
+                    );
+#elif defined(RT_ENABLE_SER)
                     if(cam.perfSerAb.x != 0u)
                     {
                         traceDiffuseSer(
@@ -7600,6 +7467,7 @@ bool neeVertexFrontFacing =
 
 #if VPT_GI_VERTEX_LOCAL_LIGHT
 if(
+    (diffuseBounceCount < 2 || SHARC_UPDATE != 0) &&
     neeVertexFrontFacing &&
     ((
         vliReadSourceVoxel(

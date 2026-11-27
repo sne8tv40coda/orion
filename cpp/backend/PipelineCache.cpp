@@ -5,13 +5,131 @@
 #include "OrionInternal.h"
 #include "TrackingHooks.h"
 
+#include <atomic>
 #include <mutex>
+#include <thread>
 
 // 2026-11-09：boot 管线编译搬到后台线程后，"每管线成功即落盘"（wrapper 内
 // PersistSharedPipelineCacheNow，跑在编译线程）与主线程的帧内 maybePersist /
 // 卸载 release 会并发碰同一个 VkPipelineCache 和同一份 blob 文件。
 // 整条缓存路径串行化；recursive 因为 PersistNow 内部还要调 persist。
 static std::recursive_mutex g_pipelineCacheMutex;
+static std::mutex g_pipelineCacheSaveThreadMutex;
+static std::thread g_pipelineCacheSaveThread;
+static std::atomic<bool> g_pipelineCacheSaveInFlight{false};
+
+static void joinPipelineCacheSaveThread()
+{
+    std::lock_guard<std::mutex> threadLock(g_pipelineCacheSaveThreadMutex);
+    if(g_pipelineCacheSaveThread.joinable())
+    {
+        g_pipelineCacheSaveThread.join();
+    }
+}
+
+static bool writePipelineCacheBlobToDisk(
+    const std::string& path,
+    const std::vector<uint8_t>& blob,
+    bool isAsync)
+{
+    if(path.empty() || blob.empty())
+    {
+        return false;
+    }
+
+    const auto cacheSaveStart =
+        std::chrono::steady_clock::now();
+
+    const std::string tmpPath = path + ".tmp";
+    FILE* file = fopen(tmpPath.c_str(), "wb");
+    bool usedTempFile = (file != nullptr);
+    if(!usedTempFile)
+    {
+        file = fopen(path.c_str(), "wb");
+    }
+
+    size_t written = 0u;
+    bool writeOk = false;
+    if(file)
+    {
+        written = fwrite(
+            blob.data(),
+            1,
+            blob.size(),
+            file
+        );
+        const int closeRc = fclose(file);
+        writeOk = (written == blob.size() && closeRc == 0);
+        if(usedTempFile)
+        {
+            if(writeOk)
+            {
+#ifdef _WIN32
+                if(!MoveFileExA(
+                       tmpPath.c_str(),
+                       path.c_str(),
+                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+#else
+                if(std::rename(tmpPath.c_str(), path.c_str()) != 0)
+#endif
+                {
+                    writeOk = false;
+                    std::remove(tmpPath.c_str());
+                }
+            }
+            else
+            {
+                std::remove(tmpPath.c_str());
+            }
+        }
+    }
+
+    const double cacheSaveMilliseconds =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - cacheSaveStart
+        ).count();
+
+    if(writeOk)
+    {
+        if(!isAsync)
+        {
+            fprintf(
+                stderr,
+                "[PERF PC.1] pipeline cache saved bytes=%zu ms=%.1f\n",
+                written,
+                cacheSaveMilliseconds
+            );
+            fflush(stderr);
+        }
+
+        RTLog(
+            "[PERF PC.1] pipeline cache saved bytes=" +
+            std::to_string(written) +
+            " ms=" +
+            std::to_string(static_cast<long long>(cacheSaveMilliseconds)) +
+            (isAsync ? " async=1" : "")
+        );
+    }
+    else
+    {
+        if(!isAsync)
+        {
+            fprintf(
+                stderr,
+                "[PERF PC.1] pipeline cache save failed path=%s\n",
+                path.c_str()
+            );
+            fflush(stderr);
+        }
+
+        RTLog(
+            "[PERF PC.1] pipeline cache save failed path=" +
+            path
+        );
+    }
+
+    return writeOk;
+}
 
 std::string ComputeRTPipelineCacheKey()
 {
@@ -681,6 +799,7 @@ void persistSharedPipelineCache()
     {
         return;
     }
+    blob.resize(blobSize);
 
     const std::string path =
         GetPipelineCacheFilePath();
@@ -690,63 +809,14 @@ void persistSharedPipelineCache()
         return;
     }
 
-    // 2026-11-02 P0（冷编分解）：96 MiB 的 blob 每次落盘都要计一次 ——
-    // 这条路径在 RT 管线建完（Device.cpp）与每 1800 帧都会走，写盘时间不能算进"编译"。
-    const auto cacheSaveStart =
-        std::chrono::steady_clock::now();
-
-    FILE* file = fopen(path.c_str(), "wb");
-
-    if(file)
-    {
-        const size_t written = fwrite(
-            blob.data(),
-            1,
-            blobSize,
-            file
-        );
-
-        fclose(file);
-
-        const double cacheSaveMilliseconds =
-            std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - cacheSaveStart
-            ).count();
-
-        fprintf(
-            stderr,
-            "[PERF PC.1] pipeline cache saved bytes=%zu ms=%.1f\n",
-            written,
-            cacheSaveMilliseconds
-        );
-
-        RTLog(
-            "[PERF PC.1] pipeline cache saved bytes=" +
-            std::to_string(written) +
-            " ms=" +
-            std::to_string(static_cast<long long>(cacheSaveMilliseconds))
-        );
-    }
-    else
-    {
-        fprintf(
-            stderr,
-            "[PERF PC.1] pipeline cache save failed path=%s\n",
-            path.c_str()
-        );
-
-        RTLog(
-            "[PERF PC.1] pipeline cache save failed path=" +
-            path
-        );
-    }
-
-    fflush(stderr);
+    writePipelineCacheBlobToDisk(path, blob, false);
 }
 // 2026-11-08：无去抖的同步落盘，供 RT 管线创建包装在每条管线成功后调用。
 // 与 maybePersist 共用"大小去重"判据，避免重复写同一份 blob。
 void PersistSharedPipelineCacheNow()
 {
+    joinPipelineCacheSaveThread();
+
     std::lock_guard<std::recursive_mutex> lock(g_pipelineCacheMutex);
 
     if(g_pipelineCache == VK_NULL_HANDLE || g_device == VK_NULL_HANDLE)
@@ -783,10 +853,106 @@ void maybePersistSharedPipelineCache()
     g_pipelineCachePersistCountdown =
         PIPELINE_CACHE_PERSIST_INTERVAL;
 
-    PersistSharedPipelineCacheNow();
+    if(g_pipelineCacheSaveInFlight.load(std::memory_order_acquire))
+    {
+        return;
+    }
+
+    {
+        std::unique_lock<std::recursive_mutex> lock(
+            g_pipelineCacheMutex,
+            std::try_to_lock
+        );
+        if(!lock.owns_lock() ||
+           g_pipelineCache == VK_NULL_HANDLE ||
+           g_device == VK_NULL_HANDLE)
+        {
+            return;
+        }
+
+        size_t blobSize = 0;
+        if(vkGetPipelineCacheData(
+               g_device,
+               g_pipelineCache,
+               &blobSize,
+               nullptr) != VK_SUCCESS ||
+           blobSize == 0 ||
+           blobSize == g_pipelineCachePersistedBytes)
+        {
+            return;
+        }
+    }
+
+    std::lock_guard<std::mutex> threadLock(g_pipelineCacheSaveThreadMutex);
+    if(g_pipelineCacheSaveInFlight.load(std::memory_order_acquire))
+    {
+        return;
+    }
+    if(g_pipelineCacheSaveThread.joinable())
+    {
+        g_pipelineCacheSaveThread.join();
+    }
+
+    g_pipelineCacheSaveInFlight.store(true, std::memory_order_release);
+    g_pipelineCacheSaveThread = std::thread([]()
+    {
+        struct InFlightReset
+        {
+            ~InFlightReset()
+            {
+                g_pipelineCacheSaveInFlight.store(false, std::memory_order_release);
+            }
+        } resetGuard;
+
+        std::vector<uint8_t> blob;
+        std::string path;
+        size_t blobSize = 0;
+
+        {
+            std::lock_guard<std::recursive_mutex> lock(g_pipelineCacheMutex);
+            if(g_pipelineCache == VK_NULL_HANDLE || g_device == VK_NULL_HANDLE)
+            {
+                return;
+            }
+
+            if(vkGetPipelineCacheData(
+                   g_device,
+                   g_pipelineCache,
+                   &blobSize,
+                   nullptr) != VK_SUCCESS ||
+               blobSize == 0 ||
+               blobSize == g_pipelineCachePersistedBytes)
+            {
+                return;
+            }
+
+            blob.resize(blobSize);
+            if(vkGetPipelineCacheData(
+                   g_device,
+                   g_pipelineCache,
+                   &blobSize,
+                   blob.data()) != VK_SUCCESS)
+            {
+                return;
+            }
+            blob.resize(blobSize);
+            path = GetPipelineCacheFilePath();
+        }
+
+        if(writePipelineCacheBlobToDisk(path, blob, true))
+        {
+            std::lock_guard<std::recursive_mutex> lock(g_pipelineCacheMutex);
+            if(g_pipelineCache != VK_NULL_HANDLE)
+            {
+                g_pipelineCachePersistedBytes = blobSize;
+            }
+        }
+    });
 }
 void releaseSharedPipelineCache()
 {
+    joinPipelineCacheSaveThread();
+
     std::lock_guard<std::recursive_mutex> lock(g_pipelineCacheMutex);
 
     if(g_pipelineCache != VK_NULL_HANDLE)

@@ -13,9 +13,15 @@ layout(binding = 2, set = 0) uniform CameraProperties {
 
 #include "sharc_ubo.glsl"
 
+layout(push_constant) uniform SharcResolvePush {
+    uint sliceStride;
+    uint sliceOffset;
+} pc;
+
 void main()
 {
-    const uint entryIndex = gl_GlobalInvocationID.x;
+    const uint stride = max(pc.sliceStride, 1u);
+    const uint entryIndex = gl_GlobalInvocationID.x * stride + pc.sliceOffset;
 
     SharcParameters sharcParameters = sharcBuildParameters();
 

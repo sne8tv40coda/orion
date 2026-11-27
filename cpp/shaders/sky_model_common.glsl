@@ -3,6 +3,58 @@
 
 #include "sky_sun_common.glsl"
 
+// =============================================================================
+// 2026-11-27 天空 LUT（skyScatteringTex / skyTransmittanceTex，256×128 equirect）
+// 的仰角参数化 —— 修「天空色彩呈阶梯分布、断层」（用户报告）。
+//
+// 旧映射 v = elevation/π + 0.5 是**线性**的：128 行均分 180°，每行 1.41°。
+// 而天空的色彩变化几乎全挤在地平线上下几度（暮光橙带、地平线泛白、Rayleigh
+// 光程在 mu→0 处的陡升）；双线性插值在这里只是一串 1.4° 长的折线段，
+// 每个转折点的斜率突变经 ACES2 抬对比后读成一圈圈色阶 = "阶梯断层"。
+//
+// 改为 Hillaire 2020（UE4 Sky-View LUT）的非线性纬度映射：
+//   v = 0.5 + 0.5·sign(l)·sqrt(|l| / (π/2))
+// 地平线 ±5° 内由 ~7 行增至 ~30 行（采样密度 ≈4×），天顶附近每行放宽到 ~2.8°
+// —— 那里天空本来就是平滑渐变，不需要分辨率。零额外采样、零额外显存。
+//
+// **写端与读端必须同一映射**：写端 sky_atmosphere.comp::directionForPixel，
+// 读端 rt_test.rmiss（天空本体 + 日盘透射染色）、rgen_transparent_primary.glsl
+// （玻璃解析反射）、rgen_water_receiver.glsl（走查耗尽天空）、
+// volumetric_clouds_v5.comp（云的天光）。四处都只调这两个函数。
+// star_map_common.glsl / rt_test.rgen 里的 directionToEquirect 仍是线性的，
+// 它们服务星图等别的 equirect 纹理，**不要**拿来采天空 LUT。
+// A/B 回退：-DSKY_LUT_HORIZON_MAPPING=0（逐位回到线性映射）。
+// =============================================================================
+#ifndef SKY_LUT_HORIZON_MAPPING
+#define SKY_LUT_HORIZON_MAPPING 1
+#endif
+
+vec2 skyLutDirectionToUv(vec3 dir)
+{
+    const float TWO_PI = 6.28318530718;
+    const float HALF_PI = 1.57079632679;
+    float u = fract(atan(dir.z, dir.x) / TWO_PI);
+    float elevation = asin(clamp(dir.y, -1.0, 1.0));
+#if SKY_LUT_HORIZON_MAPPING
+    float v = 0.5 + 0.5 * sign(elevation) *
+        sqrt(clamp(abs(elevation) / HALF_PI, 0.0, 1.0));
+#else
+    float v = elevation / 3.14159265359 + 0.5;
+#endif
+    return vec2(u, v);
+}
+
+float skyLutElevationFromV(float v)
+{
+#if SKY_LUT_HORIZON_MAPPING
+    const float HALF_PI = 1.57079632679;
+    float s = 2.0 * v - 1.0;
+    return sign(s) * s * s * HALF_PI;
+#else
+    return (v - 0.5) * 3.14159265359;
+#endif
+}
+
 vec3 sunDirection()
 {
     const float TWO_PI = 6.28318530718;

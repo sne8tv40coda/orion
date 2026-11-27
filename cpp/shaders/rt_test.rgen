@@ -7,7 +7,7 @@
 #extension GL_EXT_nonuniform_qualifier : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #ifdef ORION_K2I_COMPOSE_COMPUTE
-layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 #define gl_LaunchIDEXT gl_GlobalInvocationID
 #define gl_LaunchSizeEXT uvec3(imageSize(image), 1u)
 #else
@@ -1152,13 +1152,11 @@ bool giRouletteEnabledForVariant()
 // 返回累积透射"而不是判 0。单水柱场景近档/远档逐位一致；本设置只决定
 // 多界面水柱 / 玻璃堆场景的积分精度，不再钳制透射观感（用户诉求：透射
 // 统一随水深，浅清深浊）。
+// 2026-11-27：彻底移除“太阳透射距离”钳制。
+// 空气侧半透明统一走单次 RT_PURPOSE_GLASS_VISIBILITY（无距离/步数限制）；
+// 本函数仅保留兼容符号，返回水下出水 march 默认步数上限 3。
 #ifndef WATER_SUN_MARCH_STEPS
-// 2026-11-18（重构，按 RTX Remix thin-walled 口径）：默认 1 步。
-// Remix 的薄壁水面把介质吸收按**一次** Beer-Lambert 算完（
-// translucent_surface_material_interaction.slangh:516-525），不做多界面 march；
-// 多界面精度只在叠水/玻璃堆场景有意义，而那类场景在 425k 像素的全分辨率下
-// 会直接把 K2-SUN 腿顶到 40 ms。回退：-DWATER_SUN_MARCH_STEPS=3。
-#define WATER_SUN_MARCH_STEPS 1
+#define WATER_SUN_MARCH_STEPS 3
 #endif
 int perfL10MarchSteps(vec3 worldPos)
 {
@@ -3349,7 +3347,7 @@ uint vptRisProposalCount()
 #else
     uint proposalLane = cam.perfSecondary.x;
     return proposalLane != 0u
-        ? clamp(proposalLane, 1u, 32u)
+        ? clamp(proposalLane, 2u, 32u)
         : uint(VPT_RIS_PROPOSAL_FLOOR);
 #endif
 }
@@ -3389,28 +3387,88 @@ void vptEmitterVisibleFaceWeights(
     const vec3 bMin = vec3(emitterBlock);
     const vec3 bMax = bMin + vec3(1.0);
     const vec3 bCenter = bMin + vec3(0.5);
+    const float slabEps = 1.5e-3;
+    vec3 rawPosW = vec3(0.0);
+    vec3 rawNegW = vec3(0.0);
     posW = vec3(0.0);
     negW = vec3(0.0);
-    for(int a = 0; a < 3; ++a)
+
+    if(hitPos.x > bMax.x + slabEps)
     {
-        if(hitPos[a] > bMax[a] + 1.0e-4)
+        vec3 d = hitPos - vec3(bMax.x, bCenter.y, bCenter.z);
+        float w = max(d.x / max(length(d), 1.0e-5), 1.0e-4);
+        rawPosW.x = w;
+        uint adjSrc = 0u;
+        if(!vptReadSourceVoxel(emitterBlock + ivec3(1, 0, 0), adjSrc) || ((adjSrc & 3u) != 1u))
         {
-            vec3 fc = bCenter;
-            fc[a] = bMax[a];
-            vec3 d = hitPos - fc;
-            float len = max(length(d), 1.0e-5);
-            posW[a] = max(d[a] / len, 1.0e-4);
-        }
-        else if(hitPos[a] < bMin[a] - 1.0e-4)
-        {
-            vec3 fc = bCenter;
-            fc[a] = bMin[a];
-            vec3 d = fc - hitPos;
-            float len = max(length(d), 1.0e-5);
-            negW[a] = max(d[a] / len, 1.0e-4);
+            posW.x = w;
         }
     }
+    else if(hitPos.x < bMin.x - slabEps)
+    {
+        vec3 d = vec3(bMin.x, bCenter.y, bCenter.z) - hitPos;
+        float w = max(d.x / max(length(d), 1.0e-5), 1.0e-4);
+        rawNegW.x = w;
+        uint adjSrc = 0u;
+        if(!vptReadSourceVoxel(emitterBlock + ivec3(-1, 0, 0), adjSrc) || ((adjSrc & 3u) != 1u))
+        {
+            negW.x = w;
+        }
+    }
+
+    if(hitPos.y > bMax.y + slabEps)
+    {
+        vec3 d = hitPos - vec3(bCenter.x, bMax.y, bCenter.z);
+        float w = max(d.y / max(length(d), 1.0e-5), 1.0e-4);
+        rawPosW.y = w;
+        uint adjSrc = 0u;
+        if(!vptReadSourceVoxel(emitterBlock + ivec3(0, 1, 0), adjSrc) || ((adjSrc & 3u) != 1u))
+        {
+            posW.y = w;
+        }
+    }
+    else if(hitPos.y < bMin.y - slabEps)
+    {
+        vec3 d = vec3(bCenter.x, bMin.y, bCenter.z) - hitPos;
+        float w = max(d.y / max(length(d), 1.0e-5), 1.0e-4);
+        rawNegW.y = w;
+        uint adjSrc = 0u;
+        if(!vptReadSourceVoxel(emitterBlock + ivec3(0, -1, 0), adjSrc) || ((adjSrc & 3u) != 1u))
+        {
+            negW.y = w;
+        }
+    }
+
+    if(hitPos.z > bMax.z + slabEps)
+    {
+        vec3 d = hitPos - vec3(bCenter.x, bCenter.y, bMax.z);
+        float w = max(d.z / max(length(d), 1.0e-5), 1.0e-4);
+        rawPosW.z = w;
+        uint adjSrc = 0u;
+        if(!vptReadSourceVoxel(emitterBlock + ivec3(0, 0, 1), adjSrc) || ((adjSrc & 3u) != 1u))
+        {
+            posW.z = w;
+        }
+    }
+    else if(hitPos.z < bMin.z - slabEps)
+    {
+        vec3 d = vec3(bCenter.x, bCenter.y, bMin.z) - hitPos;
+        float w = max(d.z / max(length(d), 1.0e-5), 1.0e-4);
+        rawNegW.z = w;
+        uint adjSrc = 0u;
+        if(!vptReadSourceVoxel(emitterBlock + ivec3(0, 0, -1), adjSrc) || ((adjSrc & 3u) != 1u))
+        {
+            negW.z = w;
+        }
+    }
+
     totalW = dot(posW, vec3(1.0)) + dot(negW, vec3(1.0));
+    if(totalW <= 1.0e-6)
+    {
+        posW = rawPosW;
+        negW = rawNegW;
+        totalW = dot(posW, vec3(1.0)) + dot(negW, vec3(1.0));
+    }
 }
 
 vec3 vptSampleLocalEmitterPoint(
@@ -3492,19 +3550,19 @@ vec3 vptSampleLocalEmitterPoint(
         }
     }
 
-    vec2 uv = vec2(rand(rngState), rand(rngState)) * 0.990 + vec2(0.005);
+    vec2 uv = vec2(rand(rngState), rand(rngState)) * 0.960 + vec2(0.020);
     vec3 localPos = vec3(0.0);
     if(selectedAxis == 0)
     {
-        localPos = vec3(selectedSign > 0.0 ? 0.999 : 0.001, uv.x, uv.y);
+        localPos = vec3(selectedSign > 0.0 ? 0.998 : 0.002, uv.x, uv.y);
     }
     else if(selectedAxis == 1)
     {
-        localPos = vec3(uv.x, selectedSign > 0.0 ? 0.999 : 0.001, uv.y);
+        localPos = vec3(uv.x, selectedSign > 0.0 ? 0.998 : 0.002, uv.y);
     }
     else
     {
-        localPos = vec3(uv.x, uv.y, selectedSign > 0.0 ? 0.999 : 0.001);
+        localPos = vec3(uv.x, uv.y, selectedSign > 0.0 ? 0.998 : 0.002);
     }
     return bMin + localPos;
 }
@@ -3836,13 +3894,13 @@ vec3 traceVptLocalLightVisibilityCached(
 #define VPT_LIGHT_GRID_EXHAUSTIVE_MAX 12u
 #endif
 #ifndef VPT_LIGHT_GRID_BOUNCE_EXHAUSTIVE_MAX
-#define VPT_LIGHT_GRID_BOUNCE_EXHAUSTIVE_MAX 8u
+#define VPT_LIGHT_GRID_BOUNCE_EXHAUSTIVE_MAX 4u
 #endif
 #ifndef VPT_LIGHT_GRID_PROPOSAL_CAP
 #define VPT_LIGHT_GRID_PROPOSAL_CAP 8u
 #endif
 #ifndef VPT_LIGHT_GRID_BOUNCE_PROPOSAL_CAP
-#define VPT_LIGHT_GRID_BOUNCE_PROPOSAL_CAP 6u
+#define VPT_LIGHT_GRID_BOUNCE_PROPOSAL_CAP 3u
 #endif
 #ifndef VPT_LIGHT_GRID_MIS_GRID_PROPOSALS
 #define VPT_LIGHT_GRID_MIS_GRID_PROPOSALS 6u
@@ -3851,10 +3909,10 @@ vec3 traceVptLocalLightVisibilityCached(
 #define VPT_LIGHT_GRID_MIS_DIR_PROPOSALS 2u
 #endif
 #ifndef VPT_LIGHT_GRID_BOUNCE_MIS_GRID_PROPOSALS
-#define VPT_LIGHT_GRID_BOUNCE_MIS_GRID_PROPOSALS 4u
+#define VPT_LIGHT_GRID_BOUNCE_MIS_GRID_PROPOSALS 2u
 #endif
 #ifndef VPT_LIGHT_GRID_BOUNCE_MIS_DIR_PROPOSALS
-#define VPT_LIGHT_GRID_BOUNCE_MIS_DIR_PROPOSALS 2u
+#define VPT_LIGHT_GRID_BOUNCE_MIS_DIR_PROPOSALS 1u
 #endif
 #ifndef VPT_LOCAL_BLUE_NOISE_RIS
 #define VPT_LOCAL_BLUE_NOISE_RIS 1
@@ -4747,7 +4805,19 @@ vec3 evaluateVPTRISDirectLightingSingle(
     // DIRECTION, not its length, as the deciding factor.  N is still used for
     // the shading cosine below.
     vec3 neeRayDirection = normalize(selectedSample - hitPos);
-    vec3 receiverOrigin = hitPos + neeRayDirection * 0.001;
+    vec3 receiverBase = hitPos;
+#if VPT_LOCAL_GEOMETRIC_COSINE_BOUND
+    if(!waterColumnReceiver && geometricFaceKnown && dot(localGeometricN, neeRayDirection) > 0.0)
+    {
+        vec3 airBiasedPos = hitPos + localGeometricN * 0.002;
+        uint biasSrc = 0u;
+        if(!vptReadSourceVoxel(ivec3(floor(airBiasedPos)), biasSrc) || ((biasSrc & 3u) != 1u))
+        {
+            receiverBase = airBiasedPos;
+        }
+    }
+#endif
+    vec3 receiverOrigin = receiverBase + neeRayDirection * 0.001;
     // Stop the transmission march just before it enters the emitter's own
     // voxel, so the emitter mesh cannot shadow its own emitted sample.  This
     // used to run vptLoadedPathToCandidateEmitter() and treat "path not
@@ -5156,6 +5226,63 @@ vec3 evaluateDynamicLightRISDirect(
             (float(proposals) * selectedWeight)),
         transmittance
     );
+}
+
+// 2026-11-27: 100% 确定性、零射线、零数组、零噪点的动态光源直接光照求和，
+// 专供水体反射/透射接收面与半透明玻璃链使用，彻底消除 1-spp RIS 随机颗粒。
+vec3 evaluateDynamicLightDeterministicDirect(
+    vec3 hitPos,
+    vec3 hitNormal,
+    vec3 hitAlbedo,
+    float receiverCameraDistance
+)
+{
+    if(receiverCameraDistance > 144.0)
+    {
+        return vec3(0.0);
+    }
+
+    uint lightCount = min(dynamicLights.header.x, 8u);
+    if(lightCount == 0u)
+    {
+        return vec3(0.0);
+    }
+
+    vec3 N = normalize(hitNormal);
+    vec3 dynamicLightCameraPosition =
+        (cam.viewInverse * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+    vec3 V = normalize(dynamicLightCameraPosition - hitPos);
+
+    vec3 sum = vec3(0.0);
+    for(uint lightIndex = 0u; lightIndex < lightCount; ++lightIndex)
+    {
+        DynamicLightRecord light = dynamicLights.lights[lightIndex];
+        float emissionLevel = light.worldPosEmission.w;
+        if(emissionLevel <= 0.0)
+        {
+            continue;
+        }
+        sum += dynamicLightContribution(
+            hitPos,
+            N,
+            V,
+            hitAlbedo,
+            vec3(-1.0),
+            -1.0,
+            1.0,
+            emissionLevel,
+            light.meta.x,
+            light.meta.y,
+            light.worldPosEmission.xyz
+        );
+    }
+
+    float luma = dot(max(sum, vec3(0.0)), vec3(0.2126, 0.7152, 0.0722));
+    if(luma > 3.5)
+    {
+        sum *= 3.5 / luma;
+    }
+    return sum;
 }
 
 // 2026-10-07：多了 f0 / metallic / roughness 三个材质入参 —— 移动光源的镜面项要用。
@@ -8206,7 +8333,33 @@ vec3 vptLocalEmitterSampleTransmittance(
 {
     ivec3 selectedBlock = ivec3(floor(selectedSample));
     vec3 neeRayDirection = normalize(selectedSample - hitPos);
-    vec3 receiverOrigin = hitPos + neeRayDirection * 0.001;
+    vec3 receiverBase = hitPos;
+    vec3 transFrac = fract(hitPos);
+    vec3 transDistToFace = min(transFrac, vec3(1.0) - transFrac);
+    float transNearestFace = min(transDistToFace.x, min(transDistToFace.y, transDistToFace.z));
+    if(transNearestFace <= VPT_LOCAL_FACE_AXIS_EPS)
+    {
+        int faceAxis = 0;
+        if(transDistToFace.y == transNearestFace)
+        {
+            faceAxis = 1;
+        }
+        else if(transDistToFace.z == transNearestFace)
+        {
+            faceAxis = 2;
+        }
+        vec3 faceN;
+        if(vptVoxelFaceNormalFromHit(hitPos, faceAxis, faceN) && dot(faceN, neeRayDirection) > 0.0)
+        {
+            vec3 airBiasedPos = hitPos + faceN * 0.002;
+            uint biasSrc = 0u;
+            if(!vptReadSourceVoxel(ivec3(floor(airBiasedPos)), biasSrc) || ((biasSrc & 3u) != 1u))
+            {
+                receiverBase = airBiasedPos;
+            }
+        }
+    }
+    vec3 receiverOrigin = receiverBase + neeRayDirection * 0.001;
 
     bool sampledPointInsideEmitterVoxel =
         all(greaterThanEqual(selectedSample, vec3(selectedBlock))) &&
@@ -9076,18 +9229,64 @@ struct GlassSurfaceInfo {
     float alpha;
 };
 #include "rgen_trace_state.glsl"
+#if !defined(ORION_K2I_COMPOSE_COMPUTE)
+#ifndef ORION_OPAQUE_VIS_FASTPATH
+#define ORION_OPAQUE_VIS_FASTPATH 1
+#endif
+#ifndef SUN_SHADOW_RAY_TMIN
+#define SUN_SHADOW_RAY_TMIN 0.02
+#endif
+#if ORION_OPAQUE_VIS_FASTPATH
+bool tryOpaqueSunVisibilityQuery(
+    vec3 origin,
+    vec3 dir,
+    float maxDist,
+    out float outHitDist)
+{
+    rayQueryEXT sunVisQuery;
+    rayQueryInitializeEXT(
+        sunVisQuery,
+        topLevelAS,
+        gl_RayFlagsTerminateOnFirstHitEXT,
+        g_secondaryCullMask,
+        origin,
+        SUN_SHADOW_RAY_TMIN,
+        dir,
+        maxDist
+    );
+    if(!rayQueryProceedEXT(sunVisQuery))
+    {
+        #ifdef ORION_RT_STAGE_COUNTERS
+        rtCntRayIssued();
+        #endif
+        outHitDist = (rayQueryGetIntersectionTypeEXT(sunVisQuery, true) !=
+                      gl_RayQueryCommittedIntersectionNoneEXT)
+            ? rayQueryGetIntersectionTEXT(sunVisQuery, true)
+            : -1.0;
+        return true;
+    }
+    rayQueryTerminateEXT(sunVisQuery);
+    outHitDist = 1.0;
+    return false;
+}
+#endif
+#endif
 #include "rgen_trace_helpers.glsl"
 #include "rgen_rng.glsl"
 #include "rgen_glass_profile.glsl"
 #include "rgen_water_sun.glsl"
 #include "rgen_pbr_eval.glsl"
 #include "rgen_sun_lighting.glsl"
+#if !defined(ORION_K2_DIRECT_SUN_STAGE_B)
 #include "rgen_local_lights.glsl"
+#endif
 #if !defined(ORION_K2I_COMPOSE_COMPUTE) && !defined(ORION_K1_DEFER_GLASS) && !defined(ORION_K2_LOC_NEE_ONLY) && !defined(ORION_K2_DIRECT_SUN_STAGE_B) && !SHARC_UPDATE
 #if !defined(ORION_K2_LOC_GLOSSY_ONLY) && !defined(ORION_K2_INDIRECT_TRACE_ONLY) && !defined(ORION_K2_DIRECT_SUN_STAGE_A)
 #include "rgen_glass_reflection.glsl"
 #endif
+#if !defined(ORION_K2_INDIRECT_TRACE_ONLY)
 #include "rgen_receiver_gi.glsl"
+#endif
 #if !defined(ORION_K2_LOC_GLOSSY_ONLY) && !defined(ORION_K2_INDIRECT_TRACE_ONLY)
 #if !defined(ORION_K1_GLASS_ONLY)
 #include "rgen_water_caustics.glsl"
@@ -9106,7 +9305,9 @@ struct GlassSurfaceInfo {
 #endif
 #include "rgen_dh_far.glsl"
 #include "rgen_vpt_sparse.glsl"
+#if !defined(ORION_K2_DIRECT_SUN_STAGE_B) && !defined(ORION_K2_DIRECT_SUN_STAGE_A) && !defined(ORION_K2_DIRECT_LOCAL_STAGE)
 #include "rgen_gi_temporal.glsl"
+#endif
 #include "rgen_k1_landing.glsl"
 #ifdef ORION_K2_TRANSPORT
 #include "rgen_k2_material.glsl"

@@ -23,7 +23,13 @@
 #define SUN_RAY_NORMAL_BIAS 0.02
 #endif
 
-vec3 evaluateDirectSunLighting(
+// 2026-11-27 (Batch AE): Optional scalar capture of sunTransmittance for
+// immediate reuse by underwater caustics (avoids duplicate water-sun trace).
+bool g_captureDirectSunTrans = false;
+bool g_capturedDirectSunValid = false;
+vec3 g_capturedDirectSunTrans = vec3(0.0);
+
+vec3 evaluateDirectSunLightingInMedium(
     vec3 hitPos,
     vec3 hitNormal,
     vec3 viewDir,
@@ -31,7 +37,8 @@ vec3 evaluateDirectSunLighting(
     float hitRoughness,
     float hitF0Metal,
     float pomSelfShadow,
-    vec3 sunDirection
+    vec3 sunDirection,
+    bool startInWater
 )
 {
     vec3 N =
@@ -69,14 +76,20 @@ vec3 evaluateDirectSunLighting(
         return vec3(0.0);
     }
 
+    const vec3 sunRayOrigin =
+        hitPos +
+        N * SUN_RAY_NORMAL_BIAS +
+        L * 0.001;
 
-    vec3 sunTransmittance =
-        traceSunTransmittanceThroughWater(
-            hitPos +
-                N * SUN_RAY_NORMAL_BIAS +
-                L * 0.001,
-            L
-        );
+    vec3 sunTransmittance = startInWater
+        ? traceSunTransmittanceThroughWater(sunRayOrigin, L)
+        : traceSunTransmittanceAir(sunRayOrigin, L);
+
+    if(g_captureDirectSunTrans)
+    {
+        g_capturedDirectSunTrans = sunTransmittance;
+        g_capturedDirectSunValid = true;
+    }
 
     if(max(sunTransmittance.r, max(sunTransmittance.g, sunTransmittance.b)) <= 1.0e-5)
     {
@@ -88,7 +101,7 @@ vec3 evaluateDirectSunLighting(
         3.2 *
         getTimeDrivenSkyLightRadianceScale() *
         sunTransmittance *
-        c3CloudSunTransmittance(hitPos + N * SUN_RAY_NORMAL_BIAS + L * 0.001, L) *
+        c3CloudSunTransmittance(sunRayOrigin, L) *
         clamp(
             pomSelfShadow,
             0.0,
@@ -162,17 +175,42 @@ vec3 evaluateDirectSunLighting(
         );
 }
 
+vec3 evaluateDirectSunLighting(
+    vec3 hitPos,
+    vec3 hitNormal,
+    vec3 viewDir,
+    vec3 hitAlbedo,
+    float hitRoughness,
+    float hitF0Metal,
+    float pomSelfShadow,
+    vec3 sunDirection
+)
+{
+    return evaluateDirectSunLightingInMedium(
+        hitPos,
+        hitNormal,
+        viewDir,
+        hitAlbedo,
+        hitRoughness,
+        hitF0Metal,
+        pomSelfShadow,
+        sunDirection,
+        false
+    );
+}
+
 #ifndef GI_BOUNCE_LAMBERT_DIRECT
 #define GI_BOUNCE_LAMBERT_DIRECT 1
 #endif
 
-vec3 evaluateDirectSunLightingDiffuse(
+vec3 evaluateDirectSunLightingDiffuseInMedium(
     vec3 hitPos,
     vec3 hitNormal,
     vec3 hitAlbedo,
     float hitF0Metal,
     float pomSelfShadow,
-    vec3 sunDirection
+    vec3 sunDirection,
+    bool startInWater
 )
 {
     vec3 N =
@@ -196,13 +234,14 @@ vec3 evaluateDirectSunLightingDiffuse(
         return vec3(0.0);
     }
 
-    vec3 sunTransmittance =
-        traceSunTransmittanceThroughWater(
-            hitPos +
-                N * SUN_RAY_NORMAL_BIAS +
-                L * 0.001,
-            L
-        );
+    const vec3 sunRayOrigin =
+        hitPos +
+        N * SUN_RAY_NORMAL_BIAS +
+        L * 0.001;
+
+    vec3 sunTransmittance = startInWater
+        ? traceSunTransmittanceThroughWater(sunRayOrigin, L)
+        : traceSunTransmittanceAir(sunRayOrigin, L);
 
     if(max(sunTransmittance.r, max(sunTransmittance.g, sunTransmittance.b)) <= 1.0e-5)
     {
@@ -214,7 +253,7 @@ vec3 evaluateDirectSunLightingDiffuse(
         3.2 *
         getTimeDrivenSkyLightRadianceScale() *
         sunTransmittance *
-        c3CloudSunTransmittance(hitPos + N * SUN_RAY_NORMAL_BIAS + L * 0.001, L) *
+        c3CloudSunTransmittance(sunRayOrigin, L) *
         clamp(
             pomSelfShadow,
             0.0,
@@ -235,6 +274,26 @@ vec3 evaluateDirectSunLightingDiffuse(
         metallic < 0.5 ? 0.96 : 0.25;
 
     return sunLightColor * (hitAlbedo * diffuseScale * BSDF_SUN_DIFFUSE_SCALE * NdotL);
+}
+
+vec3 evaluateDirectSunLightingDiffuse(
+    vec3 hitPos,
+    vec3 hitNormal,
+    vec3 hitAlbedo,
+    float hitF0Metal,
+    float pomSelfShadow,
+    vec3 sunDirection
+)
+{
+    return evaluateDirectSunLightingDiffuseInMedium(
+        hitPos,
+        hitNormal,
+        hitAlbedo,
+        hitF0Metal,
+        pomSelfShadow,
+        sunDirection,
+        false
+    );
 }
 
 

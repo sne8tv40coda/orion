@@ -12,8 +12,11 @@
 #extension GL_GOOGLE_include_directive : require
 #define GLASS_TINT_NO_DDA 1
 
-// =====================================================
-// 2026-10-26（第四轮，严格搬 RTX Remix）
+#ifndef VPT_GLASS_DIELECTRIC_REWRITE
+#define VPT_GLASS_DIELECTRIC_REWRITE 1
+#endif
+
+#if 1 // glass_chain_common.glsl 引用 73/74/75，绑定必须声明（未被调用即无运行期开销）
 // AlphaBlendSurface 的每像素状态由**命中着色器**读写（原文在
 // geometry_resolver.slangh:2196-2199 做 load -> update -> store），
 // 三张图的通道分配见 glass_chain_common.glsl 顶部。
@@ -26,6 +29,7 @@ uniform image2D glassAlphaBlendMetaImage;
 
 layout(binding = 75, set = 0, rgba16f)
 uniform image2D glassAlphaBlendLightImage;
+#endif
 
 #include "glass_tint_common.glsl"
 // LOD / 远场几何的角色表与每柱覆盖位图（binding 19/20）。
@@ -34,6 +38,7 @@ uniform image2D glassAlphaBlendLightImage;
 // 2026-10-20: 结构体单源化，见 hit_payload.glsl（六个 shader 共用同一份布局）。
 #include "hit_payload.glsl"
 // 2026-10-25：透射事件与 main 共用同一套物理薄片数学 + 同一套链契约。
+// （glass_chain_common.glsl 依赖 thinwall，纯函数无绑定，保留无成本。）
 #include "glass_dielectric_common.glsl"
 #include "glass_thinwall_common.glsl"
 #include "glass_chain_common.glsl"
@@ -131,6 +136,14 @@ vec3 rtObjectToWorld(vec3 localPosition)
     return gl_ObjectToWorldEXT * vec4(localPosition, 1.0);
 }
 
+struct VertexLite {
+    float u, v;
+    float r, g, b, a;
+    float materialId;
+    float pad1;
+    float pad2;
+};
+
 #if SECTION_VERTEX_32B
 struct SectionVertex32
 {
@@ -145,17 +158,13 @@ layout(buffer_reference, scalar) buffer SectionVertices32 {
     SectionVertex32 v[];
 };
 
-Vertex loadSectionVertex(uint64_t addr, uint stride, uint index)
+VertexLite loadSectionVertexLite(uint64_t addr, uint stride, uint index)
 {
     if(stride == 32u)
     {
         const SectionVertex32 packed = SectionVertices32(addr).v[index];
 
-        Vertex unpacked;
-        const vec3 world = rtObjectToWorld(vec3(packed.x, packed.y, packed.z));
-        unpacked.x = world.x;
-        unpacked.y = world.y;
-        unpacked.z = world.z;
+        VertexLite unpacked;
         unpacked.u = packed.u;
         unpacked.v = packed.v;
         unpacked.r = float(packed.color & 0xFFu) / 255.0;
@@ -171,22 +180,51 @@ Vertex loadSectionVertex(uint64_t addr, uint stride, uint index)
         return unpacked;
     }
 
-    Vertex raw = Vertices(addr).v[index];
-    const vec3 world = rtObjectToWorld(vec3(raw.x, raw.y, raw.z));
-    raw.x = world.x;
-    raw.y = world.y;
-    raw.z = world.z;
-    return raw;
+    const Vertex raw = Vertices(addr).v[index];
+    VertexLite lite;
+    lite.u = raw.u;
+    lite.v = raw.v;
+    lite.r = raw.r;
+    lite.g = raw.g;
+    lite.b = raw.b;
+    lite.a = raw.a;
+    lite.materialId = raw.materialId;
+    lite.pad1 = raw.pad1;
+    lite.pad2 = raw.pad2;
+    return lite;
+}
+
+vec3 loadSectionVertexWorldPos(uint64_t addr, uint stride, uint index)
+{
+    if(stride == 32u)
+    {
+        const SectionVertex32 packed = SectionVertices32(addr).v[index];
+        return rtObjectToWorld(vec3(packed.x, packed.y, packed.z));
+    }
+    const Vertex raw = Vertices(addr).v[index];
+    return rtObjectToWorld(vec3(raw.x, raw.y, raw.z));
 }
 #else
-Vertex loadSectionVertex(uint64_t addr, uint /*stride*/, uint index)
+VertexLite loadSectionVertexLite(uint64_t addr, uint /*stride*/, uint index)
 {
-    Vertex raw = Vertices(addr).v[index];
-    const vec3 world = rtObjectToWorld(vec3(raw.x, raw.y, raw.z));
-    raw.x = world.x;
-    raw.y = world.y;
-    raw.z = world.z;
-    return raw;
+    const Vertex raw = Vertices(addr).v[index];
+    VertexLite lite;
+    lite.u = raw.u;
+    lite.v = raw.v;
+    lite.r = raw.r;
+    lite.g = raw.g;
+    lite.b = raw.b;
+    lite.a = raw.a;
+    lite.materialId = raw.materialId;
+    lite.pad1 = raw.pad1;
+    lite.pad2 = raw.pad2;
+    return lite;
+}
+
+vec3 loadSectionVertexWorldPos(uint64_t addr, uint /*stride*/, uint index)
+{
+    const Vertex raw = Vertices(addr).v[index];
+    return rtObjectToWorld(vec3(raw.x, raw.y, raw.z));
 }
 #endif
 
@@ -634,26 +672,30 @@ void main() {
         i2 = i0 + 2u;
     }
 
-    Vertex v0 = loadSectionVertex(rawAddr, sectionStride, i0);
-    Vertex v1 = loadSectionVertex(rawAddr, sectionStride, i1);
-    Vertex v2 = loadSectionVertex(rawAddr, sectionStride, i2);
-
     vec3 barycentrics = vec3(1.0 - attribs.x - attribs.y, attribs.x, attribs.y);
 
-    // === 远场去重（Vista 模型）===
-    // 与 rt_test.rahit 同源：角色取自 binding 19 角色表，命中点世界柱查 binding 20
-    // 覆盖位图，近场已就绪的柱上丢弃远场命中。
+    // === 远场去重（Vista 模型）与 DH 远场早退 ===
+    // 近场半透明命中（水/玻璃）instanceRole != LOD_ROLE_DH_FAR，
+    // 跳过 3 次 rtObjectToWorld 矩阵乘与位置插值。
     const uint instanceRole = lodInstanceRole();
-    const vec3 hitWorldPosition =
-        vec3(v0.x, v0.y, v0.z) * barycentrics.x +
-        vec3(v1.x, v1.y, v1.z) * barycentrics.y +
-        vec3(v2.x, v2.y, v2.z) * barycentrics.z;
-
-    if(lodHitIsRedundant(instanceRole, hitWorldPosition))
+    if(instanceRole == LOD_ROLE_DH_FAR)
     {
-        ignoreIntersectionEXT;
+        const vec3 p0 = loadSectionVertexWorldPos(rawAddr, sectionStride, i0);
+        const vec3 p1 = loadSectionVertexWorldPos(rawAddr, sectionStride, i1);
+        const vec3 p2 = loadSectionVertexWorldPos(rawAddr, sectionStride, i2);
+        const vec3 hitWorldPosition =
+            p0 * barycentrics.x + p1 * barycentrics.y + p2 * barycentrics.z;
+        if(lodHitIsRedundant(instanceRole, hitWorldPosition))
+        {
+            ignoreIntersectionEXT;
+            return;
+        }
         return;
     }
+
+    VertexLite v0 = loadSectionVertexLite(rawAddr, sectionStride, i0);
+    VertexLite v1 = loadSectionVertexLite(rawAddr, sectionStride, i1);
+    VertexLite v2 = loadSectionVertexLite(rawAddr, sectionStride, i2);
 
     float interpU = v0.u * barycentrics.x + v1.u * barycentrics.y + v2.u * barycentrics.z;
     float interpV = v0.v * barycentrics.x + v1.v * barycentrics.y + v2.v * barycentrics.z;
@@ -693,25 +735,6 @@ if(
         v1.pad1 * barycentrics.y +
         v2.pad1 * barycentrics.z;
     bool isVoxyAnyHit = voxyAnyHitMarker < -0.5;
-
-    // =====================================================
-    // DH 远场几何：**不做 alpha cutout**，直接接受命中
-    // =====================================================
-    // DH 顶点记录的 a 通道**不是 alpha**，而是打包光照 (skyLight<<4)|blockLight
-    // （见 VulkanCore.appendDhLodQuads 的字节契约与 DhLodMesher.packLight）⇒ 无光格
-    // a=0 ⇒ 下面 combinedAlpha=0 ⇒ 整片阴影区地形被 ignoreIntersectionEXT 剔掉。
-    // 2026-09-25 实机症状就是它：远场成片空洞 + 能看穿地形。
-    //
-    // 远场本来也没有 cutout 语义：LOD 树叶是实心壳（closest-hit 侧按实心 BSDF 着色），
-    // 拿贴图 alpha 打洞只会在几百格外留下针孔。DH 的三个桶都走 SBT_RECORD_ALPHA
-    // （见 VulkanCore 的 LOD_AS_CLASS_* 注释），所以这条必须在这里。
-    //
-    // ★ 判据由 pad1 < -2.5 改为角色表：pad1 现在只表示 DH 材质编号（值域 [-18,-3]，
-    //   由 closest-hit 还原成 0..15），不再兼任"是不是远场"的选址暗号。
-    if(instanceRole == LOD_ROLE_DH_FAR)
-    {
-        return;
-    }
 
     // pad2 >= 0 marks a quad with a texture-table tile (bridge mip +
     // shade/256); pad2 < 0 is a fallback quad whose colour is already
@@ -792,9 +815,9 @@ if(
     {
         if(voxyMipShade >= 0.0)
         {
-            vec3 voxyPos0 = vec3(v0.x, v0.y, v0.z);
-            vec3 voxyPos1 = vec3(v1.x, v1.y, v1.z);
-            vec3 voxyPos2 = vec3(v2.x, v2.y, v2.z);
+            vec3 voxyPos0 = loadSectionVertexWorldPos(rawAddr, sectionStride, i0);
+            vec3 voxyPos1 = loadSectionVertexWorldPos(rawAddr, sectionStride, i1);
+            vec3 voxyPos2 = loadSectionVertexWorldPos(rawAddr, sectionStride, i2);
             vec3 voxyNormal = normalize(
                 cross(voxyPos1 - voxyPos0, voxyPos2 - voxyPos0));
             float voxyMip = voxyLodMip(voxyPos0, voxyPos1, voxyNormal);
@@ -975,6 +998,7 @@ if(
     // 相机打到的**第一片**不在这里乘（由 main 的 glassTransmission 负责）。
     // 开关：-DORION_GLASS_SINGLE_PASS=0 ⇒ 本分支不参与编译（回递归旧档）。
     // =====================================================
+#if !VPT_GLASS_DIELECTRIC_REWRITE
 #ifndef ORION_GLASS_SINGLE_PASS
 #define ORION_GLASS_SINGLE_PASS 1
 #endif
@@ -982,9 +1006,9 @@ if(
     if(isPrimaryTransmissionRay(payload.state) &&
        isGlassPaneVertexMaterial(materialId))
     {
-        vec3 pos0 = vec3(v0.x, v0.y, v0.z);
-        vec3 pos1 = vec3(v1.x, v1.y, v1.z);
-        vec3 pos2 = vec3(v2.x, v2.y, v2.z);
+        vec3 pos0 = loadSectionVertexWorldPos(rawAddr, sectionStride, i0);
+        vec3 pos1 = loadSectionVertexWorldPos(rawAddr, sectionStride, i1);
+        vec3 pos2 = loadSectionVertexWorldPos(rawAddr, sectionStride, i2);
         vec3 geometricNormal = normalize(cross(pos1 - pos0, pos2 - pos0));
 
         vec3 paneTint = vptSaturateGlassTransmission(
@@ -1207,6 +1231,7 @@ if(
         return;
     }
 #endif
+#endif // !VPT_GLASS_DIELECTRIC_REWRITE
 
     bool glassVisibilityOnly =
         getRayPurpose(payload.state) == RT_PURPOSE_GLASS_VISIBILITY;
@@ -1344,9 +1369,9 @@ if(
 
         if(isLightExitFace)
         {
-            vec3 pos0 = vec3(v0.x, v0.y, v0.z);
-            vec3 pos1 = vec3(v1.x, v1.y, v1.z);
-            vec3 pos2 = vec3(v2.x, v2.y, v2.z);
+            vec3 pos0 = loadSectionVertexWorldPos(rawAddr, sectionStride, i0);
+            vec3 pos1 = loadSectionVertexWorldPos(rawAddr, sectionStride, i1);
+            vec3 pos2 = loadSectionVertexWorldPos(rawAddr, sectionStride, i2);
 
             vec3 geometricNormal =
                 normalize(

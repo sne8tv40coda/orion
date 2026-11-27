@@ -20,34 +20,27 @@ layout(location = 0) rayPayloadEXT HitPayload payload;
 #endif
 
 #ifdef RT_ENABLE_SER
+#ifndef ORION_SER_FUSED_ONLY
+#define ORION_SER_FUSED_ONLY 1
+#endif
 // Perf-L10.8 - SER now covers every ray path, not only the diffuse-GI bounce.
 //
-// serTraceRay is the single funnel.  It keeps the coherence key the measured
-// diffuse-GI win was built on -- path phase in the high bits, SBT record in the
-// low two -- and fuses reorder and shader execution into one EXT instruction
-// (hitObjectReorderExecuteEXT) instead of the older
-// reorderThreadEXT + hitObjectExecuteShaderEXT pair.
+// serTraceRay is the single funnel. Under ORION_SER_FUSED_ONLY=1 (default),
+// all runtime serMode branching and SerLodRoles buffer lookups are compiled out,
+// emitting a single hitObjectTraceReorderExecuteEXT instruction.
 //
 // Callers pass the exact ray flags, cull mask and ray interval they would have
 // passed to traceRayEXT.  SER only changes how the hit shader is scheduled; it
 // never changes which ray is traced, so the two paths must stay pixel-equal.
-//
-// A hit object is deliberately scoped to this function: declaring it in a
-// caller would keep traversal state live across loop iterations and eat the
-// scheduling win.
 
-// 2026-10-07 mode-4 key source: the per-instance role table from
-// lod_coverage.glsl (binding 19, indexed by instanceCustomIndex ==
-// vertexAddressSlot).  Declared locally instead of including the whole file
-// because rgen needs only the role table -- binding 20 stays hit-stage-only.
-// The host exposes binding 19 to the raygen stage for this read
-// (VulkanCore.cpp b[56].stageFlags).
+#if !ORION_SER_FUSED_ONLY
 layout(std430, binding = 19, set = 0) readonly buffer SerLodRoles {
     uint roles[];
 } serLodRoles;
 
 #define SER_ROLE_TERRAIN 0u
 #define SER_ROLE_SLOT_LIMIT (1u << 16)
+#endif
 
 void serTraceRayOffset(
     vec3 origin,
@@ -64,34 +57,24 @@ void serTraceRayOffset(
     #ifdef ORION_RT_STAGE_COUNTERS
     rtCntRayIssued();
     #endif
-    // Perf-L10.9 - the group lane that enabled this call doubles as the SER
-    // mode, so a single module can measure every stage of the hit-object
-    // sequence against each other in one session:
-    //   1 = fused reorder with the custom coherence hint (the adopted path)
-    //   2 = fused reorder with the driver-picked key, custom hint dropped
-    //   3 = execute the hit shader with no reordering at all
-    //   4 = fused reorder with the coherence key v2: post-trace instance
-    //         class from the role table + miss + SBT record (2026-10-07).
-    //         The v1 key mixes per-pixel loop counters, which are noise for
-    //         coherence; this key is built only from values the trace itself
-    //         produced, so adjacent pixels on the same instance land in the
-    //         same bucket -- the Khronos SER sample's "flags that affect
-    //         control flow" guidance.
-    //   5 = one fully-fused hitObjectTraceReorderExecuteEXT with the
-    //         driver-picked key: the mode-2 shape minus the live hit object
-    //         between traversal and the reorder-execute (2026-10-07).
-    //   6 = reserved by the probe arm: the DISTANCE_ONLY water-guide call
-    //         site switches to an rgen-side hit-object query; every funnel
-    //         caller keeps the mode-1 behaviour (mapped below), so a session
-    //         comparing 1 against 6 isolates that one call site.
-    // 1 against 2 isolates the custom hint and the extra SBT query it needs;
-    // 2 against 3 isolates the reordering itself; 1 against 4 isolates the
-    // key content; 2 against 5 isolates the hit-object liveness window.
-    // A call site only reaches this function when its own lane is non-zero,
-    // and the host rotates one group at a time, so the largest lane is that
-    // group's mode.
-    // .w is deliberately excluded: it carries the RTAO skip flag now, not a SER
-    // mode, so the mode is the larger of the two remaining group lanes.
+#if ORION_SER_FUSED_ONLY
+    hitObjectEXT fusedObject;
+    hitObjectTraceReorderExecuteEXT(
+        fusedObject,
+        topLevelAS,
+        rayFlags,
+        cullMask,
+        sbtOffset,
+        0,
+        0,
+        origin,
+        tMin,
+        direction,
+        tMax,
+        0
+    );
+    return;
+#else
     uint serMode = max(cam.perfSerAb.y, cam.perfSerAb.z);
     if(serMode == 6u)
     {
@@ -100,10 +83,6 @@ void serTraceRayOffset(
 
     if(serMode == 5u)
     {
-        // Single instruction: traversal + reorder + execute.  The custom key
-        // cannot participate here (the hint is an input, not a post-trace
-        // query), which is exactly the mode-2 shape with the buffered hit
-        // object removed.
         hitObjectEXT fusedObject;
         hitObjectTraceReorderExecuteEXT(
             fusedObject,
@@ -140,10 +119,6 @@ void serTraceRayOffset(
 
     if(serMode == 4u)
     {
-        // Key v2: every bit comes from the trace result, never from a
-        // per-pixel counter.  Misses form bucket 0; hits group by instance
-        // role (terrain / voxy LOD / DH far field -- the megashader's real
-        // control-flow split) with the SBT record as the low bit pair.
         uint classKey = 0u;
         if(!hitObjectIsMissEXT(hitObject))
         {
@@ -168,23 +143,11 @@ void serTraceRayOffset(
     }
     else
     {
-        // The SBT query lives here rather than above so modes 2 and 3 do not pay
-        // for an instruction they never use.
         uint sbtIndex = hitObjectGetShaderBindingTableRecordIndexEXT(hitObject);
 
-        // Mask the caller's hint down to the two bits the key has room for.
-        // Call sites pass whichever loop counter is at hand, and that counter
-        // can exceed the four bits declared below; masking keeps the coherence
-        // value inside the declared width and matches the original diffuse-GI
-        // key, which also arrived pre-masked to two bits.
-        // 2026-11-07 A/B：官方排序优先级里 shader ID / SBT 记录号本来就是最高位键，
-        // 再把它塞进用户 hint 的低 2 位是重复占位。默认保留（1 = 现行为）；
-        // 置 0 则 hint 只剩路径相位 2 bit、位宽也从 4 降成 2 —— 用
-        // -DGI_SER_HINT_SBT_BITS=0 编第二份 SPV 对比。
 #ifndef GI_SER_HINT_SBT_BITS
 #define GI_SER_HINT_SBT_BITS 1
 #endif
-        // stage 38 = 同局消融臂（去掉重复的 SBT 2 位）；base 下仍走 GI_SER_HINT_SBT_BITS
         if((GI_SER_HINT_SBT_BITS != 0) && !perfL10SerKeyMinimal())
         {
             uint coherenceHint = ((hint & 0x3u) << 2u) | (sbtIndex & 0x3u);
@@ -196,6 +159,7 @@ void serTraceRayOffset(
             hitObjectReorderExecuteEXT(hitObject, coherenceHint, 2u, 0);
         }
     }
+#endif
 }
 
 void serTraceRay(

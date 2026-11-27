@@ -31,19 +31,9 @@
 //   · 30 ms 以上：1（walker 砍到 2 步、界面循环砍到 1 步、太阳 march 砍到 1 步）
 // 帧时间恢复后会自己回到全质量，不需要重启。
 // ===========================================================================
-float perfL10WaterLoad()
-{
-    const float frameMs =
-        cam.rtSampleParams.w;
+// perfL10WaterLoad() moved to rgen_trace_helpers.glsl (Batch AE).
 
-    if(frameMs <= 0.0)
-    {
-        return 0.0;
-    }
-
-    return clamp((frameMs - 16.0) / 14.0, 0.0, 1.0);
-}
-
+#if !VPT_GLASS_DIELECTRIC_REWRITE
 vec3 tracePrimaryWaterReceiverIndirectReworked(
     vec3 receiverPos,
     vec3 receiverNormal,
@@ -64,25 +54,26 @@ vec3 tracePrimaryWaterReceiverIndirectReworked(
 
     bool runWaterGI = true;
     float lodWeight = 1.0;
-    // 2026-10-06 近水降本：32~64 格也掷骰子（×2 权重）。0~32 格保留全预算
-    //（玩家脚下的水底细节最显眼，避免可见噪声）；32~64 格的抽样噪声由时间滤波
-    // 平滑。回退：删掉这个分支即回到 <64 格全预算。
-    if(lodDistance >= 32.0 * perfL10TierScale() && lodDistance < 64.0 * perfL10TierScale())
+    // 2026-11-27 噪点回退：<32 格恢复全预算（棋盘格抽样会让水面起噪）。
+    if(lodDistance < 32.0 * perfL10TierScale())
+    {
+    }
+    else if(lodDistance < 64.0 * perfL10TierScale())
     {
         runWaterGI = (lodRandom & 1u) == 0u;
         lodWeight = 2.0;
     }
-    else if(lodDistance >= 64.0 * perfL10TierScale() && lodDistance < 128.0 * perfL10TierScale())
+    else if(lodDistance < 128.0 * perfL10TierScale())
     {
         runWaterGI = (lodRandom & 1u) == 0u;
         lodWeight = 2.0;
     }
-    else if(lodDistance >= 128.0 * perfL10TierScale() && lodDistance < 160.0 * perfL10TierScale())
+    else if(lodDistance < 160.0 * perfL10TierScale())
     {
         runWaterGI = (lodRandom & 3u) == 0u;
         lodWeight = 4.0;
     }
-    else if(lodDistance >= 160.0 * perfL10TierScale())
+    else
     {
         runWaterGI = false;
     }
@@ -142,6 +133,17 @@ const float WATER_EXTINCTION_DISTANCE =
 #if GI_SKIP_SUN_DISK
         hit.state |= RT_STATE_NO_SUN_DISK_BIT;
 #endif
+#if defined(RT_ENABLE_SER) && ORION_SER_FUSED_ONLY
+        serTraceRay(
+            currentOrigin,
+            0.001,
+            currentDirection,
+            10000.0,
+            secondaryTraverseFlags(),
+            0xcfu,
+            pathStep
+        );
+#else
 #ifdef RT_ENABLE_SER
         // Perf-L10.8: same ray, same flags; SER only reschedules the hit shader.
         if(cam.perfSerAb.z != 0u)
@@ -167,6 +169,7 @@ const float WATER_EXTINCTION_DISTANCE =
                 currentOrigin, 0.001, currentDirection, 10000.0, 0
             );
         }
+#endif
 
         if(payload.hitDistance < 0.0)
         {
@@ -215,8 +218,6 @@ float scatterAmount = 0.0;
             );
             uint localState = pathState ^ 0x5747494Cu;
             pcg_hash(localState);
-            // 2026-10-07：这里把本跳命中的 LabPBR 材质解出来传下去（移动光源的镜面项
-            // 要用）。粗糙度与上面 evaluateOpaqueSurfaceRadiance 用的是同一个 clamp。
             int bounceF0MetalCode =
                 decodeF0MetalCode(payload.f0Metal);
             incomingRadiance +=
@@ -284,6 +285,7 @@ float scatterAmount = 0.0;
 
     return vec3(0.0);
 }
+#endif // !VPT_GLASS_DIELECTRIC_REWRITE
 
 // =====================================================
 // 2026-10-06 近水掉帧降本：反射/折射 walker 的步数距离分档。
@@ -337,24 +339,7 @@ const int   WATER_WALKER_STEPS_FAR      = 2;
 // 用法是把距离**阈值**按 scale 收紧（写成一律"除以 scale"的形式），不改步数表
 // 与档位表本身 ⇒ 每一档的语义不变，只是"什么时候进入该档"被提前。
 // =====================================================
-float perfL10WaterAdaptiveScale()
-{
-    const float frameMs =
-        cam.rtSampleParams.w;
-
-    if(frameMs <= 0.0)
-    {
-        return 1.0;
-    }
-
-    const float tightness = clamp(
-        (frameMs - 9.5) / 8.5,
-        0.0,
-        1.0
-    );
-
-    return mix(1.0, 0.40, tightness);
-}
+// perfL10WaterAdaptiveScale() moved to rgen_trace_helpers.glsl (Batch AE).
 
 // =====================================================
 // 2026-11-18：**水面像素的射线预算降级**（用户："靠近水面的超级掉帧"）。
@@ -440,6 +425,8 @@ vec3 tracePrimaryTransparentRadiance(
     // 2026-11-16：相机水柱透射哨兵（负值 = 本 walker 未提供，消费端回退
     // 旧的单发公式）。真正赋值见 opaque 接收器分支。
     transmissionInfo.cameraWaterColumnTransmittance = vec3(-1.0);
+    transmissionInfo.receiverSunTransmittance = vec3(0.0);
+    transmissionInfo.receiverSunTransmittanceValid = 0.0;
 
     const float WATER_IOR =
         1.33;
@@ -525,34 +512,39 @@ const vec3 WATER_SCATTER_COLOR = waterScatterColorAt(startOrigin.xz);
         startInsideWater;
 
     bool crossedTranslucent = false;
-    // 运行期 UBO 掩蔽上限，防止 spirv-opt -O / NV JIT 将 ~1000 行循环体按常量 4 次
-    // 全展开导致 SSA ID 溢出与冷编膨胀（实测未掩蔽时 k1 optSize 膨胀 3.75x、rt_test ID overflow）。
-    const int distTransmitSteps =
-        (waterGILodDistance < 24.0)
-            ? WATER_WALKER_TRANSMIT_STEPS
-            : ((waterGILodDistance < 48.0) ? min(WATER_WALKER_TRANSMIT_STEPS, 3) : 1);
+    bool floatingWaterExited = false;
+    // 2026-11-27: 反射瓣恒为 1 步超轻量路径；透射瓣按距离给足 3~4 步穿出悬空水柱/冰海，
+    // UBO 掩蔽防 spirv-opt 展开膨胀。
+    int distTransmitSteps = (waterGILodDistance < 48.0) ? 4 : 3;
     const int transmitWalkerSteps =
         (cam.frameCount != 0xFFFFFFFFu)
             ? distTransmitSteps
             : 0;
+    const int reflWalkerSteps =
+        (cam.frameCount != 0xFFFFFFFFu) ? 1 : 0;
     const int maxWalkerSteps =
         reflectionLobe
-            ? waterTransparentWalkerSteps(waterGILodDistance)
+            ? reflWalkerSteps
             : transmitWalkerSteps;
+    int walkerStepBudget = maxWalkerSteps;
+    int internalWaterSkips = 0;
 
     for(
         int step = 0;
-        step < maxWalkerSteps;
+        step < walkerStepBudget;
         ++step
     )
     {
         hit.hitDistance =
             1.0;
 
-
         hit.state = makeTraceState(
             insideWater ? RT_PURPOSE_WATER_MEDIUM : RT_PURPOSE_FULL
-        );
+        ) | RT_STATE_GI_NO_POM_BIT;
+        if(reflectionLobe || (!insideWater && waterGILodDistance >= 32.0) || g_waterWalkerSkipClouds)
+        {
+            hit.state |= RT_STATE_GI_SKIP_CLOUDS_BIT;
+        }
 
 #if WATER_SKY_SUN_OCCLUSION
         // 2026-10-22: shadowed water reflection.  Re-applied every step because a
@@ -566,6 +558,17 @@ const vec3 WATER_SCATTER_COLOR = waterScatterColorAt(startOrigin.xz);
         }
 #endif
 
+#if defined(RT_ENABLE_SER) && ORION_SER_FUSED_ONLY
+        serTraceRay(
+            currentOrigin,
+            0.01,
+            currentDirection,
+            10000.0,
+            secondaryTraverseFlags(),
+            0xcfu,
+            step
+        );
+#else
 #ifdef RT_ENABLE_SER
         // Perf-L10.8: same ray, same flags; SER only reschedules the hit shader.
         if(cam.perfSerAb.z != 0u)
@@ -600,6 +603,7 @@ const vec3 WATER_SCATTER_COLOR = waterScatterColorAt(startOrigin.xz);
                 0
             );
         }
+#endif
 
 
         // =============================================
@@ -610,20 +614,32 @@ const vec3 WATER_SCATTER_COLOR = waterScatterColorAt(startOrigin.xz);
         // =============================================
 if(payload.hitDistance < 0.0)
 {
-    // A refracted ray can leave the shallow, triangulated water volume at a
-    // block edge and reach miss before it reaches the adjacent solid.  Do
-    // not turn that transport failure into a strip of sky colour: retry the
-    // local segment along the direction that entered water.  A genuine open
-    // water view still misses again and therefore keeps the real sky.
+    if(reflectionLobe)
+    {
+        transmissionInfo.waterPathLength = 65504.0;
+        return accumulatedWaterScattering +
+            throughput * unpackAlbedoUnorm(payload.albedoPacked);
+    }
+
     if(insideWater && hasWaterEntryDirection)
     {
         hit.hitDistance =
             1.0;
 
-        hit.state = makeTraceState(RT_PURPOSE_WATER_MEDIUM);
+        hit.state = makeTraceState(RT_PURPOSE_WATER_MEDIUM) | RT_STATE_GI_NO_POM_BIT;
 
+#if defined(RT_ENABLE_SER) && ORION_SER_FUSED_ONLY
+        serTraceRay(
+            currentOrigin,
+            0.01,
+            waterEntryDirection,
+            10000.0,
+            secondaryTraverseFlags(),
+            0xcfu,
+            step
+        );
+#else
 #ifdef RT_ENABLE_SER
-        // Perf-L10.8: same ray, same flags; SER only reschedules the hit shader.
         if(cam.perfSerAb.z != 0u)
         {
             serTraceRay(
@@ -656,6 +672,7 @@ if(payload.hitDistance < 0.0)
                 0
             );
         }
+#endif
 
         if(
             payload.hitDistance >= 0.0 &&
@@ -669,51 +686,55 @@ if(payload.hitDistance < 0.0)
 
             vec3 fallbackHitNormal =
                 payload.normal;
+            vec3 fallbackAlbedo =
+                unpackAlbedoUnorm(payload.albedoPacked);
 
             transmissionInfo.waterPathLength +=
                 payload.hitDistance;
             transmissionInfo.receiverWorldPos = fallbackHitPos;
             transmissionInfo.receiverNormal = fallbackHitNormal;
             transmissionInfo.receiverViewDirection = -waterEntryDirection;
-            transmissionInfo.receiverAlbedo = unpackAlbedoUnorm(payload.albedoPacked);
+            transmissionInfo.receiverAlbedo = fallbackAlbedo;
             transmissionInfo.receiverRoughness = payload.roughness;
             transmissionInfo.receiverF0Metal = payload.f0Metal;
             transmissionInfo.reachedUnderwaterReceiver = 1.0;
-            // 保留入口点 trace 到的太阳可见性，不能重置成 1.0。
             transmissionInfo.waterSunVisibility = waterSunVisibility;
             transmissionInfo.receiverSelfEmissionRadiance = vec3(0.0);
 
             vec3 fallbackLocalDirect =
-         evaluateTransparentReceiverDirectLighting(
-                    // 相机可见的第一层透明面命中点 = 本像素的精确历史键
-                    // （见 TRANSPARENT_HISTORY_KEY_FIRST_SURFACE）。
-                    transparentHistoryKey,
-                    vptGeometricFaceNormalFromRay(
-                        fallbackHitPos, waterEntryDirection),
+                evaluateVPTExactFaceDirectLighting(
                     fallbackHitPos,
                     fallbackHitNormal,
-                    unpackAlbedoUnorm(payload.albedoPacked),
-                    0x57424F54u
-                    );
+                    fallbackAlbedo
+                ) +
+                evaluateDynamicLightDeterministicDirect(
+                    fallbackHitPos,
+                    fallbackHitNormal,
+                    fallbackAlbedo,
+                    waterGILodDistance
+                );
 
             vec3 fallbackRadiance =
-                evaluateOpaqueSurfaceRadiance(
+                evaluateOpaqueSurfaceRadianceInMedium(
                     fallbackHitPos,
                     fallbackHitNormal,
                     -waterEntryDirection,
-                    unpackAlbedoUnorm(payload.albedoPacked),
+                    fallbackAlbedo,
                     payload.roughness,
                     payload.f0Metal,
                     payload.emission +
                         evaluateVLIEmitterRadianceAtHit(
                             fallbackHitPos,
                             fallbackHitNormal,
-                            unpackAlbedoUnorm(payload.albedoPacked)
+                            fallbackAlbedo
                         ),
                     payload.pomSelfShadow,
-                    sunDirection
+                    sunDirection,
+                    true
                 ) +
-                fallbackLocalDirect;
+                fallbackLocalDirect +
+                fallbackAlbedo *
+                    evaluateDeterministicIndirectAmbient(fallbackHitNormal, waterSunVisibility);
 
 #if WATER_VOLUME_INSCATTER_V2
             const vec3 fallbackExtinction =
@@ -988,19 +1009,6 @@ if(max(throughput.r, max(throughput.g, throughput.b)) < 0.03)
 
 if(hitMaterialId <= 0.5)
 {
-    transmissionInfo.receiverWorldPos = hitPos;
-    transmissionInfo.receiverNormal = hitNormal;
-    transmissionInfo.receiverViewDirection = -currentDirection;
-    transmissionInfo.receiverAlbedo = hitAlbedo;
-    transmissionInfo.receiverRoughness = hitRoughness;
-    transmissionInfo.receiverF0Metal = hitF0Metal;
-    transmissionInfo.reachedUnderwaterReceiver = 1.0;
-    // 保留入口点 trace 到的太阳可见性，不能重置成 1.0。
-    transmissionInfo.waterSunVisibility = waterSunVisibility;
-    // 2026-11-16：把逐段累乘的相机水柱透射实值交给焦散消费端（含 Beer
-    // 吸收 × GLASS_TINT 混色 × 深水 0.15 压透，不含界面 Fresnel）。
-    transmissionInfo.cameraWaterColumnTransmittance = waterColumnFactor;
-
     vec3 unifiedHitEmission =
         hitEmission +
         evaluateVLIEmitterRadianceAtHit(
@@ -1009,135 +1017,123 @@ if(hitMaterialId <= 0.5)
             hitAlbedo
         );
 
-    // 2026-10-05 次表面散射只响应水面上方的光源：导出接收器自身的发光
-    // 辐亮度（× 同一套水体吞吐），多散射项从源里扣掉 —— 水下光源没有
-    // 穿过水面进入水体，不该在水面再叠一层 SSS 光斑。
+    if(reflectionLobe)
+    {
+        transmissionInfo.waterPathLength = hitDistance;
+        // 2026-11-27: 水面反射禁用 SHaRC 短窗有噪缓存查询，统一走 100% 确定性着色，
+        // 防止平静水面倒影沸腾闪动。
+        vec3 reflSurfaceRadiance =
+            unifiedHitEmission +
+            evaluateDirectSunLightingDiffuseInMedium(
+                hitPos,
+                hitNormal,
+                hitAlbedo,
+                hitF0Metal,
+                hitPOMSelfShadow,
+                sunDirection,
+                insideWater
+            ) +
+            evaluateVPTExactFaceDirectLighting(
+                hitPos,
+                hitNormal,
+                hitAlbedo
+            ) +
+            evaluateDynamicLightDeterministicDirect(
+                hitPos,
+                hitNormal,
+                hitAlbedo,
+                waterGILodDistance
+            ) +
+            hitAlbedo * evaluateDeterministicIndirectAmbient(hitNormal, waterSunVisibility);
+
+        return accumulatedWaterScattering + throughput * reflSurfaceRadiance;
+    }
+
+    transmissionInfo.receiverWorldPos = hitPos;
+    transmissionInfo.receiverNormal = hitNormal;
+    transmissionInfo.receiverViewDirection = -currentDirection;
+    transmissionInfo.receiverAlbedo = hitAlbedo;
+    transmissionInfo.receiverRoughness = hitRoughness;
+    transmissionInfo.receiverF0Metal = hitF0Metal;
+    transmissionInfo.reachedUnderwaterReceiver = 1.0;
+    transmissionInfo.waterSunVisibility = waterSunVisibility;
+    transmissionInfo.cameraWaterColumnTransmittance = waterColumnFactor;
     transmissionInfo.receiverSelfEmissionRadiance =
         throughput * unifiedHitEmission;
 
+    const bool captureSunForCaustics = (!reflectionLobe && insideWater);
+    if(captureSunForCaustics)
+    {
+        g_captureDirectSunTrans = true;
+        g_capturedDirectSunValid = false;
+    }
+    vec3 surfaceRadiance =
+        evaluateOpaqueSurfaceRadianceInMedium(
+            hitPos,
+            hitNormal,
+            -currentDirection,
+            hitAlbedo,
+            hitRoughness,
+            hitF0Metal,
+            unifiedHitEmission,
+            hitPOMSelfShadow,
+            sunDirection,
+            insideWater
+        );
+    if(captureSunForCaustics)
+    {
+        g_captureDirectSunTrans = false;
+        if(g_capturedDirectSunValid)
+        {
+            transmissionInfo.receiverSunTransmittance = g_capturedDirectSunTrans;
+            transmissionInfo.receiverSunTransmittanceValid = 1.0;
+        }
+    }
 
-// 2026-10-10（③ 近水降本）：接收器照明只在浅水才付。
-// 这一段为一个"水下接收器"额外打出三类射线：太阳穿水 march（≤6）+
-// 本地光 RIS 面积采样可见性（2）+ 水下 GI walker（≤6）≈ 最多 14 条真实射线，
-// 而它们**还要再乘一次**相机到接收器的 Beer-Lambert 衰减（见下面 15094 的注释，
-// 衰减在 return 里由 throughput 施加）。水吸收每格 0.24（红通道）⇒ 24 格水程
-// exp(-0.24*24) ≈ 0.003 ⇒ 深水/远接收器这十几条实质白付。
-// ⚠ 公共量与出参必须在闸外：transmissionInfo.receiverSelfEmissionRadiance（15076）
-//   是出参，调用方要消费，所以上面那段照旧算满，只有下面三个**发射线**的调用进闸。
-// 回退：把常量改大（或让它 > 最远水程）。
-// =====================================================
-// 2026-10-10 **回退**：原值 24.0（只给 24 格水程内的接收器算照明）。
-//
-// 实测观感有问题 ⇒ 阈值改为 INF（闸门恒真）⇒ **逐位回到改动前**：
-// 三个发射线的调用（接收器太阳 march / 本地光 RIS 可见性 / 水下 GI walker）
-// 在任何水程下都照旧执行。刻意用"改阈值"而不是"删 if"，是因为后者要动作用域与
-// 括号，风险不为零；改一个数可以证明行为等价。
-//
-// 24.0 这个数是**我按水吸收推算的**（0.24/格，exp(-0.24*24)≈0.003），不是实测
-// 出来的 ⇒ 教训：观感类阈值不能用推算值直接上线，必须先 A/B。
-// 若日后要重做，请按"深水是否真的看不出来"实测取证后再给值。
-// =====================================================
-const float WATER_RECEIVER_LIGHTING_MAX_PATH = 1.0e9;
+    float skyOpenFactor = entrySunValid
+        ? clamp(max(entrySunTrans.r, max(entrySunTrans.g, entrySunTrans.b)), 0.0, 1.0)
+        : waterSunVisibility;
 
-bool waterReceiverLightingNear =
-    length(hitPos - startOrigin) <=
-    WATER_RECEIVER_LIGHTING_MAX_PATH * perfL10WaterAdaptiveScale();
-
-vec3 surfaceRadiance =
-    vec3(0.0);
-
-if(waterReceiverLightingNear)
-{
-surfaceRadiance =
-    evaluateOpaqueSurfaceRadiance(
-        hitPos,
-        hitNormal,
-        -currentDirection,
-        hitAlbedo,
-        hitRoughness,
-        hitF0Metal,
-        unifiedHitEmission,
-        hitPOMSelfShadow,
-        sunDirection
-    );
-
-
-// This receiver was reached through the water transport.  Evaluate its
-// active VPT/RIS local direct light before the return below applies the
-// accumulated Beer-Lambert attenuation for the camera-to-receiver path.
-// Same screen-space history as a pane receiver: this surface was reached by
-// retracing through water, so NRD never sees it either.
-vec3 waterReceiverLocalDirect =
-    evaluateTransparentReceiverDirectLighting(
-        // 相机可见的第一层透明面命中点 = 本像素的精确历史键
-        // （见 TRANSPARENT_HISTORY_KEY_FIRST_SURFACE）。
-        transparentHistoryKey,
-        vptGeometricFaceNormalFromRay(hitPos, currentDirection),
-        hitPos,
-        hitNormal,
-        hitAlbedo,
-        0x57424F54u
-    );
-
-surfaceRadiance +=
-    waterReceiverLocalDirect;
-
-#if WATER_RECEIVER_GI_ADAPTIVE_GATE
-if(step < 2 && insideWater && enableWaterReceiverGI &&
-   max(throughput.r, max(throughput.g, throughput.b)) > 0.12)
-#else
-if(step < 2 && insideWater && enableWaterReceiverGI)
-#endif
-{
     surfaceRadiance +=
-        tracePrimaryWaterReceiverIndirectReworked(
+        evaluateVPTExactFaceDirectLighting(
+            hitPos,
+            hitNormal,
+            hitAlbedo
+        ) +
+        evaluateDynamicLightDeterministicDirect(
             hitPos,
             hitNormal,
             hitAlbedo,
-            waterGILodDistance,
-            sunDirection
-#if GI_GLASS_RECEIVER_INDIRECT
-            // The guard above already knows the medium; passing it keeps the
-            // walker's start state honest instead of assuming water.
-            , insideWater
-#endif
-        );
-}
-}
-
+            waterGILodDistance
+        ) +
+        hitAlbedo * evaluateDeterministicIndirectAmbient(hitNormal, skyOpenFactor);
 
 #if WATER_VOLUME_INSCATTER_V2
-return
-    accumulatedWaterScattering +
-    throughput *
-    surfaceRadiance;
+    return
+        accumulatedWaterScattering +
+        throughput *
+        surfaceRadiance;
 #else
-return
-    throughput *
-    surfaceRadiance;
+    return
+        throughput *
+        surfaceRadiance;
 #endif
 }
 
-// 2026-11-16 修「walker 整段死代码」：上面这个 } 原本缺失——
-// if(hitMaterialId <= 0.5) 一直开到下面的水界面处理段末尾，导致 1130 的
-// 无条件 return 之后整段（玻璃处理 / 水界面折射 / 入口太阳可见性 trace）
-// 全部不可达，walker 实际每条射线只打 1 次 trace，撞到第二层水/玻璃界面
-// 直接掉进循环后的"耗尽回退"——这就是 2026-11-13「玻璃叠水固定白光」的
-// 结构性根因（当时的 WATER_WALKER_EXHAUST_GLOW=0 只是调暗症状）。
-// 修复后：玻璃/水界面按既有 3/2/1 步数预算正常走查，耗尽回退回到
-// "步数用尽才执行"的正确语义。回退 = 删掉这个 } 并把 1445 附近的
-// 函数闭括号数回去（逐位回到修复前）。
-// SPIR-V 双验证（2026-11-16）：修复前该函数 OpTraceRayKHR 仅 2 条
-//（循环主 trace + miss 重试）、OpExtInst refract 0 条。
-
-// =============================================
-// Generic translucent interface
-//
-// Glass stays straight-through and contributes its filter once.  It is not
-// a water interface and must never consume WATER_IOR / insideWater state.
-// =============================================
 if(hitMaterialId >= 2.5)
 {
+    if(reflectionLobe)
+    {
+        transmissionInfo.waterPathLength = hitDistance;
+        vec3 gDir = normalize(reflect(currentDirection, hitNormal));
+        return accumulatedWaterScattering +
+            throughput * mix(
+                hitAlbedo * evaluateDeterministicIndirectAmbient(hitNormal, 0.8),
+                samplePhysicalClearSkyForAerialPerspective(gDir),
+                0.35
+            );
+    }
+
     if(hitMaterialId < 3.5)
     {
         throughput *=
@@ -1158,39 +1154,14 @@ if(hitMaterialId >= 2.5)
     continue;
 }
 
-
-// =============================================
-// Another water interface
-
         hitNormal =
             waterInterfaceNormalForRay(
                 hitNormal,
                 currentDirection
             );
 
-// =====================================================
-// 2026-11-16 修「水面经常有莫名其妙的白色反光」（用户报告）。
-//
-// 反射瓣的射线撞到**另一片水**（大水面掠射时被扰动法线压下去、重新命中远处
-// 水面 —— 海洋上最常见的二次命中路径）时，旧逻辑把它当透射继续折射进水：
-// 反射像变成「被反射水体的水下景」，并从那一段起逐段累加 4×
-// UNDERWATER_COLUMN_SCATTER_BOOST 的水体 in-scatter（日光下白蓝色，太阳可见
-// 时满功率），多段界面后再叠耗尽回退 ⇒ 水面反射里一片与场景无关的白光。
-//
-// 单瓣近似的正确选择是镜面：按 F 带权沿反射方向继续，**永不进入水体**
-//（不积累 in-scatter、不触发水入口太阳可见性 trace）。掠射处 F→1，反射回到
-// 正确的「天空镜面」；陡视角 F≈0.02，该瓣本来就被主面 fresnel 混合压到可
-// 忽略，观感无损。透射瓣（reflectionLobe=false）逐位不变。
-// 回退：-DWATER_REFLECTION_LOBE_MIRROR=0。
-// =====================================================
-#ifndef WATER_REFLECTION_LOBE_MIRROR
-#define WATER_REFLECTION_LOBE_MIRROR 1
-#endif
-#if WATER_REFLECTION_LOBE_MIRROR
         if(reflectionLobe)
         {
-            // 法线必须迎着射线，否则 reflect 会把射线送进水体内部
-            //（与折射路径共用 payload.normal 的朝向假设不同，这里显式对齐）。
             vec3 mirrorNormal =
                 dot(currentDirection, hitNormal) < 0.0
                     ? hitNormal
@@ -1213,28 +1184,29 @@ if(hitMaterialId >= 2.5)
                 (1.0 - WATER_F0) *
                 (mirrorOmc2 * mirrorOmc2 * mirrorOmc);
 
-            throughput *= mirrorFresnel;
+            vec3 mirrorReflDir =
+                normalize(reflect(currentDirection, mirrorNormal));
+            vec3 mirrorSky = mix(
+                WATER_SCATTER_COLOR * getSurfaceAmbientRadiance() * 0.6,
+                samplePhysicalClearSkyForAerialPerspective(mirrorReflDir),
+                smoothstep(-0.05, 0.25, mirrorReflDir.y)
+            );
+            vec3 mirrorBase =
+                hitAlbedo * evaluateDeterministicIndirectAmbient(mirrorNormal, 0.85);
+            transmissionInfo.waterPathLength = hitDistance;
+            return accumulatedWaterScattering +
+                throughput * mix(mirrorBase, mirrorSky, mirrorFresnel);
+        }
 
-            currentOrigin =
-                hitPos +
-                mirrorNormal *
-                RAY_BIAS;
-
-            currentDirection =
-                normalize(
-                    reflect(
-                        currentDirection,
-                        mirrorNormal
-                    )
-                );
-
+        // 2026-11-27: 流水柱/阶梯水流内部相邻方块正面水片直穿（最多 2 次，不扣 Fresnel、不耗步数）。
+        if(!crossedTranslucent && insideWater && hitMaterialId < 1.5 && hitDistance < 2.5 && internalWaterSkips < 2)
+        {
+            currentOrigin = hitPos + currentDirection * 0.005;
+            ++internalWaterSkips;
+            --step;
             continue;
         }
-#endif
 
-        // Close downward internal water quad while already inside water
-        // (e.g., stepped / flowing water quads below the surface): step
-        // straight through instead of breaking to a dark exhaust fallback.
         if(!reflectionLobe && !crossedTranslucent)
         {
             if(insideWater && payload.hitDistance < 2.5 && currentDirection.y < -0.05)
@@ -1242,7 +1214,26 @@ if(hitMaterialId >= 2.5)
                 currentOrigin = hitPos + currentDirection * 0.005;
                 continue;
             }
+#ifndef WATER_FLOATING_EXIT_CONTINUE
+#define WATER_FLOATING_EXIT_CONTINUE 1
+#endif
+#if WATER_FLOATING_EXIT_CONTINUE
+            if(!(insideWater || floatingWaterExited))
+            {
+                break;
+            }
+            if(insideWater)
+            {
+                floatingWaterExited = true;
+            }
+            walkerStepBudget =
+                max(
+                    walkerStepBudget,
+                    min(step + 2, 4)
+                );
+#else
             break;
+#endif
         }
 
         bool exitingWater =
@@ -1357,22 +1348,7 @@ if(hitMaterialId >= 2.5)
                     }
                     else
 #endif
-#ifdef RT_ENABLE_SER
-                    if(cam.perfSerAb.y != 0u)
-                    {
-                        serTraceRay(
-                            hitPos + sunDirection * 0.001,
-                            0.02,
-                            sunDirection,
-                            10000.0,
-                            gl_RayFlagsTerminateOnFirstHitEXT |
-                                gl_RayFlagsSkipClosestHitShaderEXT,
-                            0xcfu,
-                            0u
-                        );
-                    }
-                    else
-#endif
+                    // 2026-11-27 (Batch AI): visibility-only shadow ray skips SER overhead.
                     {
                         #ifdef ORION_RT_STAGE_COUNTERS
                         rtCntRayIssued();
@@ -1448,6 +1424,17 @@ if(hitMaterialId >= 2.5)
             ) < 1.0e-6
         )
         {
+            if(exitingWater && abs(hitNormal.y) <= 0.5)
+            {
+                // 2026-11-27: 竖直瀑布/水柱侧壁 TIR 不弹回水柱内死循环，平滑穿出到空气。
+                throughput *= (1.0 - min(fresnel, 0.55));
+                insideWater = false;
+                currentOrigin = hitPos - hitNormal * 0.005;
+                currentDirection = normalize(
+                    hasWaterEntryDirection ? waterEntryDirection : currentDirection);
+                continue;
+            }
+
             currentOrigin =
                 hitPos +
                 hitNormal *
@@ -1492,142 +1479,15 @@ if(hitMaterialId >= 2.5)
     }
 
 
-    // 2026-10-15 机制 A：走查预算耗尽从"纯黑"改"软降级"。旧行为（return vec3(0.0)）
-    // 把已累积的水体散射与 throughput 一并丢弃 —— 玻璃叠水（1 块玻璃 2 面 + 水面
-    // + 水底 = 4 步起步）在走查 3~4 步时会整块变黑。降级 = 按当前介质补一个
-    // 单位长 in-scatter 的平坦近似：水里用与逐步积累（上方 waterScatterColor 块）
-    // 同一套因子，玻璃栈里给天光环境色。代价 = 0（只对耗尽的那条射线执行）。
-    // 回退 = 还原为 return vec3(0.0)。
-    //
-    // =====================================================
-    // 2026-11-13：耗尽时的"补一个单位长 in-scatter"默认关闭。
-    //
-    // 现象（用户报告）：只要场景里出现"能看进看出的两层半透明面"
-    //（水+水 / 玻璃+水 / 水面之后还有一层水界面），水面反射里就出现
-    // 位置固定、亮度与背景无关的白光。
-    //
-    // 机制：近水 walker 现在只有 3 步（2026-10-18 定档 8/5/3 → 3/2/1，见上方
-    // WATER_WALKER_STEPS_FULL）。"进水 → 第二层界面 → 接收面"已经用满三步，
-    // 再多一层必然耗尽；而耗尽分支返回的是**与场景无关的固定亮度**：
-    //   WATER_SCATTER_COLOR × WATER_SCATTERING × 天光 ×
-    //   UNDERWATER_COLUMN_SCATTER_BOOST(4.0)
-    // 各向同性、不随视角/背景/太阳位置变化 ⇒ 读作"莫名其妙的白光"。
-    //
-    // 1 = 旧档（保留那道散射）；0 = 只保留真实累积 + throughput 推过去的天空底
-    //（口径与下面"非水介质耗尽"那条一致）。
-    // 预算耗尽本身是性能定档，不动步数；这里只改"耗尽时给什么"。
-    // =====================================================
-#ifndef WATER_WALKER_EXHAUST_GLOW
-#define WATER_WALKER_EXHAUST_GLOW 0
-#endif
-    // =====================================================
-    // 2026-11-16 修「看到第二个透射面时不透明、发白光」（用户报告）。
-    //
-    // 耗尽回退的"天空"旧实现是**直射光颜色代理**
-    //（getTimeDrivenSkyLightColor × RadianceScale）—— 那是光源色（正午 ≈
-    // 纯白、带 radianceScale 增益），不是天空辐亮度。走查预算耗尽的射线把它
-    // 满功率返回 ⇒ 一块与背景无关的固定白光（2026-11-13 注释描述的正是这个
-    // 症状；当时关掉 WATER_WALKER_EXHAUST_GLOW 只去掉了叠加散射项，代理本身
-    // 没换）。现在换成真实天空 LUT 沿 currentDirection 的采样 —— 与 miss
-    // 分支返回的天空（rt_test.rmiss 同一份 skyScatteringTex）亮度口径一致；
-    // 日盘/星图不在 LUT 里，与 suppressSkySun 的口径也天然一致。步数提到
-    // 6/4/2 后耗尽本身已是少数路径，这里只负责"少数路径不再发白"。
-    // 回退 = 把下面两处 exhaustSkyRadiance 换回 getTimeDrivenSkyLightColor()
-    // × getTimeDrivenSkyLightRadianceScale()（逐位旧档）。
-    // =====================================================
-    // 2026-11-26 (Batch V, Bug 2): Verify sky visibility on walker exhaustion so cave water
-    // never glows with daytime sky brightness when rays run out inside enclosed rock.
-    float exhaustSkyVisible = 1.0;
-#ifndef ORION_K2I_COMPOSE_COMPUTE
-    {
-        const vec3 probeDir =
-            (insideWater || currentDirection.y <= 0.0)
-                ? vec3(0.0, 1.0, 0.0)
-                : normalize(currentDirection);
-        rayQueryEXT exhaustSkyQuery;
-        #ifdef ORION_RT_STAGE_COUNTERS
-        rtCntRayIssued();
-        #endif
-        rayQueryInitializeEXT(
-            exhaustSkyQuery,
-            topLevelAS,
-            gl_RayFlagsTerminateOnFirstHitEXT,
-            0xcfu,
-            currentOrigin + probeDir * 0.05,
-            0.02,
-            probeDir,
-            256.0
-        );
-        int exhaustSkyGuard = 0;
-        while(rayQueryProceedEXT(exhaustSkyQuery) && ++exhaustSkyGuard < 32)
-        {
-            if(rayQueryGetIntersectionTypeEXT(exhaustSkyQuery, false) ==
-               gl_RayQueryCandidateIntersectionTriangleEXT)
-            {
-                const uint candSbtOff =
-                    rayQueryGetIntersectionInstanceShaderBindingTableRecordOffsetEXT(
-                        exhaustSkyQuery, false);
-                if(candSbtOff != 2u && candSbtOff != 3u)
-                {
-                    rayQueryConfirmIntersectionEXT(exhaustSkyQuery);
-                }
-            }
-        }
-        if(rayQueryGetIntersectionTypeEXT(exhaustSkyQuery, true) !=
-           gl_RayQueryCommittedIntersectionNoneEXT)
-        {
-            exhaustSkyVisible = 0.0;
-        }
-    }
-#endif
-    const float exhaustSkyScale = mix(0.02, 1.0, exhaustSkyVisible);
-
-    vec3 exhaustSkyRadiance =
-        textureLod(
-            skyScatteringTex,
-            directionToEquirect(currentDirection),
-            0.0
-        ).rgb * exhaustSkyScale;
-    const float exhaustUpSkyWeight =
-        smoothstep(-0.12, 0.08, currentDirection.y);
+    // 2026-11-27: 取消耗尽后的 32 次 rayQuery 天空探测与黑白垂直渐变带，
+    // 步数耗尽时零射线平滑收尾。
     if(insideWater)
     {
-#if WATER_WALKER_EXHAUST_GLOW
-        return
-            accumulatedWaterScattering +
-            throughput *
-            WATER_SCATTER_COLOR *
-            WATER_SCATTERING *
-            getTimeDrivenSkyLightColor() *
-            getTimeDrivenSkyLightRadianceScale() *
-            waterSunVisibility *
-            UNDERWATER_COLUMN_SCATTER_BOOST *
-            exhaustSkyScale;
-#else
-        const vec3 deepWaterFallback =
-            WATER_SCATTER_COLOR * getSurfaceAmbientRadiance() * (0.5 * exhaustSkyScale);
-        return
-            accumulatedWaterScattering +
-            throughput *
-            mix(deepWaterFallback, exhaustSkyRadiance, exhaustUpSkyWeight);
-#endif
+        return accumulatedWaterScattering +
+            throughput * WATER_SCATTER_COLOR * getSurfaceAmbientRadiance() * 0.6;
     }
-
-    const float WATER_SKY_FALLBACK_MIN = 0.30;
-    float waterSkyFallbackDim = 1.0;
-    if(waterSunVisibilityTraced && sunDirection.y > 0.0)
-    {
-        waterSkyFallbackDim =
-            mix(WATER_SKY_FALLBACK_MIN, 1.0, waterSunVisibility);
-    }
-
-    const vec3 exhaustNonWaterFallback =
-        mix(getSurfaceAmbientRadiance() * (0.35 * exhaustSkyScale), exhaustSkyRadiance, exhaustUpSkyWeight);
-    return
-        accumulatedWaterScattering +
-        throughput *
-        exhaustNonWaterFallback *
-        waterSkyFallbackDim;
+    return accumulatedWaterScattering +
+        throughput * getSurfaceAmbientRadiance() * 0.5;
 }
 
 // =====================================================

@@ -909,6 +909,7 @@ destroySharcUpdatePipeline();
         g_chunkRawPayloads.clear();
         g_chunkUploadDigests.clear();
         g_cutoutOmmInputs.clear();
+        g_chunkColumnKeys.clear();
         g_voxyLodSources.clear();
         g_voxyLodSpatialOwners.clear();
         g_dhLodSections.clear();

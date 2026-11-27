@@ -793,12 +793,26 @@ vec3 evaluatePrimaryWaterReceiverCaustics(
         return vec3(0.0);
     }
 
+#ifndef WATER_CAUSTIC_REUSE_RECEIVER_SUN
+#define WATER_CAUSTIC_REUSE_RECEIVER_SUN 1
+#endif
+
 #if WATER_CAUSTIC_DEFERRED_SUN_TRACE
-    vec3 sunTransmittance = traceSunTransmittanceThroughWaterEx(
-        receiver.receiverWorldPos + receiverN * 0.015,
-        receiverToSun,
-        L
-    );
+    vec3 sunTransmittance;
+#if WATER_CAUSTIC_REUSE_RECEIVER_SUN
+    if(receiver.receiverSunTransmittanceValid > 0.5)
+    {
+        sunTransmittance = receiver.receiverSunTransmittance;
+    }
+    else
+#endif
+    {
+        sunTransmittance = traceSunTransmittanceThroughWaterEx(
+            receiver.receiverWorldPos + receiverN * 0.015,
+            receiverToSun,
+            L
+        );
+    }
     if(max(sunTransmittance.r, max(sunTransmittance.g, sunTransmittance.b)) <= 0.0)
     {
         return vec3(0.0);

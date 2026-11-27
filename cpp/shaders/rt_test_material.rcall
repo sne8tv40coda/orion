@@ -333,9 +333,7 @@ void main()
         floatBitsToUint(payload.normal.z),
         floatBitsToUint(payload.pomSelfShadow));
     ptLandingRecords[slot].c = uvec4(payload.albedoPacked, payload.state,
-        0u, 0u);
+        floatBitsToUint(payload.parallaxRayTravel), 0u);
     ptLandingRecords[slot].d = vec4(payload.emission,
         payload.pomMicroOcclusion);
-    ptLandingRecords[slot].e = vec4(payload.parallaxRayTravel,
-        0.0, 0.0, 0.0);
 }

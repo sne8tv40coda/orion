@@ -1536,7 +1536,7 @@ std::atomic<uint32_t> g_perfAoNearSamples{2u};
 std::atomic<uint32_t> g_perfAoMidSamples{1u};
 std::atomic<uint32_t> g_perfGiBounces{1u};
 std::atomic<uint32_t> g_perfSunShadowSamples{2u};
-std::atomic<uint32_t> g_perfLocalLightRisCandidates{4u};
+std::atomic<uint32_t> g_perfLocalLightRisCandidates{16u};
 std::atomic<uint32_t> g_perfLocalLightAreaSamples{2u};
 std::atomic<uint32_t> g_perfWaterReflectionInterval{1u};
 std::atomic<uint32_t> g_perfGlossyFullDistance{64u};
@@ -1826,6 +1826,7 @@ bool g_rainPuddleLoggedGeometry = false;
 std::unordered_map<uint64_t, std::vector<uint8_t>>
     g_chunkRawPayloads;
 std::unordered_map<uint64_t, ChunkUploadDigest> g_chunkUploadDigests;
+std::unordered_map<uint64_t, std::unordered_set<uint64_t>> g_chunkColumnKeys;
 std::mutex g_visibleSectionKeysMutex;
 std::vector<uint64_t> g_visibleSectionKeys;
 std::atomic<uint32_t> g_visibleSectionKeyCount{0u};
@@ -1867,6 +1868,7 @@ std::unordered_map<
     uint64_t,
     std::vector<LocalLightRecord>
 > g_lightSections;
+std::unordered_map<uint64_t, std::unordered_set<uint64_t>> g_lightColumnKeys;
 
 
 size_t
@@ -2425,6 +2427,7 @@ VkDescriptorPool g_waterFftDescriptorPool = VK_NULL_HANDLE;
 VkDescriptorSet g_waterFftDescriptorSet = VK_NULL_HANDLE;
 VkPipelineLayout g_waterFftPipelineLayout = VK_NULL_HANDLE;
 VkPipeline g_waterFftPipeline = VK_NULL_HANDLE;
+VkPipeline g_waterFftFusedPipeline = VK_NULL_HANDLE;
 bool g_waterFftLayoutReady = false;
 int32_t g_waterFftWorkingLayer = 0;
 std::chrono::steady_clock::time_point g_waterFftLastUpdate{};

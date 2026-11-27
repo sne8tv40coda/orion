@@ -442,30 +442,7 @@ vec3 evaluateSecondaryDiffuseLocalLights(
             hit.albedoPacked = packAlbedoUnorm(vec3(1.0));
 
 
-#ifdef RT_ENABLE_SER
-            // Perf-L10.8: same ray, same flags; SER only reschedules the hit shader.
-            // Perf-L10.10: moved here from .y.  This is the local-light
-            // secondary bounce - a genuine secondary ray whose hit triggers
-            // material-dependent shading, which the Khronos "When to Use SER"
-            // list calls out as a case that can pay for a hit object.  It was
-            // previously lumped in with the visibility group, so it never had a
-            // measurement of its own.  .y now gates only the dropped visibility
-            // group.
-            if(cam.perfSerAb.z != 0u)
-            {
-                serTraceRay(
-                    hitPos + L * 0.001,
-                    0.02,
-                    L,
-                    shadowMaxDistance,
-                    gl_RayFlagsTerminateOnFirstHitEXT |
-                    gl_RayFlagsSkipClosestHitShaderEXT,
-                    g_secondaryCullMask,
-                    slot
-                );
-            }
-            else
-#endif
+            // 2026-11-27 (Batch AI): visibility-only local-light ray skips SER overhead.
             {
                 #ifdef ORION_RT_STAGE_COUNTERS
                 rtCntRayIssued();

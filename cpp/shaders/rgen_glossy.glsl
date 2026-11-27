@@ -313,6 +313,17 @@ for(
             }
         }
 
+#if defined(RT_ENABLE_SER) && ORION_SER_FUSED_ONLY
+        serTraceRay(
+            currentOrigin,
+            0.001,
+            currentDirection,
+            glossyRayMaxDistance,
+            secondaryTraverseFlags(),
+            g_secondaryCullMask,
+            pathStep
+        );
+#else
 #ifdef RT_ENABLE_SER
         // Perf-L10.8: same ray, same flags; SER only reschedules the hit shader.
         if(cam.perfSerAb.z != 0u)
@@ -347,6 +358,7 @@ for(
                 0
             );
         }
+#endif
 
 
         if(pathStep == 0)

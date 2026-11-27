@@ -312,13 +312,15 @@ def collect_targets():
     add('rt_test.rmiss', 'rt_test_nocloud.rmiss.spv', ['-DRMISS_SKIP_CLOUDS=1'])
 
     # 3) SHaRC update 变体：同一份源码 + -DSHARC_UPDATE=1（走 K2-I 轻量化管线 + MatReuse 消费瘦身）。
-    add('rt_test.rgen', 'rt_test_sharc_update.rgen.spv', [
+    sharc_update_flags = [
         '-DSHARC_UPDATE=1',
         '-DORION_K2_TRANSPORT',
         '-DORION_K2_MATERIAL_INLINE',
         '-DORION_K2_INDIRECT_STAGE',
         '-DORION_K2_CONSUMER_MAT_REUSE_ONLY',
-    ])
+    ]
+    add('rt_test.rgen', 'rt_test_sharc_update.rgen.spv', sharc_update_flags)
+    add('rt_test.rgen', 'rt_test_sharc_update_ser.rgen.spv', sharc_update_flags + ['-DRT_ENABLE_SER'])
 
     # 3.5) 批4b 植物真几何摇摆：foliage split 顶点逐帧位移 compute（无描述符，
     #      全 push constant；位移后走 foliage BLAS refit）。
@@ -371,6 +373,9 @@ def collect_targets():
     # 8) K1 主命中组精简 rchit + 极简主光线专用 rchit（~8 KB）。
     add('rt_test.rchit', 'rt_test_k1.rchit.spv', ['-DORION_K1_PRIMARY'])
     add('rt_test_k1_primary.rchit', 'rt_test_k1_primary.rchit.spv', [])
+
+    # 8.5) 水面 FFT 共享内存融合计算管线（3/5 趟取代 21/41 趟）。
+    add('water_fft_fused.comp', 'water_fft_fused.comp.spv', [])
 
     # 9) 材质 callable TU（生成文件，单一事实源 rt_test.rchit）。
     add('rt_test_material.rcall', 'rt_test_material.spv', [])

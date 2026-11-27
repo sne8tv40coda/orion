@@ -1,0 +1,86 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, rg32f) uniform image2DArray waterFftState;
+layout(set = 0, binding = 1, rgba16f) uniform image2D waterFftSlope;
+
+#include "water_fft_common.glsl"
+
+// Single-pass 512-point radix-2 FFT per row/column in shared memory.
+// Reduces 21/41 small GPU dispatches + barriers down to 3/5 dispatches
+// with identical Phillips spectrum and finalize slope math.
+shared vec2 s_fft[WATER_FFT_N];
+
+void main()
+{
+    const uint lineIdx = gl_WorkGroupID.x;
+    if(lineIdx >= WATER_FFT_N)
+    {
+        return;
+    }
+
+    const uint t = gl_LocalInvocationID.x;
+    const uint tHi = t + (WATER_FFT_N >> 1u);
+
+    if(fftPush.axis == 0)
+    {
+        s_fft[t] = waterFftEvolvedSpectrum(
+            waterFftGridIndex(uvec2(waterFftBitReverse(t), lineIdx)));
+        s_fft[tHi] = waterFftEvolvedSpectrum(
+            waterFftGridIndex(uvec2(waterFftBitReverse(tHi), lineIdx)));
+    }
+    else
+    {
+        s_fft[t] = imageLoad(
+            waterFftState,
+            ivec3(int(lineIdx), int(waterFftBitReverse(t)), fftPush.sourceLayer)).rg;
+        s_fft[tHi] = imageLoad(
+            waterFftState,
+            ivec3(int(lineIdx), int(waterFftBitReverse(tHi)), fftPush.sourceLayer)).rg;
+    }
+
+    barrier();
+
+    for(int stage = 0; stage < WATER_FFT_LOG2_N; ++stage)
+    {
+        const uint halfLen = 1u << uint(stage);
+        const uint stageLen = halfLen << 1u;
+        const uint group = t >> uint(stage);
+        const uint j = t & (halfLen - 1u);
+        const uint idx0 = group * stageLen + j;
+        const uint idx1 = idx0 + halfLen;
+
+        const float angle = 2.0 * WATER_FFT_PI * float(j) / float(stageLen);
+        const vec2 w = vec2(cos(angle), sin(angle));
+        const vec2 a = s_fft[idx0];
+        const vec2 b = waterFftComplexMul(s_fft[idx1], w);
+        s_fft[idx0] = a + b;
+        s_fft[idx1] = a - b;
+
+        barrier();
+    }
+
+    if(fftPush.axis == 0)
+    {
+        imageStore(
+            waterFftState,
+            ivec3(int(t), int(lineIdx), fftPush.destinationLayer),
+            vec4(s_fft[t], 0.0, 1.0));
+        imageStore(
+            waterFftState,
+            ivec3(int(tHi), int(lineIdx), fftPush.destinationLayer),
+            vec4(s_fft[tHi], 0.0, 1.0));
+    }
+    else
+    {
+        imageStore(
+            waterFftState,
+            ivec3(int(lineIdx), int(t), fftPush.destinationLayer),
+            vec4(s_fft[t], 0.0, 1.0));
+        imageStore(
+            waterFftState,
+            ivec3(int(lineIdx), int(tHi), fftPush.destinationLayer),
+            vec4(s_fft[tHi], 0.0, 1.0));
+    }
+}

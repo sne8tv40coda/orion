@@ -28,7 +28,6 @@ struct PTLandingRecord
     uvec4 b;
     uvec4 c;
     vec4 d;
-    vec4 e;
 };
 
 layout(std430, binding = 88, set = 0) buffer PTLandingSSBO
@@ -42,8 +41,6 @@ struct MatReuseRecord
 {
     uvec4 a;
     uvec4 b;
-    uvec4 c;
-    uvec4 d;
 };
 
 layout(std430, binding = 94, set = 0) readonly buffer MatReuseSSBO
@@ -71,6 +68,17 @@ layout(std430, binding = 100, set = 0) buffer K2iSparseCompactSSBO
 
 const float SOLAR_LATITUDE_35_SIN = 0.57357643635;
 const float SOLAR_LATITUDE_35_COS = 0.81915204429;
+
+vec3 ptOctDecode(vec2 e)
+{
+    vec3 n = vec3(e.x, e.y, 1.0 - abs(e.x) - abs(e.y));
+    if(n.z < 0.0)
+    {
+        vec2 sgn = vec2(n.x >= 0.0 ? 1.0 : -1.0, n.y >= 0.0 ? 1.0 : -1.0);
+        n.xy = (1.0 - abs(n.yx)) * sgn;
+    }
+    return normalize(n);
+}
 
 uint pcgHash(inout uint state)
 {
@@ -232,7 +240,7 @@ void main()
             {
                 const MatReuseRecord mr = matReuseRecords[linearIdx];
                 const bool matReuseValid =
-                    (cam.matReuseAb.x != 0u) && (mr.d.w == (cam.frameCount + 1u));
+                    (cam.matReuseAb.x != 0u) && ((mr.b.w >> 24u) == ((cam.frameCount % 255u) + 1u));
 
                 bool maskBitLoaded = false;
                 bool maskBitActive = true;
@@ -262,7 +270,7 @@ void main()
                 }
                 else
                 {
-                    const uint hitClass = (mr.b.x >> 3u) & 0x3u;
+                    const uint hitClass = (mr.a.y >> 3u) & 0x3u;
                     if(hitClass != 1u)
                     {
                         const float primaryHitDistance = max(uintBitsToFloat(mr.a.x), 0.0);
@@ -283,14 +291,11 @@ void main()
                         // Slot 3: K2-Loc-Glossy
                         if(mode3 != 0u)
                         {
-                            const float roughness = uintBitsToFloat(mr.a.y);
-                            const float f0Metal = uintBitsToFloat(mr.a.z);
-                            const float normalY = uintBitsToFloat(mr.c.y);
-                            const vec3 hitNormal = vec3(
-                                uintBitsToFloat(mr.c.x),
-                                normalY,
-                                uintBitsToFloat(mr.c.z)
-                            );
+                            const vec2 rf = unpackHalf2x16(mr.a.w);
+                            const float roughness = rf.x;
+                            const float f0Metal = rf.y;
+                            const vec3 hitNormal = ptOctDecode(unpackSnorm2x16(mr.b.x));
+                            const float normalY = hitNormal.y;
                             const int f0MetalCode = int(round(clamp(f0Metal, 0.0, 1.0) * 255.0));
                             const float rainStrength = overworldRainStrength();
                             const vec3 sunDir = getTimeDrivenSunDirection3D();
@@ -494,31 +499,41 @@ void main()
     {
         s_wgBase1 = atomicAdd(k2iCompact.headers[1].activeCount, s_wgCount1);
         const uint compactH = max(k2iCompact.headers[1].height, 1u);
-        atomicMax(k2iCompact.headers[1].width, (s_wgBase1 + s_wgCount1 + compactH - 1u) / compactH);
+        const uint end1 = s_wgBase1 + s_wgCount1;
+        const uint cols1 = (compactH == 1u) ? end1 : ((end1 + compactH - 1u) / compactH);
+        atomicMax(k2iCompact.headers[1].width, cols1);
     }
     if(gl_LocalInvocationIndex == 1u && s_wgCount2 > 0u)
     {
         s_wgBase2 = atomicAdd(k2iCompact.headers[2].activeCount, s_wgCount2);
         const uint compactH = max(k2iCompact.headers[2].height, 1u);
-        atomicMax(k2iCompact.headers[2].width, (s_wgBase2 + s_wgCount2 + compactH - 1u) / compactH);
+        const uint end2 = s_wgBase2 + s_wgCount2;
+        const uint cols2 = (compactH == 1u) ? end2 : ((end2 + compactH - 1u) / compactH);
+        atomicMax(k2iCompact.headers[2].width, cols2);
     }
     if(gl_LocalInvocationIndex == 2u && s_wgCount3 > 0u)
     {
         s_wgBase3 = atomicAdd(k2iCompact.headers[3].activeCount, s_wgCount3);
         const uint compactH = max(k2iCompact.headers[3].height, 1u);
-        atomicMax(k2iCompact.headers[3].width, (s_wgBase3 + s_wgCount3 + compactH - 1u) / compactH);
+        const uint end3 = s_wgBase3 + s_wgCount3;
+        const uint cols3 = (compactH == 1u) ? end3 : ((end3 + compactH - 1u) / compactH);
+        atomicMax(k2iCompact.headers[3].width, cols3);
     }
     if(gl_LocalInvocationIndex == 3u && s_wgCount4 > 0u)
     {
         s_wgBase4 = atomicAdd(k2iCompact.headers[4].activeCount, s_wgCount4);
         const uint compactH = max(k2iCompact.headers[4].height, 1u);
-        atomicMax(k2iCompact.headers[4].width, (s_wgBase4 + s_wgCount4 + compactH - 1u) / compactH);
+        const uint end4 = s_wgBase4 + s_wgCount4;
+        const uint cols4 = (compactH == 1u) ? end4 : ((end4 + compactH - 1u) / compactH);
+        atomicMax(k2iCompact.headers[4].width, cols4);
     }
     if(gl_LocalInvocationIndex == 4u && s_wgCount5 > 0u)
     {
         s_wgBase5 = atomicAdd(k2iCompact.headers[5].activeCount, s_wgCount5);
         const uint compactH = max(k2iCompact.headers[5].height, 1u);
-        atomicMax(k2iCompact.headers[5].width, (s_wgBase5 + s_wgCount5 + compactH - 1u) / compactH);
+        const uint end5 = s_wgBase5 + s_wgCount5;
+        const uint cols5 = (compactH == 1u) ? end5 : ((end5 + compactH - 1u) / compactH);
+        atomicMax(k2iCompact.headers[5].width, cols5);
     }
     barrier();
 

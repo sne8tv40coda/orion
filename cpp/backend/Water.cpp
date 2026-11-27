@@ -517,6 +517,50 @@ void waterFftDispatch(
     vkCmdDispatch(cmd, groups, groups, 1u);
 }
 
+void waterFftFusedDispatch(
+    VkCommandBuffer cmd,
+    int32_t sourceLayer,
+    int32_t destinationLayer,
+    int32_t axis,
+    float texelWorldSizeOverride = -1.0f,
+    float minWaveRadius = 0.0f)
+{
+    const float baseAmplitude = g_waterFftAmplitude.load();
+    WaterFftPushConstants push{};
+    push.sourceLayer = sourceLayer;
+    push.destinationLayer = destinationLayer;
+    push.stageLength = 0;
+    push.mode = 0;
+    push.axis = axis;
+    push.detailSourceLayer = 0;
+    push.timeSeconds = g_waterFftTimeSeconds;
+    push.windSpeed = 0.0f;
+    push.rainStrength = g_waterWeatherRain.load();
+    push.spectrumScale = 0.0f;
+    push.visualScale = baseAmplitude;
+    push.choppiness = g_waterFftChoppiness.load();
+    push.texelWorldSize = texelWorldSizeOverride > 0.0f
+        ? texelWorldSizeOverride
+        : g_waterFftTilePeriod.load() / float(WATER_FFT_RESOLUTION);
+    push.detailTexelWorldSize = 0.0f;
+    push.detailVisualScale = 0.0f;
+    push.minWaveRadius = minWaveRadius;
+    const float windAngleRad =
+        g_windAngle.load() * (3.14159265f / 180.0f);
+    push.windDirX = std::cos(windAngleRad);
+    push.windDirY = std::sin(windAngleRad);
+
+    vkCmdPushConstants(
+        cmd,
+        g_waterFftPipelineLayout,
+        VK_SHADER_STAGE_COMPUTE_BIT,
+        0u,
+        static_cast<uint32_t>(sizeof(push)),
+        &push
+    );
+    vkCmdDispatch(cmd, WATER_FFT_RESOLUTION, 1u, 1u);
+}
+
 // 描述符写入（两个 storage image）。只在创建时调一次：整条链不变，不需要逐帧
 // 重写（飞行中的帧永远看到一致的绑定）。
 void updateWaterFftDescriptors()
@@ -755,6 +799,30 @@ void createWaterFftResources()
             "vkCreateComputePipelines waterFft");
         vkDestroyShaderModule(g_device, shaderModule, nullptr);
 
+        try
+        {
+            const std::vector<uint8_t> fusedCode = loadSpv("shaders/water_fft_fused.comp.spv");
+            VkShaderModule fusedModule = createShaderModule(g_device, fusedCode);
+            VkComputePipelineCreateInfo fusedInfo{
+                VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+            fusedInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            fusedInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+            fusedInfo.stage.module = fusedModule;
+            fusedInfo.stage.pName = "main";
+            fusedInfo.layout = g_waterFftPipelineLayout;
+            check(vkCreateComputePipelines(
+                g_device, getSharedPipelineCache(), 1u, &fusedInfo,
+                nullptr, &g_waterFftFusedPipeline),
+                "vkCreateComputePipelines waterFftFused");
+            vkDestroyShaderModule(g_device, fusedModule, nullptr);
+            RTLog("[WATER FFT] fused shared-memory FFT pipeline ready (shaders/water_fft_fused.comp.spv)");
+        }
+        catch(const std::exception& fusedErr)
+        {
+            g_waterFftFusedPipeline = VK_NULL_HANDLE;
+            RTLog(std::string("[WATER FFT] fused pipeline unavailable, using legacy passes: ") + fusedErr.what());
+        }
+
         g_waterFftAvailable.store(true);
         updateWaterSimFftDescriptor();
         RTLog("[WATER FFT] Phillips spectrum pipeline created ("
@@ -906,81 +974,104 @@ void recordWaterFftUpdate(VkCommandBuffer cmd)
         );
     }
 
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_waterFftPipeline);
-    vkCmdBindDescriptorSets(
-        cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_waterFftPipelineLayout,
-        0u, 1u, &g_waterFftDescriptorSet, 0u, nullptr);
-
-    int32_t layer = 0;
-
-    waterFftDispatch(cmd, -1, layer, 0, 0, 0);
-    waterFftPassBarrier(cmd);
-    layer ^= 1;
-
-    for(uint32_t stage = 0u; stage < WATER_FFT_LOG2; ++stage)
-    {
-        const int32_t length = static_cast<int32_t>(2u << stage);
-        waterFftDispatch(cmd, layer ^ 1, layer, length, 1, 0);
-        waterFftPassBarrier(cmd);
-        layer ^= 1;
-    }
-
-    waterFftDispatch(cmd, layer ^ 1, layer, 0, 2, 0);
-    waterFftPassBarrier(cmd);
-    layer ^= 1;
-
-    for(uint32_t stage = 0u; stage < WATER_FFT_LOG2; ++stage)
-    {
-        const int32_t length = static_cast<int32_t>(2u << stage);
-        waterFftDispatch(cmd, layer ^ 1, layer, length, 1, 1);
-        waterFftPassBarrier(cmd);
-        layer ^= 1;
-    }
-
     const float detailTexel =
         kWATER_FFT_DETAIL_TILE / float(WATER_FFT_RESOLUTION);
-    // 2026-11-16 降本：detailVisualScale <= 0（detail 档位关或波幅=0）时，
-    // detail 链的 19 趟 dispatch 整段短路 —— finalize（water_fft.comp 的
-    // waterFftFinalizePass）在 detailVisualScale <= 0 时根本不读 detail 层
-    //（.ba 直接写 0），跳过链输出逐位不变。旧代码无条件跑这 19 趟，
-    // 结果全被 ×0 丢弃。
     const float detailVisualScale =
         g_waterFftAmplitude.load() * kWATER_FFT_DETAIL_BOOST *
         g_waterFftDetail.load();
-    int32_t finalDetailLayer = 2;
-    if(detailVisualScale > 0.0f)
-    {
-        auto detailDispatch = [&](int32_t src, int32_t dst, int32_t stage, int32_t mode, int32_t axis)
-        {
-            waterFftDispatch(
-                cmd, src, dst, stage, mode, axis,
-                -1, detailTexel, 0.0f, 0.0f, kWATER_FFT_DETAIL_MIN_WAVE_RADIUS);
-            waterFftPassBarrier(cmd);
-        };
 
-        int32_t detailLayer = 2;
-        detailDispatch(-1, detailLayer, 0, 0, 0);
-        detailLayer ^= 1;
+    int32_t finalBaseLayer = 0;
+    int32_t finalDetailLayer = 2;
+    if(g_waterFftFusedPipeline != VK_NULL_HANDLE)
+    {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_waterFftFusedPipeline);
+        vkCmdBindDescriptorSets(
+            cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_waterFftPipelineLayout,
+            0u, 1u, &g_waterFftDescriptorSet, 0u, nullptr);
+
+        waterFftFusedDispatch(cmd, -1, 0, 0);
+        waterFftPassBarrier(cmd);
+        waterFftFusedDispatch(cmd, 0, 1, 1);
+        waterFftPassBarrier(cmd);
+        finalBaseLayer = 1;
+
+        if(detailVisualScale > 0.0f)
+        {
+            waterFftFusedDispatch(
+                cmd, -1, 0, 0, detailTexel, kWATER_FFT_DETAIL_MIN_WAVE_RADIUS);
+            waterFftPassBarrier(cmd);
+            waterFftFusedDispatch(
+                cmd, 0, 2, 1, detailTexel, kWATER_FFT_DETAIL_MIN_WAVE_RADIUS);
+            waterFftPassBarrier(cmd);
+            finalDetailLayer = 2;
+        }
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_waterFftPipeline);
+    }
+    else
+    {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_waterFftPipeline);
+        vkCmdBindDescriptorSets(
+            cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_waterFftPipelineLayout,
+            0u, 1u, &g_waterFftDescriptorSet, 0u, nullptr);
+
+        int32_t layer = 0;
+
+        waterFftDispatch(cmd, -1, layer, 0, 0, 0);
+        waterFftPassBarrier(cmd);
+        layer ^= 1;
+
         for(uint32_t stage = 0u; stage < WATER_FFT_LOG2; ++stage)
         {
             const int32_t length = static_cast<int32_t>(2u << stage);
-            detailDispatch(detailLayer ^ 1, detailLayer, length, 1, 0);
-            detailLayer ^= 1;
+            waterFftDispatch(cmd, layer ^ 1, layer, length, 1, 0);
+            waterFftPassBarrier(cmd);
+            layer ^= 1;
         }
-        detailDispatch(detailLayer ^ 1, detailLayer, 0, 2, 0);
-        detailLayer ^= 1;
+
+        waterFftDispatch(cmd, layer ^ 1, layer, 0, 2, 0);
+        waterFftPassBarrier(cmd);
+        layer ^= 1;
+
         for(uint32_t stage = 0u; stage < WATER_FFT_LOG2; ++stage)
         {
             const int32_t length = static_cast<int32_t>(2u << stage);
-            detailDispatch(detailLayer ^ 1, detailLayer, length, 1, 1);
-            detailLayer ^= 1;
+            waterFftDispatch(cmd, layer ^ 1, layer, length, 1, 1);
+            waterFftPassBarrier(cmd);
+            layer ^= 1;
         }
-        finalDetailLayer = detailLayer ^ 1;
+
+        finalBaseLayer = layer ^ 1;
+        const int32_t freeBaseLayer = finalBaseLayer ^ 1;
+        if(detailVisualScale > 0.0f)
+        {
+            int32_t dSrc = freeBaseLayer;
+            int32_t dDst = 2;
+            auto detailDispatch = [&](int32_t src, int32_t stage, int32_t mode, int32_t axis)
+            {
+                waterFftDispatch(
+                    cmd, src, dDst, stage, mode, axis,
+                    -1, detailTexel, 0.0f, 0.0f, kWATER_FFT_DETAIL_MIN_WAVE_RADIUS);
+                waterFftPassBarrier(cmd);
+                std::swap(dSrc, dDst);
+            };
+
+            detailDispatch(-1, 0, 0, 0);
+            for(uint32_t stage = 0u; stage < WATER_FFT_LOG2; ++stage)
+            {
+                const int32_t length = static_cast<int32_t>(2u << stage);
+                detailDispatch(dSrc, length, 1, 0);
+            }
+            detailDispatch(dSrc, 0, 2, 0);
+            for(uint32_t stage = 0u; stage < WATER_FFT_LOG2; ++stage)
+            {
+                const int32_t length = static_cast<int32_t>(2u << stage);
+                detailDispatch(dSrc, length, 1, 1);
+            }
+            finalDetailLayer = dSrc;
+        }
     }
 
-    // 2026-11-22 Round 2 (Item G): butterfly loops flip `layer ^= 1` after the
-    // final stage write, so completed 512x512 IFFT resides in `layer ^ 1` (and `detailLayer ^ 1`).
-    const int32_t finalBaseLayer = layer ^ 1;
     waterFftDispatch(
         cmd, finalBaseLayer, -1, 0, 3, 0,
         finalDetailLayer,
@@ -1088,6 +1179,7 @@ void destroyWaterFftResources()
     g_waterFftAvailable.store(false);
     g_waterFftLayoutReady = false;
     g_waterFftLastUpdateValid = false;
+    if(g_waterFftFusedPipeline){vkDestroyPipeline(g_device,g_waterFftFusedPipeline,nullptr);g_waterFftFusedPipeline=VK_NULL_HANDLE;}
     if(g_waterFftPipeline){vkDestroyPipeline(g_device,g_waterFftPipeline,nullptr);g_waterFftPipeline=VK_NULL_HANDLE;}
     if(g_waterFftPipelineLayout){vkDestroyPipelineLayout(g_device,g_waterFftPipelineLayout,nullptr);g_waterFftPipelineLayout=VK_NULL_HANDLE;}
     if(g_waterFftDescriptorPool){vkDestroyDescriptorPool(g_device,g_waterFftDescriptorPool,nullptr);g_waterFftDescriptorPool=VK_NULL_HANDLE;g_waterFftDescriptorSet=VK_NULL_HANDLE;}
@@ -1247,25 +1339,27 @@ void createWaterCausticMapResources()
 
     try
     {
+        // 2026-11-27 (Batch AE): Single-channel R16_SFLOAT + 1 layer (-22.67 MB VRAM, 4x less blit/sample bandwidth).
         VkFormatProperties formatProperties{};
         vkGetPhysicalDeviceFormatProperties(
-            g_physicalDevice, VK_FORMAT_R16G16B16A16_SFLOAT, &formatProperties);
+            g_physicalDevice, VK_FORMAT_R16_SFLOAT, &formatProperties);
         const VkFormatFeatureFlags requiredFeatures =
-            VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
-            VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT |
+            VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT |
             VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
-            VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+            VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
+            VK_FORMAT_FEATURE_BLIT_SRC_BIT |
+            VK_FORMAT_FEATURE_BLIT_DST_BIT;
         if((formatProperties.optimalTilingFeatures & requiredFeatures) !=
            requiredFeatures)
         {
-            RTLog("[WATER CAUSTIC MAP] RGBA16F color-attachment blend/linear unsupported; "
+            RTLog("[WATER CAUSTIC MAP] R16F storage/linear/blit unsupported; "
                   "caustic map disabled");
             return;
         }
 
         VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         imageInfo.imageType = VK_IMAGE_TYPE_2D;
-        imageInfo.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+        imageInfo.format = VK_FORMAT_R16_SFLOAT;
         imageInfo.extent = {
             WATER_CAUSTIC_MAP_RESOLUTION,
             WATER_CAUSTIC_MAP_RESOLUTION,
@@ -1275,8 +1369,7 @@ void createWaterCausticMapResources()
         imageInfo.arrayLayers = WATER_CAUSTIC_MAP_LAYERS;
         imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
         imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
-        imageInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
-                          VK_IMAGE_USAGE_SAMPLED_BIT |
+        imageInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT |
                           VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                           VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                           VK_IMAGE_USAGE_STORAGE_BIT;
@@ -1301,7 +1394,7 @@ void createWaterCausticMapResources()
         VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         viewInfo.image = g_waterCausticMapImage;
         viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        viewInfo.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+        viewInfo.format = VK_FORMAT_R16_SFLOAT;
         viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         viewInfo.subresourceRange.baseMipLevel = 0u;
         viewInfo.subresourceRange.levelCount = WATER_CAUSTIC_MAP_MIPS;
@@ -1310,22 +1403,7 @@ void createWaterCausticMapResources()
         check(vkCreateImageView(g_device, &viewInfo, nullptr, &g_waterCausticMapView),
             "water caustic map create view failed");
 
-        viewInfo.subresourceRange.baseArrayLayer = WATER_CAUSTIC_MAP_LAYER_REFLECT;
-        check(vkCreateImageView(
-            g_device, &viewInfo, nullptr, &g_waterCausticMapReflectView),
-            "water caustic map create reflect view failed");
-
-        viewInfo.subresourceRange.levelCount = 1u;
-        viewInfo.subresourceRange.baseArrayLayer = WATER_CAUSTIC_MAP_LAYER_REFRACT;
-        check(vkCreateImageView(g_device, &viewInfo, nullptr, &g_waterCausticMapMip0View),
-            "water caustic map create mip0 view failed");
-        viewInfo.subresourceRange.baseArrayLayer = WATER_CAUSTIC_MAP_LAYER_REFLECT;
-        check(vkCreateImageView(
-            g_device, &viewInfo, nullptr, &g_waterCausticMapReflectMip0View),
-            "water caustic map create reflect mip0 view failed");
-
-        // 2026-11-01：compute 生产者的写入目标 —— 两层一起绑定成 2D array 的
-        // mip0 视图，一次 dispatch 出折射 + 反射。
+        // 2026-11-01：compute 生产者的写入目标（单层 2D array mip0 视图）。
         viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
         viewInfo.subresourceRange.baseMipLevel = 0u;
         viewInfo.subresourceRange.levelCount = 1u;
@@ -1469,11 +1547,11 @@ void createWaterCausticMapResources()
             barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
             barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
             barrier.dstAccessMask =
-                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
             vkCmdPipelineBarrier(
                 commandBuffer,
                 VK_PIPELINE_STAGE_TRANSFER_BIT,
-                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
                     VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
                 0u, 0u, nullptr, 0u, nullptr, 1u, &barrier);
 
@@ -1535,62 +1613,6 @@ void createWaterCausticMapResources()
                 "water caustic map init wait failed");
             vkFreeCommandBuffers(g_device, g_rtCommandPool, 1u, &commandBuffer);
         }
-
-        VkAttachmentDescription attachment{};
-        attachment.format = VK_FORMAT_R16G16B16A16_SFLOAT;
-        attachment.samples = VK_SAMPLE_COUNT_1_BIT;
-        attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-        attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-        attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-        attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-        attachment.initialLayout = VK_IMAGE_LAYOUT_GENERAL;
-        attachment.finalLayout = VK_IMAGE_LAYOUT_GENERAL;
-
-        VkAttachmentReference colorReference{};
-        colorReference.attachment = 0u;
-        colorReference.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-
-        VkSubpassDescription subpass{};
-        subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-        subpass.colorAttachmentCount = 1u;
-        subpass.pColorAttachments = &colorReference;
-
-        VkSubpassDependency dependency{};
-        dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
-        dependency.dstSubpass = 0u;
-        dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-        dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-        dependency.srcAccessMask = 0u;
-        dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-
-        VkRenderPassCreateInfo renderPassInfo{
-            VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
-        renderPassInfo.attachmentCount = 1u;
-        renderPassInfo.pAttachments = &attachment;
-        renderPassInfo.subpassCount = 1u;
-        renderPassInfo.pSubpasses = &subpass;
-        renderPassInfo.dependencyCount = 1u;
-        renderPassInfo.pDependencies = &dependency;
-        check(vkCreateRenderPass(
-            g_device, &renderPassInfo, nullptr, &g_waterCausticMapRenderPass),
-            "water caustic map create render pass failed");
-
-        VkFramebufferCreateInfo framebufferInfo{
-            VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
-        framebufferInfo.renderPass = g_waterCausticMapRenderPass;
-        framebufferInfo.attachmentCount = 1u;
-        framebufferInfo.pAttachments = &g_waterCausticMapMip0View;
-        framebufferInfo.width = WATER_CAUSTIC_MAP_RESOLUTION;
-        framebufferInfo.height = WATER_CAUSTIC_MAP_RESOLUTION;
-        framebufferInfo.layers = 1u;
-        check(vkCreateFramebuffer(
-            g_device, &framebufferInfo, nullptr, &g_waterCausticMapFramebuffer),
-            "water caustic map create framebuffer failed");
-        framebufferInfo.pAttachments = &g_waterCausticMapReflectMip0View;
-        check(vkCreateFramebuffer(
-            g_device, &framebufferInfo, nullptr,
-            &g_waterCausticMapReflectFramebuffer),
-            "water caustic map create reflect framebuffer failed");
 
         VkDescriptorSetLayoutBinding bindings[2]{};
         bindings[0].binding = 0u;
@@ -1764,10 +1786,10 @@ void createWaterCausticMapResources()
         updateWaterCausticMapRayDescriptor();
         RTLog("[WATER CAUSTIC MAP] compute map created ("
             + std::to_string(WATER_CAUSTIC_MAP_RESOLUTION) + "x"
-            + std::to_string(WATER_CAUSTIC_MAP_RESOLUTION) + ", "
+            + std::to_string(WATER_CAUSTIC_MAP_RESOLUTION) + ", R16F, "
             + std::to_string(WATER_CAUSTIC_MAP_MIPS) + " mips, "
             + std::to_string(WATER_CAUSTIC_MAP_LAYERS)
-            + " layers, photon splat + 5x5 resolve)");
+            + " layer, photon splat + 5x5 resolve)");
     }
     catch(const std::exception& error)
     {
@@ -2005,7 +2027,7 @@ void recordWaterCausticMap(VkCommandBuffer cmd)
     // 2026-11-21 性能优先：WATER_REFLECT_CAUSTIC_ENABLED=false（Remix 核心对齐），
     // Layer 1（反射焦散）着色端零读取 ⇒ 只对 Layer 0（折射焦散）执行 clear/splat/resolve/blit，
     // 减半 1024² 焦散图算子与原子争用（barrier 保持全层，布局一致）。回退改回 WATER_CAUSTIC_MAP_LAYERS。
-    constexpr uint32_t kActiveCausticLayers = 1u;
+    constexpr uint32_t kActiveCausticLayers = WATER_CAUSTIC_MAP_LAYERS;
 
     // ------------------------------------------------------------------
     // 2026-11-20 光子泼溅：清累加图 → 泼溅 → 解析（模糊/归一/压缩）
@@ -3027,25 +3049,27 @@ void createWaterSimulationResources()
     }
 
     VkFormatProperties formatProperties{};
-    vkGetPhysicalDeviceFormatProperties(
-        g_physicalDevice,
-        VK_FORMAT_R16G16B16A16_SFLOAT,
-        &formatProperties
-    );
     const VkFormatFeatureFlags requiredFeatures =
         VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT |
-        VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
-    if((formatProperties.optimalTilingFeatures & requiredFeatures) !=
-       requiredFeatures)
+        VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+        VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+    VkFormat simFormat = VK_FORMAT_R16G16_SFLOAT;
+    vkGetPhysicalDeviceFormatProperties(g_physicalDevice, simFormat, &formatProperties);
+    if((formatProperties.optimalTilingFeatures & requiredFeatures) != requiredFeatures)
     {
-        throw std::runtime_error(
-            "VK_FORMAT_R16G16B16A16_SFLOAT cannot be sampled and stored for water simulation"
-        );
+        simFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+        vkGetPhysicalDeviceFormatProperties(g_physicalDevice, simFormat, &formatProperties);
+        if((formatProperties.optimalTilingFeatures & requiredFeatures) != requiredFeatures)
+        {
+            throw std::runtime_error(
+                "Neither R16G16_SFLOAT nor R16G16B16A16_SFLOAT can be sampled and stored for water simulation"
+            );
+        }
     }
 
     VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     imageInfo.imageType = VK_IMAGE_TYPE_2D;
-    imageInfo.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+    imageInfo.format = simFormat;
     imageInfo.extent = { WATER_SIM_RESOLUTION, WATER_SIM_RESOLUTION, 1u };
     imageInfo.mipLevels = 1u;
     imageInfo.arrayLayers = 2u;
@@ -3082,7 +3106,7 @@ void createWaterSimulationResources()
     VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     viewInfo.image = g_waterSimImage;
     viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
-    viewInfo.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+    viewInfo.format = simFormat;
     viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     viewInfo.subresourceRange.baseMipLevel = 0u;
     viewInfo.subresourceRange.levelCount = 1u;
@@ -3092,6 +3116,9 @@ void createWaterSimulationResources()
         vkCreateImageView(g_device, &viewInfo, nullptr, &g_waterSimView),
         "water simulation create image view failed"
     );
+    RTLog(std::string("[WATER SIM] state image created ") +
+        std::to_string(WATER_SIM_RESOLUTION) + "x" + std::to_string(WATER_SIM_RESOLUTION) +
+        "x2 format=" + (simFormat == VK_FORMAT_R16G16_SFLOAT ? "RG16F" : "RGBA16F"));
 
     VkSamplerCreateInfo samplerInfo{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     samplerInfo.magFilter = VK_FILTER_LINEAR;

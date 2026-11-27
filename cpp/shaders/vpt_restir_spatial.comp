@@ -55,7 +55,6 @@ struct PTLandingRecord
     uvec4 b;
     uvec4 c;
     vec4 d;
-    vec4 e;
 };
 
 layout(std430, binding = 88, set = 0) readonly buffer PTLandingSSBO
@@ -411,28 +410,88 @@ void vptEmitterVisibleFaceWeights(
     const vec3 bMin = vec3(emitterBlock);
     const vec3 bMax = bMin + vec3(1.0);
     const vec3 bCenter = bMin + vec3(0.5);
+    const float slabEps = 1.5e-3;
+    vec3 rawPosW = vec3(0.0);
+    vec3 rawNegW = vec3(0.0);
     posW = vec3(0.0);
     negW = vec3(0.0);
-    for(int a = 0; a < 3; ++a)
+
+    if(hitPos.x > bMax.x + slabEps)
     {
-        if(hitPos[a] > bMax[a] + 1.0e-4)
+        vec3 d = hitPos - vec3(bMax.x, bCenter.y, bCenter.z);
+        float w = max(d.x / max(length(d), 1.0e-5), 1.0e-4);
+        rawPosW.x = w;
+        uint adjSrc = 0u;
+        if(!vptReadSourceVoxel(emitterBlock + ivec3(1, 0, 0), adjSrc) || ((adjSrc & 3u) != 1u))
         {
-            vec3 fc = bCenter;
-            fc[a] = bMax[a];
-            vec3 d = hitPos - fc;
-            float len = max(length(d), 1.0e-5);
-            posW[a] = max(d[a] / len, 1.0e-4);
-        }
-        else if(hitPos[a] < bMin[a] - 1.0e-4)
-        {
-            vec3 fc = bCenter;
-            fc[a] = bMin[a];
-            vec3 d = fc - hitPos;
-            float len = max(length(d), 1.0e-5);
-            negW[a] = max(d[a] / len, 1.0e-4);
+            posW.x = w;
         }
     }
+    else if(hitPos.x < bMin.x - slabEps)
+    {
+        vec3 d = vec3(bMin.x, bCenter.y, bCenter.z) - hitPos;
+        float w = max(d.x / max(length(d), 1.0e-5), 1.0e-4);
+        rawNegW.x = w;
+        uint adjSrc = 0u;
+        if(!vptReadSourceVoxel(emitterBlock + ivec3(-1, 0, 0), adjSrc) || ((adjSrc & 3u) != 1u))
+        {
+            negW.x = w;
+        }
+    }
+
+    if(hitPos.y > bMax.y + slabEps)
+    {
+        vec3 d = hitPos - vec3(bCenter.x, bMax.y, bCenter.z);
+        float w = max(d.y / max(length(d), 1.0e-5), 1.0e-4);
+        rawPosW.y = w;
+        uint adjSrc = 0u;
+        if(!vptReadSourceVoxel(emitterBlock + ivec3(0, 1, 0), adjSrc) || ((adjSrc & 3u) != 1u))
+        {
+            posW.y = w;
+        }
+    }
+    else if(hitPos.y < bMin.y - slabEps)
+    {
+        vec3 d = vec3(bCenter.x, bMin.y, bCenter.z) - hitPos;
+        float w = max(d.y / max(length(d), 1.0e-5), 1.0e-4);
+        rawNegW.y = w;
+        uint adjSrc = 0u;
+        if(!vptReadSourceVoxel(emitterBlock + ivec3(0, -1, 0), adjSrc) || ((adjSrc & 3u) != 1u))
+        {
+            negW.y = w;
+        }
+    }
+
+    if(hitPos.z > bMax.z + slabEps)
+    {
+        vec3 d = hitPos - vec3(bCenter.x, bCenter.y, bMax.z);
+        float w = max(d.z / max(length(d), 1.0e-5), 1.0e-4);
+        rawPosW.z = w;
+        uint adjSrc = 0u;
+        if(!vptReadSourceVoxel(emitterBlock + ivec3(0, 0, 1), adjSrc) || ((adjSrc & 3u) != 1u))
+        {
+            posW.z = w;
+        }
+    }
+    else if(hitPos.z < bMin.z - slabEps)
+    {
+        vec3 d = vec3(bCenter.x, bCenter.y, bMin.z) - hitPos;
+        float w = max(d.z / max(length(d), 1.0e-5), 1.0e-4);
+        rawNegW.z = w;
+        uint adjSrc = 0u;
+        if(!vptReadSourceVoxel(emitterBlock + ivec3(0, 0, -1), adjSrc) || ((adjSrc & 3u) != 1u))
+        {
+            negW.z = w;
+        }
+    }
+
     totalW = dot(posW, vec3(1.0)) + dot(negW, vec3(1.0));
+    if(totalW <= 1.0e-6)
+    {
+        posW = rawPosW;
+        negW = rawNegW;
+        totalW = dot(posW, vec3(1.0)) + dot(negW, vec3(1.0));
+    }
 }
 
 float vptLocalEmitterAngularWeight(

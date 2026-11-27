@@ -2746,6 +2746,7 @@ void chunkStoreRawPayloadLocked(
                 rawMemory + rawPayloadBytes
             );
     }
+    registerChunkColumnKeyLocked(chunkKey);
 }
 void chunkStoreUploadDigestLocked(
     uint64_t chunkKey,
@@ -2765,6 +2766,7 @@ void chunkStoreUploadDigestLocked(
     digest.rawBytes = static_cast<uint64_t>(rawPayloadBytes);
     digest.meshHash = meshDigest;
     digest.meshVertices = static_cast<uint64_t>(meshVertices);
+    registerChunkColumnKeyLocked(chunkKey);
 }
 
 static constexpr bool kWATER_DEDUP_BACKWARD_QUADS = true;
@@ -3336,6 +3338,7 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_uploadChunk(
         const size_t repackedVertexCount = repackedVertices.size();
 
         g_chunkMeshes[chunkKey] = std::move(repackedVertices);
+        registerChunkColumnKeyLocked(chunkKey);
 
         chunkStoreRawPayloadLocked(
             chunkKey,

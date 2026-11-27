@@ -333,12 +333,12 @@ void main()
     if(cam.skyParams1.y >= 0.5)
     {
         skyZenithColor = max(textureLod(skyScatteringLut,
-            cloudDirectionToEquirect(vec3(0.0, 1.0, 0.0)), 0.0).rgb, vec3(0.0));
+            skyLutDirectionToUv(vec3(0.0, 1.0, 0.0)), 0.0).rgb, vec3(0.0));
         skySunSideColor = max(textureLod(skyScatteringLut,
-            cloudDirectionToEquirect(normalize(vec3(lightDir0.x, 0.14, lightDir0.z))),
+            skyLutDirectionToUv(normalize(vec3(lightDir0.x, 0.14, lightDir0.z))),
             0.0).rgb, vec3(0.0));
         skyRayColor = max(textureLod(skyScatteringLut,
-            cloudDirectionToEquirect(worldDirection), 0.0).rgb, vec3(0.0));
+            skyLutDirectionToUv(worldDirection), 0.0).rgb, vec3(0.0));
     }
     else
     {

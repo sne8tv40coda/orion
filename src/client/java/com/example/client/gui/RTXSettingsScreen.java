@@ -391,7 +391,6 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
     private float pendingPlaneCloudBrightness;
 
     private int pendingGiRoulette;
-    private int pendingSunMarchFarDistance;
 
     private int pendingMotionDebugView;
 
@@ -740,8 +739,6 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
                 RTXSettingsConfig.getCloudFarStepDensity();
         this.pendingGiRoulette =
                 RTXSettingsConfig.getGiRoulette();
-        this.pendingSunMarchFarDistance =
-                RTXSettingsConfig.getSunMarchFarDistance();
         this.pendingMotionDebugView =
                 RTXSettingsConfig.getMotionDebugView();
         this.pendingDirectLightMode =
@@ -1177,8 +1174,6 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
 
             this.addOptionRow(performanceButton("GI 俄罗斯轮盘", pendingGiRoulette,
                     List.of(0, 1), value -> pendingGiRoulette = value));
-            this.addOptionRow(performanceButton("太阳透射距离", pendingSunMarchFarDistance,
-                    List.of(0, 8, 16, 32, 64, 128, 256), value -> pendingSunMarchFarDistance = value));
             this.addOptionRow(performanceButton("直接光采样（RTXDI 复用）", pendingDirectLightMode,
                     List.of(0, 1), value -> pendingDirectLightMode = value));
             this.addOptionRow(performanceButton("间接光模式（SHaRC，需重启）", pendingIndirectMode,
@@ -3173,15 +3168,6 @@ public final class RTXSettingsScreen extends OptionsSubScreen {
         } else {
             this.pendingMotionDebugView =
                     NativeVulkan.getMotionDebugView();
-            allApplied = false;
-        }
-        if(!NativeVulkan.isLoaded() || NativeVulkan.setSunMarchFarDistance(
-                this.pendingSunMarchFarDistance)) {
-            RTXSettingsConfig.setSunMarchFarDistance(
-                    this.pendingSunMarchFarDistance);
-        } else {
-            this.pendingSunMarchFarDistance =
-                    NativeVulkan.getSunMarchFarDistance();
             allApplied = false;
         }
 

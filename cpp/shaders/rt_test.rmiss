@@ -1001,6 +1001,12 @@ vec3 evaluateMoonSurface(vec3 rayDir, vec3 moonDir, float limbCosine)
 #ifndef ICE_SUN_DOG_STRENGTH
 #define ICE_SUN_DOG_STRENGTH 0.70
 #endif
+// 2026-11-27 用户：「去掉月亮旁边两个环」——22° 月晕（含环内压暗）与 3°~6° 月华
+// 整段默认关闭（编译期常量 0 ⇒ 整块被消除，零成本）。日晕/幻日不受影响。
+// 下面三个强度常量保留，仅在 A/B 时 -DMOON_HALO_ENABLE=1 才会用到。
+#ifndef MOON_HALO_ENABLE
+#define MOON_HALO_ENABLE 0
+#endif
 #ifndef MOON_HALO_STRENGTH
 // 2026-11-17：0.30 -> 0.12。真实月晕的环亮度只有天空背景的 1.5~2 倍，
 // 不是"一圈亮带"；配合下面的环内压暗与部分弧淡出，这个量级才像自然现象。
@@ -1197,7 +1203,7 @@ void main() {
         // clamps the *result* of the derivative computation; the NaN
         // derivative itself still reaches the sampler.
         vec4 scattering = textureLod(skyScatteringTex,
-            directionToEquirect(rayDir), 0.0);
+            skyLutDirectionToUv(rayDir), 0.0);
         skyColor = scattering.rgb;
         skyAureoleRatio = clamp(scattering.a, 0.0, 1.0);
 
@@ -1213,7 +1219,7 @@ void main() {
         if(sunElevation >= 0.0)
         {
             vec3 textureTint = textureLod(skyTransmittanceTex,
-                directionToEquirect(sunDir), 0.0).rgb;
+                skyLutDirectionToUv(sunDir), 0.0).rgb;
             vec3 transmittanceTint = mix(vec3(1.0),
                 textureTint, clamp(cam.skyParams1.x * 2.0, 0.0, 1.0));
             diskColor *= transmittanceTint;
@@ -1563,7 +1569,7 @@ void main() {
         //   · 卷层云不均匀 ⇒ 常常只有**部分弧**可见。
         //
         // 旧实现是 1° 宽的对称亮环 + 沿环亮度均匀 ⇒ 必然像描边。
-        if(sunElevation < 0.0 && moonElevation > 0.10)
+        if(MOON_HALO_ENABLE != 0 && sunElevation < 0.0 && moonElevation > 0.10)
         {
             const float moonHaloGate =
                 smoothstep(0.10, 0.24, moonElevation) *

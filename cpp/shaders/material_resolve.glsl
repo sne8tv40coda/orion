@@ -2060,8 +2060,10 @@ if(isWaterMaterial && abs(geoNormal.y) > 0.5)
             geometricHitPosition.xz,
             geometricHitPosition.y
         );
-    fixedNormal = dot(waterWave.normal, geoNormal) < 0.0
-        ? -waterWave.normal : waterWave.normal;
+    float waveWeight = smoothstep(0.55, 0.88, abs(geoNormal.y));
+    vec3 blendedWaveNormal = normalize(mix(geoNormal, waterWave.normal, waveWeight));
+    fixedNormal = dot(blendedWaveNormal, geoNormal) < 0.0
+        ? -blendedWaveNormal : blendedWaveNormal;
 }
 
 if(

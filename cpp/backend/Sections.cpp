@@ -158,6 +158,36 @@ void prewarmVertexStagingPool()
 
     RTLog("[STAGING PREWARM] preallocated 4x32MB + 8x1MB HOST_VISIBLE staging slots");
 
+    constexpr VkDeviceSize kMediumPrewarmBytes = 8u * 1024u * 1024u;
+    constexpr size_t kMediumPrewarmCount = 4u;
+    VkBuffer mediumPrewarmBuffers[kMediumPrewarmCount]{};
+
+    for(size_t i = 0u; i < kMediumPrewarmCount; ++i)
+    {
+        VkBuffer buf = VK_NULL_HANDLE;
+        VkDeviceMemory mem = VK_NULL_HANDLE;
+        createBuffer(
+            g_device,
+            g_physicalDevice,
+            kMediumPrewarmBytes,
+            VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            buf,
+            mem,
+            true
+        );
+        g_vertexStagingPool.adopt(buf, mem, kMediumPrewarmBytes);
+        mediumPrewarmBuffers[i] = buf;
+    }
+
+    for(size_t i = 0u; i < kMediumPrewarmCount; ++i)
+    {
+        g_vertexStagingPool.release(mediumPrewarmBuffers[i]);
+    }
+
+    RTLog("[STAGING PREWARM] preallocated 4x32MB + 4x8MB + 8x1MB HOST_VISIBLE staging slots");
+
     if(SECTION_MEMORY_POOL_ENABLED)
     {
         VkBuffer probeBuffer = VK_NULL_HANDLE;
@@ -1499,6 +1529,11 @@ double trimSectionMemoryPool()
         slab.chunkCount = 0u;
         slab.liveChunks = 0u;
         slab.freeChunks.clear();
+
+        if(!g_vramGovernor.over)
+        {
+            break;
+        }
     }
 
     g_sectionMemoryPoolKeptBytes = keptBytes;
@@ -2182,6 +2217,8 @@ namespace
         const uint64_t nowSerial = g_perfL10FrameSerial;
         size_t writeIndex = 0u;
         uint64_t flushed = 0u;
+        const bool capped = !force && g_pendingSectionDestroy.size() <= 256u;
+        const auto flushStart = std::chrono::steady_clock::now();
 
         for(size_t i = 0u; i < g_pendingSectionDestroy.size(); ++i)
         {
@@ -2192,8 +2229,15 @@ namespace
             // 2026-11-14：2 → 3 帧，与退休槽的 kRetirementMinFrameAge 对齐。
             const bool oldEnough =
                 nowSerial >= entry.frameSerial + 3u;
+            const bool budgetReached =
+                capped &&
+                flushed > 0u &&
+                (flushed >= 16u ||
+                 std::chrono::duration<double, std::milli>(
+                     std::chrono::steady_clock::now() - flushStart
+                 ).count() >= 1.5);
 
-            if(force || oldEnough)
+            if((force || oldEnough) && !budgetReached)
             {
                 destroySectionASImmediate(entry.section);
                 ++flushed;
@@ -2214,7 +2258,7 @@ namespace
 
         if(flushed > 0u && (nowSerial % 60u) == 0u)
         {
-            RTLogFlushed(
+            RTLog(
                 "[RT RETIRE] deferred=" +
                 std::to_string(g_pendingSectionDestroyDeferred) +
                 " flushed=" + std::to_string(g_pendingSectionDestroyFlushed) +
@@ -4806,7 +4850,7 @@ void recordSectionTablesSync(VkCommandBuffer cmd)
 namespace
 {
     constexpr uint32_t kBlasCompactPoolSize = 256u;
-    constexpr uint32_t kMaxBlasCompactionsPerFrame = 12u;
+    constexpr uint32_t kMaxBlasCompactionsPerFrame = 6u;
 
     struct PendingBlasCompactQuery
     {
@@ -4950,7 +4994,7 @@ bool recordPendingBlasCompactions(
             compactedThisFrame >= 1u &&
             std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - compactStart
-            ).count() >= 1.5;
+            ).count() >= 0.8;
         if(g_perfL10FrameSerial < entry.buildFrameSerial + 2u ||
            compactedThisFrame >= kMaxBlasCompactionsPerFrame ||
            budgetExceeded)

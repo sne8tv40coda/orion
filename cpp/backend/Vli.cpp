@@ -32,6 +32,98 @@ static std::atomic<float> s_vptLastCamY{ 0.0f };
 static std::atomic<float> s_vptLastCamZ{ 0.0f };
 static std::atomic<bool> s_vptHasLastCam{ false };
 
+struct VliUploadStagingSlot
+{
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    void* mapped = nullptr;
+    VkDeviceSize capacity = 0u;
+};
+static VliUploadStagingSlot s_vliStagingRing[4]{};
+
+static void destroyVliUploadStagingRing()
+{
+    for(auto& slot : s_vliStagingRing)
+    {
+        if(slot.mapped != nullptr && slot.memory != VK_NULL_HANDLE && g_device != VK_NULL_HANDLE)
+        {
+            vkUnmapMemory(g_device, slot.memory);
+        }
+        if(slot.buffer != VK_NULL_HANDLE && g_device != VK_NULL_HANDLE)
+        {
+            vkDestroyBuffer(g_device, slot.buffer, nullptr);
+        }
+        if(slot.memory != VK_NULL_HANDLE && g_device != VK_NULL_HANDLE)
+        {
+            vkFreeMemory(g_device, slot.memory, nullptr);
+        }
+        slot = VliUploadStagingSlot{};
+    }
+}
+
+static VliUploadStagingSlot* ensureVliUploadStagingSlot(VkDeviceSize neededBytes)
+{
+    if(g_device == VK_NULL_HANDLE || g_physicalDevice == VK_NULL_HANDLE || neededBytes == 0u)
+    {
+        return nullptr;
+    }
+    VliUploadStagingSlot& slot = s_vliStagingRing[g_perfL10FrameSerial & 3u];
+    if(slot.buffer != VK_NULL_HANDLE && slot.mapped != nullptr && slot.capacity >= neededBytes)
+    {
+        return &slot;
+    }
+
+    const VkDeviceSize targetCap =
+        std::max<VkDeviceSize>(4ull * 1024ull * 1024ull, neededBytes * 2ull);
+    if(slot.buffer != VK_NULL_HANDLE)
+    {
+        FGDeviceWaitIdle(g_device);
+        if(slot.mapped != nullptr && slot.memory != VK_NULL_HANDLE)
+        {
+            vkUnmapMemory(g_device, slot.memory);
+        }
+        vkDestroyBuffer(g_device, slot.buffer, nullptr);
+        if(slot.memory != VK_NULL_HANDLE)
+        {
+            vkFreeMemory(g_device, slot.memory, nullptr);
+        }
+        slot = VliUploadStagingSlot{};
+    }
+
+    VkBuffer buf = VK_NULL_HANDLE;
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    createBuffer(
+        g_device,
+        g_physicalDevice,
+        targetCap,
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        buf,
+        mem,
+        true
+    );
+    if(buf == VK_NULL_HANDLE || mem == VK_NULL_HANDLE)
+    {
+        if(buf != VK_NULL_HANDLE) vkDestroyBuffer(g_device, buf, nullptr);
+        if(mem != VK_NULL_HANDLE) vkFreeMemory(g_device, mem, nullptr);
+        return nullptr;
+    }
+
+    void* mapped = nullptr;
+    if(vkMapMemory(g_device, mem, 0u, targetCap, 0u, &mapped) != VK_SUCCESS || mapped == nullptr)
+    {
+        vkDestroyBuffer(g_device, buf, nullptr);
+        vkFreeMemory(g_device, mem, nullptr);
+        return nullptr;
+    }
+
+    slot.buffer = buf;
+    slot.memory = mem;
+    slot.mapped = mapped;
+    slot.capacity = targetCap;
+    return &slot;
+}
+
 
 // Total bytes of the capacity-sized VLI/VPT pools, i.e. every buffer that
 // grows with the live page capacity.  Used by the allocation and growth logs so
@@ -2861,50 +2953,302 @@ void recordVLIUpdates(VkCommandBuffer cmd)
         ++s_vptLightGridGeoEpoch;
     }
 
-    for(const auto& update : tablePayloads)
-    {
-        vkCmdUpdateBuffer(
-            cmd,
-            g_vliPageTableBuffer,
-            static_cast<VkDeviceSize>(update.first) * sizeof(VLITableSlot),
-            sizeof(VLITableSlot),
-            &update.second
-        );
-    }
+    std::sort(
+        solvePages.begin(),
+        solvePages.end(),
+        [](const auto& a, const auto& b) { return a.first < b.first; }
+    );
+    solvePages.erase(
+        std::unique(solvePages.begin(), solvePages.end()),
+        solvePages.end()
+    );
 
-    for(const VliUploadRef& upload : sourceUploads)
+    std::vector<uint32_t> workList;
+    if(!solvePages.empty())
     {
-        vkCmdUpdateBuffer(
-            cmd,
-            g_vliPageBuffer,
-            static_cast<VkDeviceSize>(upload.pageIndex) *
-                VLI_PAGE_WORDS * sizeof(uint32_t),
-            static_cast<VkDeviceSize>(upload.wordCount) * sizeof(uint32_t),
-            g_vliUploadArena.data() + upload.wordOffset
-        );
-    }
-
-    uint64_t uploadedEmitterCount = 0u;
-    for(const VliUploadRef& upload : emitterUploads)
-    {
-        if(upload.wordCount != VPT_EMITTER_PAGE_WORDS)
+        workList.resize(1u + solvePages.size());
+        workList[0] = static_cast<uint32_t>(solvePages.size());
+        for(size_t i = 0; i < solvePages.size(); ++i)
         {
-            continue;
+            workList[1u + i] = solvePages[i].first;
         }
-
-        uploadedEmitterCount += g_vliUploadArena[upload.wordOffset];
-        vkCmdUpdateBuffer(
-            cmd,
-            g_vptEmitterIndexBuffer,
-            static_cast<VkDeviceSize>(upload.pageIndex) *
-                VPT_EMITTER_PAGE_WORDS * sizeof(uint32_t),
-            static_cast<VkDeviceSize>(VPT_EMITTER_PAGE_WORDS) * sizeof(uint32_t),
-            g_vliUploadArena.data() + upload.wordOffset
-        );
     }
 
     static uint32_t vptPageLogThrottle = 0u;
     const bool vptLogDue = (vptPageLogThrottle++ % 120u) == 0u;
+
+    uint64_t uploadedEmitterCount = 0u;
+    for(const VliUploadRef& upload : emitterUploads)
+    {
+        if(upload.wordCount == VPT_EMITTER_PAGE_WORDS)
+        {
+            uploadedEmitterCount += g_vliUploadArena[upload.wordOffset];
+        }
+    }
+
+    uint64_t uploadedCandidateCount = 0u;
+    for(const auto& upload : candidateUploads)
+    {
+        for(const VPTRelatedEmitterGPU& candidate : upload.second)
+        {
+            if((candidate.emissionAndType & 15u) != 0u)
+            {
+                ++uploadedCandidateCount;
+            }
+        }
+    }
+
+    uint64_t uploadedDirectorySources = 0u;
+    for(const auto& upload : sourceDirectoryUploads)
+    {
+        uploadedDirectorySources += upload.second[0].pageIndex;
+    }
+
+    auto align16 = [](VkDeviceSize v) -> VkDeviceSize {
+        return (v + 15ull) & ~15ull;
+    };
+
+    VkDeviceSize totalStagingBytes = 0u;
+    totalStagingBytes += static_cast<VkDeviceSize>(tablePayloads.size()) * align16(sizeof(VLITableSlot));
+    for(const VliUploadRef& upload : sourceUploads)
+    {
+        totalStagingBytes += align16(static_cast<VkDeviceSize>(upload.wordCount) * sizeof(uint32_t));
+    }
+    for(const VliUploadRef& upload : emitterUploads)
+    {
+        if(upload.wordCount == VPT_EMITTER_PAGE_WORDS)
+        {
+            totalStagingBytes += align16(static_cast<VkDeviceSize>(VPT_EMITTER_PAGE_WORDS) * sizeof(uint32_t));
+        }
+    }
+    for(const VliUploadRef& upload : emitterAliasUploads)
+    {
+        if(upload.wordCount == VPT_EMITTER_PAGE_WORDS)
+        {
+            totalStagingBytes += align16(static_cast<VkDeviceSize>(VPT_EMITTER_PAGE_WORDS) * sizeof(uint32_t));
+        }
+    }
+    totalStagingBytes += static_cast<VkDeviceSize>(candidateUploads.size()) *
+        align16(sizeof(VPTRelatedEmitterGPU) * VPT_RELATED_EMITTERS_PER_SECTION);
+    totalStagingBytes += static_cast<VkDeviceSize>(sourceDirectoryUploads.size()) *
+        align16(sizeof(VPTSourceDirectoryEntryGPU) * VPT_SOURCE_DIRECTORY_ENTRIES_PER_PAGE);
+    if(!workList.empty())
+    {
+        totalStagingBytes += align16(static_cast<VkDeviceSize>(workList.size()) * sizeof(uint32_t));
+    }
+
+    VliUploadStagingSlot* const staging =
+        (totalStagingBytes > 0u) ? ensureVliUploadStagingSlot(totalStagingBytes) : nullptr;
+
+    if(staging != nullptr)
+    {
+        uint8_t* const basePtr = static_cast<uint8_t*>(staging->mapped);
+        VkDeviceSize curOff = 0u;
+
+        auto stageCopy = [&](const void* src, VkDeviceSize sz, VkDeviceSize dstOff,
+                             std::vector<VkBufferCopy>& copies)
+        {
+            std::memcpy(basePtr + curOff, src, static_cast<size_t>(sz));
+            copies.push_back(VkBufferCopy{ curOff, dstOff, sz });
+            curOff += align16(sz);
+        };
+
+        std::vector<VkBufferCopy> tableCopies;
+        tableCopies.reserve(tablePayloads.size());
+        for(const auto& update : tablePayloads)
+        {
+            stageCopy(
+                &update.second,
+                sizeof(VLITableSlot),
+                static_cast<VkDeviceSize>(update.first) * sizeof(VLITableSlot),
+                tableCopies);
+        }
+        if(!tableCopies.empty())
+        {
+            vkCmdCopyBuffer(cmd, staging->buffer, g_vliPageTableBuffer,
+                static_cast<uint32_t>(tableCopies.size()), tableCopies.data());
+        }
+
+        std::vector<VkBufferCopy> sourceCopies;
+        sourceCopies.reserve(sourceUploads.size());
+        for(const VliUploadRef& upload : sourceUploads)
+        {
+            stageCopy(
+                g_vliUploadArena.data() + upload.wordOffset,
+                static_cast<VkDeviceSize>(upload.wordCount) * sizeof(uint32_t),
+                static_cast<VkDeviceSize>(upload.pageIndex) * VLI_PAGE_WORDS * sizeof(uint32_t),
+                sourceCopies);
+        }
+        if(!sourceCopies.empty())
+        {
+            vkCmdCopyBuffer(cmd, staging->buffer, g_vliPageBuffer,
+                static_cast<uint32_t>(sourceCopies.size()), sourceCopies.data());
+        }
+
+        std::vector<VkBufferCopy> emitterCopies;
+        emitterCopies.reserve(emitterUploads.size());
+        for(const VliUploadRef& upload : emitterUploads)
+        {
+            if(upload.wordCount != VPT_EMITTER_PAGE_WORDS) continue;
+            stageCopy(
+                g_vliUploadArena.data() + upload.wordOffset,
+                static_cast<VkDeviceSize>(VPT_EMITTER_PAGE_WORDS) * sizeof(uint32_t),
+                static_cast<VkDeviceSize>(upload.pageIndex) * VPT_EMITTER_PAGE_WORDS * sizeof(uint32_t),
+                emitterCopies);
+        }
+        if(!emitterCopies.empty())
+        {
+            vkCmdCopyBuffer(cmd, staging->buffer, g_vptEmitterIndexBuffer,
+                static_cast<uint32_t>(emitterCopies.size()), emitterCopies.data());
+        }
+
+        std::vector<VkBufferCopy> emitterAliasCopies;
+        emitterAliasCopies.reserve(emitterAliasUploads.size());
+        for(const VliUploadRef& upload : emitterAliasUploads)
+        {
+            if(upload.wordCount != VPT_EMITTER_PAGE_WORDS) continue;
+            stageCopy(
+                g_vliUploadArena.data() + upload.wordOffset,
+                static_cast<VkDeviceSize>(VPT_EMITTER_PAGE_WORDS) * sizeof(uint32_t),
+                static_cast<VkDeviceSize>(upload.pageIndex) * VPT_EMITTER_PAGE_WORDS * sizeof(uint32_t),
+                emitterAliasCopies);
+        }
+        if(!emitterAliasCopies.empty())
+        {
+            vkCmdCopyBuffer(cmd, staging->buffer, g_vptEmitterAliasBuffer,
+                static_cast<uint32_t>(emitterAliasCopies.size()), emitterAliasCopies.data());
+        }
+
+        std::vector<VkBufferCopy> candidateCopies;
+        candidateCopies.reserve(candidateUploads.size());
+        for(const auto& upload : candidateUploads)
+        {
+            stageCopy(
+                upload.second.data(),
+                sizeof(upload.second),
+                static_cast<VkDeviceSize>(upload.first) * VPT_RELATED_EMITTERS_PER_SECTION * sizeof(VPTRelatedEmitterGPU),
+                candidateCopies);
+        }
+        if(!candidateCopies.empty())
+        {
+            vkCmdCopyBuffer(cmd, staging->buffer, g_vptCandidateBuffer,
+                static_cast<uint32_t>(candidateCopies.size()), candidateCopies.data());
+        }
+
+        std::vector<VkBufferCopy> dirCopies;
+        dirCopies.reserve(sourceDirectoryUploads.size());
+        for(const auto& upload : sourceDirectoryUploads)
+        {
+            stageCopy(
+                upload.second.data(),
+                sizeof(upload.second),
+                static_cast<VkDeviceSize>(upload.first) * VPT_SOURCE_DIRECTORY_ENTRIES_PER_PAGE * sizeof(VPTSourceDirectoryEntryGPU),
+                dirCopies);
+        }
+        if(!dirCopies.empty())
+        {
+            vkCmdCopyBuffer(cmd, staging->buffer, g_vptSourceDirectoryBuffer,
+                static_cast<uint32_t>(dirCopies.size()), dirCopies.data());
+        }
+
+        if(!workList.empty())
+        {
+            const VkDeviceSize workSz =
+                static_cast<VkDeviceSize>(workList.size()) * sizeof(uint32_t);
+            std::memcpy(basePtr + curOff, workList.data(), static_cast<size_t>(workSz));
+            VkBufferCopy workCopy{ curOff, 0u, workSz };
+            vkCmdCopyBuffer(cmd, staging->buffer, g_vliWorkListBuffer, 1u, &workCopy);
+            curOff += align16(workSz);
+        }
+    }
+    else
+    {
+        for(const auto& update : tablePayloads)
+        {
+            vkCmdUpdateBuffer(
+                cmd,
+                g_vliPageTableBuffer,
+                static_cast<VkDeviceSize>(update.first) * sizeof(VLITableSlot),
+                sizeof(VLITableSlot),
+                &update.second
+            );
+        }
+
+        for(const VliUploadRef& upload : sourceUploads)
+        {
+            vkCmdUpdateBuffer(
+                cmd,
+                g_vliPageBuffer,
+                static_cast<VkDeviceSize>(upload.pageIndex) *
+                    VLI_PAGE_WORDS * sizeof(uint32_t),
+                static_cast<VkDeviceSize>(upload.wordCount) * sizeof(uint32_t),
+                g_vliUploadArena.data() + upload.wordOffset
+            );
+        }
+
+        for(const VliUploadRef& upload : emitterUploads)
+        {
+            if(upload.wordCount != VPT_EMITTER_PAGE_WORDS) continue;
+            vkCmdUpdateBuffer(
+                cmd,
+                g_vptEmitterIndexBuffer,
+                static_cast<VkDeviceSize>(upload.pageIndex) *
+                    VPT_EMITTER_PAGE_WORDS * sizeof(uint32_t),
+                static_cast<VkDeviceSize>(VPT_EMITTER_PAGE_WORDS) * sizeof(uint32_t),
+                g_vliUploadArena.data() + upload.wordOffset
+            );
+        }
+
+        for(const VliUploadRef& upload : emitterAliasUploads)
+        {
+            if(upload.wordCount != VPT_EMITTER_PAGE_WORDS) continue;
+            vkCmdUpdateBuffer(
+                cmd,
+                g_vptEmitterAliasBuffer,
+                static_cast<VkDeviceSize>(upload.pageIndex) *
+                    VPT_EMITTER_PAGE_WORDS * sizeof(uint32_t),
+                static_cast<VkDeviceSize>(VPT_EMITTER_PAGE_WORDS) * sizeof(uint32_t),
+                g_vliUploadArena.data() + upload.wordOffset
+            );
+        }
+
+        for(const auto& upload : candidateUploads)
+        {
+            vkCmdUpdateBuffer(
+                cmd,
+                g_vptCandidateBuffer,
+                static_cast<VkDeviceSize>(upload.first) *
+                    VPT_RELATED_EMITTERS_PER_SECTION *
+                    sizeof(VPTRelatedEmitterGPU),
+                sizeof(upload.second),
+                upload.second.data()
+            );
+        }
+
+        for(const auto& upload : sourceDirectoryUploads)
+        {
+            vkCmdUpdateBuffer(
+                cmd,
+                g_vptSourceDirectoryBuffer,
+                static_cast<VkDeviceSize>(upload.first) *
+                    VPT_SOURCE_DIRECTORY_ENTRIES_PER_PAGE *
+                    sizeof(VPTSourceDirectoryEntryGPU),
+                sizeof(upload.second),
+                upload.second.data()
+            );
+        }
+
+        if(!workList.empty())
+        {
+            vkCmdUpdateBuffer(
+                cmd,
+                g_vliWorkListBuffer,
+                0,
+                static_cast<VkDeviceSize>(workList.size()) * sizeof(uint32_t),
+                workList.data()
+            );
+        }
+    }
 
     if(!emitterUploads.empty() && vptLogDue)
     {
@@ -2921,41 +3265,6 @@ void recordVLIUpdates(VkCommandBuffer cmd)
         RTLog(ss.str());
     }
 
-    for(const VliUploadRef& upload : emitterAliasUploads)
-    {
-        if(upload.wordCount != VPT_EMITTER_PAGE_WORDS) continue;
-        vkCmdUpdateBuffer(
-            cmd,
-            g_vptEmitterAliasBuffer,
-            static_cast<VkDeviceSize>(upload.pageIndex) *
-                VPT_EMITTER_PAGE_WORDS * sizeof(uint32_t),
-            static_cast<VkDeviceSize>(VPT_EMITTER_PAGE_WORDS) * sizeof(uint32_t),
-            g_vliUploadArena.data() + upload.wordOffset
-        );
-    }
-
-    uint64_t uploadedCandidateCount = 0u;
-    for(const auto& upload : candidateUploads)
-    {
-        for(const VPTRelatedEmitterGPU& candidate : upload.second)
-        {
-            if((candidate.emissionAndType & 15u) != 0u)
-            {
-                ++uploadedCandidateCount;
-            }
-        }
-
-        vkCmdUpdateBuffer(
-            cmd,
-            g_vptCandidateBuffer,
-            static_cast<VkDeviceSize>(upload.first) *
-                VPT_RELATED_EMITTERS_PER_SECTION *
-                sizeof(VPTRelatedEmitterGPU),
-            sizeof(upload.second),
-            upload.second.data()
-        );
-    }
-
     if(!candidateUploads.empty() && vptLogDue)
     {
         std::stringstream ss;
@@ -2964,21 +3273,6 @@ void recordVLIUpdates(VkCommandBuffer cmd)
            << " maxPerPage=" << VPT_RELATED_EMITTERS_PER_SECTION
            << " binding=29";
         RTLog(ss.str());
-    }
-
-    uint64_t uploadedDirectorySources = 0u;
-    for(const auto& upload : sourceDirectoryUploads)
-    {
-        uploadedDirectorySources += upload.second[0].pageIndex;
-        vkCmdUpdateBuffer(
-            cmd,
-            g_vptSourceDirectoryBuffer,
-            static_cast<VkDeviceSize>(upload.first) *
-                VPT_SOURCE_DIRECTORY_ENTRIES_PER_PAGE *
-                sizeof(VPTSourceDirectoryEntryGPU),
-            sizeof(upload.second),
-            upload.second.data()
-        );
     }
 
     if(!sourceDirectoryUploads.empty() && vptLogDue)
@@ -2992,9 +3286,6 @@ void recordVLIUpdates(VkCommandBuffer cmd)
         RTLog(ss.str());
     }
 
-    // ReSTIR DI validates cached emitter voxels per-pixel in O(1); routine
-    // section uploads no longer wipe the full-screen temporal history buffer.
-
     g_vliMsUpload =
         std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() -
@@ -3003,16 +3294,6 @@ void recordVLIUpdates(VkCommandBuffer cmd)
 
     const auto vliBreakdownSolveBegin =
         std::chrono::steady_clock::now();
-
-    std::sort(
-        solvePages.begin(),
-        solvePages.end(),
-        [](const auto& a, const auto& b) { return a.first < b.first; }
-    );
-    solvePages.erase(
-        std::unique(solvePages.begin(), solvePages.end()),
-        solvePages.end()
-    );
 
     if(solvePages.empty())
     {
@@ -3043,21 +3324,6 @@ void recordVLIUpdates(VkCommandBuffer cmd)
         }
         return;
     }
-
-    std::vector<uint32_t> workList(1u + solvePages.size());
-    workList[0] = static_cast<uint32_t>(solvePages.size());
-    for(size_t i = 0; i < solvePages.size(); ++i)
-    {
-        workList[1u + i] = solvePages[i].first;
-    }
-
-    vkCmdUpdateBuffer(
-        cmd,
-        g_vliWorkListBuffer,
-        0,
-        static_cast<VkDeviceSize>(workList.size()) * sizeof(uint32_t),
-        workList.data()
-    );
 
     VkMemoryBarrier workBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
     workBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -3181,6 +3447,7 @@ void createVLIComputePipeline()
 void destroyVLIResources()
 {
     destroyVPTLightGridResources();
+    destroyVliUploadStagingRing();
     if(g_vliComputePipeline != VK_NULL_HANDLE)
     {
         vkDestroyPipeline(g_device, g_vliComputePipeline, nullptr);
@@ -3806,6 +4073,7 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_uploadVoxelLightSect
             {
                 derivedCount = derivedLights.size();
                 g_lightSections[sectionKey] = std::move(derivedLights);
+                registerLightColumnKeyLocked(sectionKey);
             }
 
             g_totalLocalLights =
@@ -4271,6 +4539,7 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_uploadLightSection(
                     std::move(
                         incomingLights
                     );
+                registerLightColumnKeyLocked(sectionKey);
 
 
                 g_totalLocalLights +=
@@ -4372,71 +4641,45 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_removeLightChunk(
     size_t remainingLights =
         0;
 
-
+    // 2026-11-27 Batch AG: free erased vectors outside g_lightMutex and g_chunkMutex.
+    std::vector<std::vector<LocalLightRecord>> lightUnloadGarbage;
     {
         std::lock_guard<std::mutex>
             lock(
                 g_lightMutex
             );
 
-
-        for(
-            auto it =
-                g_lightSections.begin();
-
-            it !=
-                g_lightSections.end();
-        )
+        const auto colIt = g_lightColumnKeys.find(targetXZ);
+        if(colIt != g_lightColumnKeys.end())
         {
-            const bool sameChunk =
-                (
-                    it->first &
-                    SECTION_XZ_MASK
-                ) ==
-                targetXZ;
+            std::unordered_set<uint64_t> colKeys = std::move(colIt->second);
+            g_lightColumnKeys.erase(colIt);
+            lightUnloadGarbage.reserve(colKeys.size());
 
-
-            if(!sameChunk)
+            for(const uint64_t key : colKeys)
             {
-                ++it;
+                const auto it = g_lightSections.find(key);
+                if(it == g_lightSections.end())
+                {
+                    continue;
+                }
 
-                continue;
+                const size_t sectionLightCount = it->second.size();
+                removedLights += sectionLightCount;
+                if(g_totalLocalLights >= sectionLightCount)
+                {
+                    g_totalLocalLights -= sectionLightCount;
+                }
+                else
+                {
+                    g_totalLocalLights = 0;
+                }
+
+                lightUnloadGarbage.push_back(std::move(it->second));
+                g_lightSections.erase(it);
+                ++removedSections;
             }
-
-
-            const size_t
-                sectionLightCount =
-                    it->second.size();
-
-
-            removedLights +=
-                sectionLightCount;
-
-
-            if(
-                g_totalLocalLights >=
-                sectionLightCount
-            )
-            {
-                g_totalLocalLights -=
-                    sectionLightCount;
-            }
-            else
-            {
-                g_totalLocalLights =
-                    0;
-            }
-
-
-            it =
-                g_lightSections.erase(
-                    it
-                );
-
-
-            ++removedSections;
         }
-
 
         remainingLights =
             g_totalLocalLights;
@@ -4621,135 +4864,52 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_removeLightChunk(
     size_t removedGeometryLayers =
         0;
 
-
+    std::vector<std::vector<Vertex>> meshUnloadGarbage;
+    std::vector<std::vector<uint8_t>> rawUnloadGarbage;
+    std::vector<OmmCutoutInput> ommUnloadGarbage;
     {
         std::lock_guard<std::timed_mutex>
             lock(
                 g_chunkMutex
             );
 
-
-        for(
-            auto it =
-                g_chunkMeshes.begin();
-
-            it !=
-                g_chunkMeshes.end();
-        )
+        const auto colIt = g_chunkColumnKeys.find(targetXZ);
+        if(colIt != g_chunkColumnKeys.end())
         {
-            if(
-                (
-                    it->first &
-                    SECTION_XZ_MASK
-                ) !=
-                targetXZ
-            )
+            std::unordered_set<uint64_t> colKeys = std::move(colIt->second);
+            g_chunkColumnKeys.erase(colIt);
+            meshUnloadGarbage.reserve(colKeys.size());
+            rawUnloadGarbage.reserve(colKeys.size());
+            ommUnloadGarbage.reserve(colKeys.size());
+
+            for(const uint64_t key : colKeys)
             {
-                ++it;
+                const auto meshIt = g_chunkMeshes.find(key);
+                if(meshIt != g_chunkMeshes.end())
+                {
+                    g_dirtySectionKeys.insert(key & SPATIAL_SECTION_KEY_MASK);
+                    meshUnloadGarbage.push_back(std::move(meshIt->second));
+                    g_chunkMeshes.erase(meshIt);
+                    ++removedGeometryLayers;
+                }
 
-                continue;
-            }
+                const auto rawIt = g_chunkRawPayloads.find(key);
+                if(rawIt != g_chunkRawPayloads.end())
+                {
+                    rawUnloadGarbage.push_back(std::move(rawIt->second));
+                    g_chunkRawPayloads.erase(rawIt);
+                }
 
+                g_chunkUploadDigests.erase(key);
 
-            g_dirtySectionKeys.insert(
-                it->first &
-                SPATIAL_SECTION_KEY_MASK
-            );
-
-
-            it =
-                g_chunkMeshes.erase(
-                    it
-                );
-
-
-            ++removedGeometryLayers;
-        }
-
-
-        for(
-            auto it =
-                g_chunkRawPayloads.begin();
-
-            it !=
-                g_chunkRawPayloads.end();
-        )
-        {
-            if(
-                (
-                    it->first &
-                    SECTION_XZ_MASK
-                ) ==
-                targetXZ
-            )
-            {
-                it =
-                    g_chunkRawPayloads.erase(
-                        it
-                    );
-            }
-            else
-            {
-                ++it;
+                const auto ommIt = g_cutoutOmmInputs.find(key);
+                if(ommIt != g_cutoutOmmInputs.end())
+                {
+                    ommUnloadGarbage.push_back(std::move(ommIt->second));
+                    g_cutoutOmmInputs.erase(ommIt);
+                }
             }
         }
-
-
-        for(
-            auto it =
-                g_chunkUploadDigests.begin();
-
-            it !=
-                g_chunkUploadDigests.end();
-        )
-        {
-            if(
-                (
-                    it->first &
-                    SECTION_XZ_MASK
-                ) ==
-                targetXZ
-            )
-            {
-                it =
-                    g_chunkUploadDigests.erase(
-                        it
-                    );
-            }
-            else
-            {
-                ++it;
-            }
-        }
-
-
-        for(
-            auto it =
-                g_cutoutOmmInputs.begin();
-
-            it !=
-                g_cutoutOmmInputs.end();
-        )
-        {
-            if(
-                (
-                    it->first &
-                    SECTION_XZ_MASK
-                ) ==
-                targetXZ
-            )
-            {
-                it =
-                    g_cutoutOmmInputs.erase(
-                        it
-                    );
-            }
-            else
-            {
-                ++it;
-            }
-        }
-
 
         if(removedGeometryLayers > 0)
         {

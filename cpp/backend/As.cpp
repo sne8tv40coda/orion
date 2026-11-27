@@ -746,6 +746,7 @@ JNIEXPORT void JNICALL Java_com_example_vulkan_NativeVulkan_uploadCutoutOmmSecti
     }
 
     g_cutoutOmmInputs[key] = std::move(input);
+    registerChunkColumnKeyLocked(key);
     g_dirtySectionKeys.insert(spatialKey);
     markWorldGeometryDirty();
 }
